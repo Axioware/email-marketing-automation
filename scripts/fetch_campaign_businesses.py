@@ -91,7 +91,18 @@ def normalize_website(value: str | None) -> str | None:
 
 def normalize_name_key(value: str | None) -> str | None:
     name = normalize_text(value)
-    return name.casefold() if name else None
+    if not name:
+        return None
+    name = re.sub(r"(?<=[^\W_])['’](?=[^\W_])", "", name)
+    decomposed = unicodedata.normalize("NFKD", name.casefold())
+    return " ".join(re.findall(r"[^\W_]+", decomposed)) or None
+
+
+def normalize_domain(value: str | None) -> str | None:
+    website = normalize_website(value)
+    if not website:
+        return None
+    return (urlsplit(website).hostname or "").removeprefix("www.") or None
 
 
 def parse_comma_separated_values(value: str | list[str] | None) -> list[str]:
@@ -353,56 +364,55 @@ def extract_business_details(
     }
 
 
-def business_dedupe_keys(business: dict) -> set[tuple[str, ...]]:
-    keys = set()
-    place_id = business.get("google_place_id")
-    maps_url = business.get("google_maps_url")
-    if place_id:
-        keys.add(("place", place_id))
-    if maps_url:
-        keys.add(("url", maps_url))
-
-    name = normalize_name_key(business.get("name"))
-    phone = normalize_phone(business.get("phone"), business.get("country"))
-    website = normalize_website(business.get("website_url"))
-    address = normalize_name_key(business.get("address"))
-    if name and phone:
-        keys.add(("phone-name", phone, name))
-    if name and website and address:
-        keys.add(("website-name-address", website, name, address))
-    return keys
+def business_identity(business: dict) -> dict[str, str | None]:
+    return {
+        "place_id": normalize_text(business.get("google_place_id")),
+        "maps_url": normalize_text(business.get("google_maps_url")),
+        "name": normalize_name_key(business.get("name")),
+        "address": normalize_name_key(business.get("address")),
+        "domain": normalize_domain(business.get("domain") or business.get("website_url")),
+    }
 
 
-def existing_business_keys(connection, businesses: Table, campaign_id: int) -> set[tuple[str, ...]]:
+def same_business(first: dict, second: dict) -> bool:
+    first_identity = business_identity(first)
+    second_identity = business_identity(second)
+
+    first_place_id = first_identity["place_id"]
+    second_place_id = second_identity["place_id"]
+    if first_place_id and second_place_id:
+        return first_place_id == second_place_id
+
+    if first_identity["maps_url"] and first_identity["maps_url"] == second_identity["maps_url"]:
+        return True
+
+    if not first_identity["name"] or first_identity["name"] != second_identity["name"]:
+        return False
+
+    first_address = first_identity["address"]
+    second_address = second_identity["address"]
+    if first_address and second_address:
+        return first_address == second_address
+
+    first_domain = first_identity["domain"]
+    second_domain = second_identity["domain"]
+    return bool(first_domain and first_domain == second_domain)
+
+
+def existing_businesses(connection, businesses: Table, campaign_id: int) -> list[dict]:
     rows = connection.execute(
         select(
             businesses.c.google_place_id,
             businesses.c.google_maps_url,
             businesses.c.name,
-            businesses.c.phone,
             businesses.c.website_url,
+            businesses.c.domain,
             businesses.c.address,
-            businesses.c.country,
         ).where(
             businesses.c.discovery_campaign_id == campaign_id
         )
     )
-    keys = set()
-    for row in rows:
-        keys.update(
-            business_dedupe_keys(
-                {
-                    "google_place_id": row.google_place_id,
-                    "google_maps_url": row.google_maps_url,
-                    "name": row.name,
-                    "phone": row.phone,
-                    "website_url": row.website_url,
-                    "address": row.address,
-                    "country": row.country,
-                }
-            )
-        )
-    return keys
+    return [dict(row._mapping) for row in rows]
 
 
 def scrape_campaign(
@@ -416,7 +426,7 @@ def scrape_campaign(
     headed: bool,
 ):
     with engine.connect() as connection:
-        seen_keys = existing_business_keys(connection, businesses, campaign["id"])
+        seen_businesses = existing_businesses(connection, businesses, campaign["id"])
 
     records = []
     for query in queries:
@@ -429,9 +439,6 @@ def scrape_campaign(
         for card in cards:
             if len(records) >= limit:
                 break
-            if ("url", card["url"]) in seen_keys:
-                continue
-
             time.sleep(delay)
             try:
                 details = extract_business_details(
@@ -443,8 +450,7 @@ def scrape_campaign(
                 print(f"Skipping a Maps result ({type(error).__name__}).")
                 continue
 
-            dedupe_keys = business_dedupe_keys(details)
-            if dedupe_keys & seen_keys:
+            if any(same_business(details, seen) for seen in seen_businesses):
                 continue
 
             discovered_at = datetime.now(timezone.utc)
@@ -454,7 +460,7 @@ def scrape_campaign(
                 last_discovered_at=discovered_at,
             )
             records.append(details)
-            seen_keys.update(dedupe_keys)
+            seen_businesses.append(details)
 
     return records
 
