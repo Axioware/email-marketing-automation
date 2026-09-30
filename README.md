@@ -50,4 +50,4 @@ alembic upgrade head
 python scripts/research_business_websites.py
 ```
 
-The script processes businesses with websites that do not yet have a completed profile. Use `--limit N` for a bounded batch or `--business-id ID` for one business. It asks the agent to SCORE, SCRAPE, or EXIT after each page, enforces a maximum of five unique page visits per business, and stores cleaned research in `business_website_profiles`; raw HTML is not saved.
+The script processes businesses with websites that do not yet have a completed profile. Use `--limit N` for a bounded batch or `--business-id ID` for one business. It asks the agent to SCORE, SCRAPE, or EXIT after each page, enforces a maximum of five unique page visits per business, and stores compact page summaries/findings, discovered links, emails, and URLs in `business_website_profiles`. Only the current page's full cleaned text is sent on each agent turn; raw HTML is not saved.

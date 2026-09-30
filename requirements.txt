@@ -9,3 +9,4 @@ beautifulsoup4>=4.12
 trafilatura>=1.12
 openai>=1.40
 lxml_html_clean>=0.4
+pydantic>=2.7
