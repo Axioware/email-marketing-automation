@@ -38,3 +38,16 @@ python scripts/fetch_campaign_businesses.py
 Select a campaign and enter a positive result limit. The fetcher searches that campaign's terms and locations, stores up to the requested number of new businesses, and leaves unavailable Maps fields as `NULL`. Use `--headed` if Google requires manual consent. Automated Google Maps access may be restricted by its terms; for production use, prefer the official Places API.
 
 Each new business is saved with a `business_sources` record containing the unnormalized Google Maps payload in PostgreSQL `JSONB`.
+
+## Research business websites
+
+Set `OPENAI_API_KEY` in `.env` (optionally set `OPENAI_MODEL`; the default is `gpt-4o-mini`), install dependencies and Chromium, and apply migrations. Jina Reader is used by default for cleaned page text and is limited to 20 requests per 60 seconds; `JINA_API_KEY` is optional. If Jina fails, the worker falls back to local extraction. Use `--local-only` to keep page content local.
+
+```sh
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+alembic upgrade head
+python scripts/research_business_websites.py
+```
+
+The script processes businesses with websites that do not yet have a completed profile. Use `--limit N` for a bounded batch or `--business-id ID` for one business. It asks the agent to SCORE, SCRAPE, or EXIT after each page, enforces a maximum of five unique page visits per business, and stores cleaned research in `business_website_profiles`; raw HTML is not saved.
