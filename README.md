@@ -36,3 +36,5 @@ python scripts/fetch_campaign_businesses.py
 ```
 
 Select a campaign and enter a positive result limit. The fetcher searches that campaign's terms and locations, stores up to the requested number of new businesses, and leaves unavailable Maps fields as `NULL`. Use `--headed` if Google requires manual consent. Automated Google Maps access may be restricted by its terms; for production use, prefer the official Places API.
+
+Each new business is saved with a `business_sources` record containing the unnormalized Google Maps payload in PostgreSQL `JSONB`.
