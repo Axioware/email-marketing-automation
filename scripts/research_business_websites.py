@@ -1,11 +1,13 @@
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
 import time
 from collections import deque
+from decimal import Decimal
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -57,6 +59,13 @@ class ResearchError(RuntimeError):
     pass
 
 
+def json_default(value):
+    if isinstance(value, Decimal):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 class SlidingWindowRateLimiter:
     def __init__(self, max_requests: int, window_seconds: int):
         self.max_requests = max_requests
@@ -76,8 +85,7 @@ class SlidingWindowRateLimiter:
 
 
 class JinaReader:
-    def __init__(self, api_key: str | None = None):
-        self.api_key = api_key
+    def __init__(self):
         self.rate_limiter = SlidingWindowRateLimiter(
             JINA_REQUESTS_PER_MINUTE,
             JINA_RATE_WINDOW_SECONDS,
@@ -90,7 +98,6 @@ class JinaReader:
             headers={
                 "Accept": "text/plain",
                 "X-Return-Format": "markdown",
-                **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
             },
         )
         try:
@@ -267,7 +274,15 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
             response_format=response_format,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(request_data, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        request_data,
+                        ensure_ascii=False,
+                        default=json_default,
+                        allow_nan=False,
+                    ),
+                },
             ],
         )
         try:
@@ -327,15 +342,8 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
         if action == "SCRAPE" and not must_score:
             selected = normalize_url(decision.url, context["current_page_url"]) if decision.url else None
             selected_identity = url_identity(selected) if selected else None
-            if (
-                decision.reason is None
-                or not decision.reason.strip()
-                or any(
-                value is not None
-                    for value in (decision.score, decision.reasons, decision.reasoning)
-                )
-            ):
-                feedback = "SCRAPE requires a URL and a non-empty reason; score/reasons/reasoning must be null."
+            if not selected_identity:
+                feedback = "SCRAPE requires a valid URL from the current website."
                 continue
             if selected_identity and selected_identity in context["visited_identities"]:
                 feedback = "This URL has already been scraped. Choose another URL or produce SCORE/EXIT."
@@ -350,10 +358,14 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                 and selected_identity in available_identities
                 and selected_identity not in context["visited_identities"]
             ):
+                request_reason = (
+                    decision.reason or decision.reasoning or
+                    "The agent selected this page as potentially useful for qualification."
+                )
                 return {
                     "action": action,
                     "url": selected,
-                    "reason": decision.reason.strip()[:2000],
+                    "reason": request_reason.strip()[:2000],
                     **page_notes,
                 }
             feedback = "Choose an unvisited same-site URL from available_links or return SCORE/EXIT."
@@ -526,8 +538,14 @@ def save_progress(
 
 
 def load_businesses(
-    connection, businesses: Table, profiles: Table, limit: int | None, business_id: int | None
+    connection,
+    businesses: Table,
+    profiles: Table,
+    limit: int | None,
+    business_id: int | None,
+    retry_failed: bool = False,
 ):
+    eligible_statuses = ("pending", "failed") if retry_failed else ("pending",)
     statement = (
         select(
             businesses.c.id,
@@ -547,7 +565,7 @@ def load_businesses(
         .outerjoin(profiles, profiles.c.business_id == businesses.c.id)
         .where(
             businesses.c.website_url.is_not(None),
-            or_(profiles.c.id.is_(None), profiles.c.status.in_(("pending", "failed"))),
+            or_(profiles.c.id.is_(None), profiles.c.status.in_(eligible_statuses)),
         )
         .order_by(businesses.c.id)
     )
@@ -592,6 +610,11 @@ def main() -> int:
     parser.add_argument("--limit", type=int, help="Maximum number of businesses in this run.")
     parser.add_argument("--headed", action="store_true", help="Show the Chromium browser.")
     parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Include businesses whose previous website research failed.",
+    )
+    parser.add_argument(
         "--local-only",
         action="store_true",
         help="Do not send page URLs/content to Jina Reader; use local text extraction.",
@@ -609,17 +632,24 @@ def main() -> int:
         parser.error("OPENAI_API_KEY is not set in the environment or project .env file")
 
     client = OpenAI(api_key=api_key)
-    model = os.environ.get("OPENAI_MODEL", "gpt-5.6-mini")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
     jina_reader = None
     if not args.local_only:
-        jina_reader = JinaReader(os.environ.get("JINA_API_KEY"))
+        jina_reader = JinaReader()
     engine = create_engine(database_url, pool_pre_ping=True)
     metadata = MetaData()
     try:
         businesses = Table("businesses", metadata, autoload_with=engine)
         profiles = Table("business_website_profiles", metadata, autoload_with=engine)
         with engine.connect() as connection:
-            queue = load_businesses(connection, businesses, profiles, args.limit, args.business_id)
+            queue = load_businesses(
+                connection,
+                businesses,
+                profiles,
+                args.limit,
+                args.business_id,
+                retry_failed=args.retry_failed,
+            )
         if not queue:
             print("No businesses with websites need research.")
             return 0
