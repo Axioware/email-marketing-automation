@@ -3,16 +3,95 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+import phonenumbers
+import pycountry
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from sqlalchemy import MetaData, Table, create_engine, func, insert, select, update
 from sqlalchemy.exc import SQLAlchemyError
+
+
+def normalize_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = "".join(
+        character for character in normalized if unicodedata.category(character) != "Cf"
+    )
+    return " ".join(normalized.split()) or None
+
+
+def country_region(country: str | None) -> str | None:
+    country_name = normalize_text(country)
+    if not country_name:
+        return None
+
+    aliases = {"UK": "GB", "USA": "US", "U.S.A.": "US"}
+    if country_name.upper() in aliases:
+        return aliases[country_name.upper()]
+    try:
+        return pycountry.countries.lookup(country_name).alpha_2
+    except LookupError:
+        return None
+
+
+def normalize_phone(value: str | None, country: str | None = None) -> str | None:
+    phone = normalize_text(value)
+    if not phone:
+        return None
+
+    region = None if phone.startswith("+") else country_region(country)
+    try:
+        parsed = phonenumbers.parse(phone, region)
+        if phonenumbers.is_possible_number(parsed):
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+    except phonenumbers.NumberParseException:
+        pass
+
+    digits = "".join(character for character in phone if character.isdecimal())
+    if not digits:
+        return None
+    return f"+{digits}" if phone.startswith("+") else digits
+
+
+def normalize_website(value: str | None) -> str | None:
+    website = normalize_text(value)
+    if not website:
+        return None
+    if website.startswith("//"):
+        website = f"https:{website}"
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", website):
+        website = f"https://{website}"
+
+    try:
+        parsed = urlsplit(website)
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname or parsed.scheme.casefold() not in {"http", "https"}:
+        return None
+
+    hostname = hostname.removeprefix("www.")
+    if port and not (parsed.scheme.casefold() == "http" and port == 80) and not (
+        parsed.scheme.casefold() == "https" and port == 443
+    ):
+        hostname = f"{hostname}:{port}"
+
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.casefold(), hostname, path, parsed.query, ""))
+
+
+def normalize_name_key(value: str | None) -> str | None:
+    name = normalize_text(value)
+    return name.casefold() if name else None
 
 
 def parse_comma_separated_values(value: str | list[str] | None) -> list[str]:
@@ -202,7 +281,7 @@ def extract_business_details(
     heading = page.locator("h1").first
     try:
         heading.wait_for(state="visible", timeout=12000)
-        name = heading.inner_text(timeout=1500).strip() or card["name"]
+        name = heading.inner_text(timeout=1500) or card["name"]
     except PlaywrightError:
         name = card["name"]
 
@@ -241,7 +320,18 @@ def extract_business_details(
 
     place_id_match = re.search(r"\bChIJ[A-Za-z0-9_-]+", page.url)
     coordinates_match = re.search(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)", page.url)
+    name = normalize_text(name)
+    category = normalize_text(category)
+    website_url = normalize_website(website_url)
     domain = urlsplit(website_url).hostname if website_url else None
+    phone = normalize_phone(phone, target_country)
+    address = normalize_text(address)
+    target_country = normalize_text(target_country)
+    if opening_hours:
+        opening_hours = [normalize_text(hour) for hour in opening_hours]
+        opening_hours = [hour for hour in opening_hours if hour]
+        if not opening_hours:
+            opening_hours = None
 
     return {
         "name": name[:255] if name else None,
@@ -263,18 +353,55 @@ def extract_business_details(
     }
 
 
-def existing_business_keys(connection, businesses: Table, campaign_id: int) -> set[tuple[str, str]]:
+def business_dedupe_keys(business: dict) -> set[tuple[str, ...]]:
+    keys = set()
+    place_id = business.get("google_place_id")
+    maps_url = business.get("google_maps_url")
+    if place_id:
+        keys.add(("place", place_id))
+    if maps_url:
+        keys.add(("url", maps_url))
+
+    name = normalize_name_key(business.get("name"))
+    phone = normalize_phone(business.get("phone"), business.get("country"))
+    website = normalize_website(business.get("website_url"))
+    address = normalize_name_key(business.get("address"))
+    if name and phone:
+        keys.add(("phone-name", phone, name))
+    if name and website and address:
+        keys.add(("website-name-address", website, name, address))
+    return keys
+
+
+def existing_business_keys(connection, businesses: Table, campaign_id: int) -> set[tuple[str, ...]]:
     rows = connection.execute(
-        select(businesses.c.google_place_id, businesses.c.google_maps_url).where(
+        select(
+            businesses.c.google_place_id,
+            businesses.c.google_maps_url,
+            businesses.c.name,
+            businesses.c.phone,
+            businesses.c.website_url,
+            businesses.c.address,
+            businesses.c.country,
+        ).where(
             businesses.c.discovery_campaign_id == campaign_id
         )
     )
     keys = set()
-    for place_id, maps_url in rows:
-        if place_id:
-            keys.add(("place", place_id))
-        if maps_url:
-            keys.add(("url", maps_url))
+    for row in rows:
+        keys.update(
+            business_dedupe_keys(
+                {
+                    "google_place_id": row.google_place_id,
+                    "google_maps_url": row.google_maps_url,
+                    "name": row.name,
+                    "phone": row.phone,
+                    "website_url": row.website_url,
+                    "address": row.address,
+                    "country": row.country,
+                }
+            )
+        )
     return keys
 
 
@@ -316,8 +443,8 @@ def scrape_campaign(
                 print(f"Skipping a Maps result ({type(error).__name__}).")
                 continue
 
-            place_id = details["google_place_id"]
-            if place_id and ("place", place_id) in seen_keys:
+            dedupe_keys = business_dedupe_keys(details)
+            if dedupe_keys & seen_keys:
                 continue
 
             discovered_at = datetime.now(timezone.utc)
@@ -327,9 +454,7 @@ def scrape_campaign(
                 last_discovered_at=discovered_at,
             )
             records.append(details)
-            if place_id:
-                seen_keys.add(("place", place_id))
-            seen_keys.add(("url", details["google_maps_url"]))
+            seen_keys.update(dedupe_keys)
 
     return records
 
