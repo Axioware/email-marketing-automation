@@ -52,13 +52,23 @@ python scripts/research_business_websites.py
 
 The script processes businesses with websites that do not yet have a completed profile. Failed profiles are skipped on normal runs; pass `--retry-failed` to retry them. Use `--limit N` for a bounded batch or `--business-id ID` for one business. It asks the agent to SCORE, SCRAPE, or EXIT after each page, enforces a maximum of five unique page visits per business, and stores compact page summaries/findings, discovered links, emails, and URLs in `business_website_profiles`. Only the current page's full cleaned text is sent on each agent turn; raw HTML is not saved.
 
-## Find business stakeholders
+## Find decision makers and contact emails (Module 3)
 
-Needs Firefox and [geckodriver](https://github.com/mozilla/geckodriver/releases) installed locally (no API keys). The script searches Google for each qualified business's owners, reads the AI Overview, falls back to DuckDuckGo, and stores each named person in `business_contacts` with pattern-guessed, unverified emails.
+Needs Firefox and [geckodriver](https://github.com/mozilla/geckodriver/releases) installed locally; no API keys or paid services. Apply the latest migration first.
 
 ```sh
 python -m pip install -r requirements.txt
+alembic upgrade head
 python scripts/find_business_stakeholders.py --limit 5 --headed
 ```
 
-Use `--min-score N` (default 50), `--business-id ID`, `--delay SECONDS`, and `--profile PATH` to run Firefox from a copy of an existing profile (for example one already signed in to Google).
+For each qualified business (completed profile, score >= `--min-score`, default 50) it runs a waterfall:
+
+1. **Module 2 data:** scraped page text, findings, emails and LinkedIn links are mined for people and job titles.
+2. **Rendered site crawl** (only if no target-role person yet; `--max-pages`, default 6): team/about/contact pages are opened in Firefox so JavaScript-built pages are read as a visitor sees them. Pages Module 2 already read are skipped.
+3. **Role ranking:** people are classified with `config/target_roles_dental.json` (target roles, fallback roles, excluded roles). Swap the file with `--roles-file` for other niches.
+4. **Web search** (only if still no target-role person, at most `--max-searches` per business, default 3): Google AI Overview first, DuckDuckGo as fallback. A result is accepted only if it contains the business's phone number, or its name plus location/domain.
+5. **Email:** an email found publicly is stored with `email_source` `website` or `search`; otherwise a pattern guess is stored as `inferred`. All other guesses are kept in `candidate_emails`. Every email is `unverified`; verification is Module 4.
+6. **Selection:** the highest-ranked role becomes the primary contact (`is_primary`); other target-role people are kept as secondary contacts. `source_urls` and `discovery_reasoning` record the evidence.
+
+Options: `--business-id ID`, `--redo` (reprocess and replace this module's contacts), `--no-search`, `--no-crawl`, `--dry-run`, `--delay SECONDS`, `--profile PATH` (copy of a Firefox profile, e.g. one signed in to Google, to reduce CAPTCHAs). Automated search may be restricted by Google's and DuckDuckGo's terms.
