@@ -51,3 +51,14 @@ python scripts/research_business_websites.py
 ```
 
 The script processes businesses with websites that do not yet have a completed profile. Failed profiles are skipped on normal runs; pass `--retry-failed` to retry them. Use `--limit N` for a bounded batch or `--business-id ID` for one business. It asks the agent to SCORE, SCRAPE, or EXIT after each page, enforces a maximum of five unique page visits per business, and stores compact page summaries/findings, discovered links, emails, and URLs in `business_website_profiles`. Only the current page's full cleaned text is sent on each agent turn; raw HTML is not saved.
+
+## Find business stakeholders
+
+Needs Firefox and [geckodriver](https://github.com/mozilla/geckodriver/releases) installed locally (no API keys). The script searches Google for each qualified business's owners, reads the AI Overview, falls back to DuckDuckGo, and stores each named person in `business_contacts` with pattern-guessed, unverified emails.
+
+```sh
+python -m pip install -r requirements.txt
+python scripts/find_business_stakeholders.py --limit 5 --headed
+```
+
+Use `--min-score N` (default 50), `--business-id ID`, `--delay SECONDS`, and `--profile PATH` to run Firefox from a copy of an existing profile (for example one already signed in to Google).
