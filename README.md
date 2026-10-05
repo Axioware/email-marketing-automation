@@ -72,3 +72,46 @@ For each qualified business (completed profile, score >= `--min-score`, default 
 6. **Selection:** the highest-ranked role becomes the primary contact (`is_primary`); other target-role people are kept as secondary contacts. `source_urls` and `discovery_reasoning` record the evidence.
 
 Options: `--business-id ID`, `--redo` (reprocess and replace this module's contacts), `--no-search`, `--no-crawl`, `--dry-run`, `--delay SECONDS`, `--profile PATH` (copy of a Firefox profile, e.g. one signed in to Google, to reduce CAPTCHAs). Automated search may be restricted by Google's and DuckDuckGo's terms.
+
+## Verify contact emails (Module 4)
+
+Checks whether the emails in `business_contacts` can receive mail, without sending any. Two engines share the same database columns and CSV report:
+
+- **`--engine reacher` (default):** calls a self-hosted [Reacher](https://github.com/reacherhq/check-if-email-exists) server running in Docker.
+- **`--engine smtp`:** the built-in prober (syntax, MX, provider detection, catch-all test, `RCPT TO`, greylist retries).
+
+Both need **outbound port 25** open: Reacher opens the SMTP connections from its container, which normally share your host's network path. Many home ISPs and cloud providers block port 25; if so, results come back `unknown`.
+
+### Reacher setup
+
+Start the container once. The sender address and HELO name are *container* settings (Reacher ignores them per request, and its default `localhost` is refused by servers such as Hostinger, giving false results), so set them from a domain you control:
+
+```sh
+docker run -d --name reacher --restart unless-stopped -p 127.0.0.1:8080:8080 \
+  -e RCH__FROM_EMAIL=verify@yourdomain.com \
+  -e RCH__HELLO_NAME=mail.yourdomain.com \
+  reacherhq/backend:latest
+```
+
+Optionally set `REACHER_URL` (default `http://127.0.0.1:8080`) and `REACHER_API_SECRET` (if you start the container with `RCH__HEADER_SECRET`) in `.env`.
+
+```sh
+python -m pip install -r requirements.txt
+alembic upgrade head
+python scripts/verify_contact_emails.py --primary-only --limit 5 --dry-run
+```
+
+Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky` and `unknown` -> `unknown`. The last two are **needs review**: `email_check_details.needs_review` is set, they are listed in the run summary, and they must not be sent to automatically. For inferred emails the candidates are tried in order while Reacher says `invalid`; the first `safe` one replaces `email`. Any other verdict (catch-all, blocked, unreachable) stops the search, since every candidate would get the same answer. Per-candidate verdicts go in `candidate_emails`, and Reacher's SMTP fields in `email_check_details.reacher`.
+
+The run stops early if Reacher is unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked).
+
+### Built-in SMTP engine
+
+Add a sender address on a domain you control to `.env` (servers reject probes from non-existent sender domains), then run with `--engine smtp`:
+
+```sh
+VERIFY_MAIL_FROM=verify@yourdomain.com
+VERIFY_HELO=host.yourdomain.com   # fully qualified; defaults to this machine's FQDN
+```
+
+`email_status` becomes `deliverable`, `undeliverable`, `risky` (catch-all, gateway, full mailbox) or `unknown` (blocked, greylisted, unreachable). Options for both engines: `--business-id`, `--recheck`, `--max-probes`, `--delay`, `--retry-rounds`, `--retry-wait`, `--report out.csv`, `--dry-run`.
