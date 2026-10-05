@@ -297,6 +297,32 @@ def candidate_list(contact: dict, max_probes: int) -> list[str]:
     return ordered[:max_probes]
 
 
+def check_address(address: str, client: ReacherClient, delay: float, last_call: dict[str, float]) -> dict:
+    """Ask Reacher about one address (spaced out per domain). Returns the mapped outcome.
+
+    {"address", "status" (deliverable/undeliverable/risky/unknown), "verdict" (Reacher's is_reachable or
+    "unknown"), "summary" (None when the call itself failed), "note", "retryable"}. A failed call is reported as
+    unknown, unless Reacher itself died, in which case ReacherUnavailable propagates.
+    """
+    domain = address.rpartition("@")[2].casefold()
+    wait = delay - (time.monotonic() - last_call.get(domain, 0.0))
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        result = client.check(address)
+    except ReacherError as error:
+        client.version()  # raises ReacherUnavailable if Reacher itself died, so the address is not recorded as unknown
+        return {"address": address, "status": "unknown", "verdict": "unknown", "summary": None,
+                "note": str(error), "retryable": True}
+    finally:
+        last_call[domain] = time.monotonic()
+    summary = summarize_reacher(result)
+    status = REACHER_STATUS.get(summary["is_reachable"], "unknown")
+    retryable = status == "unknown" and not (summary["smtp_error"] or "").startswith("permanent")
+    return {"address": address, "status": status, "verdict": summary["is_reachable"] or "unknown",
+            "summary": summary, "note": reacher_note(summary), "retryable": retryable}
+
+
 def verify_contact(contact: dict, client: ReacherClient, args, last_call: dict[str, float]) -> dict:
     """Return the update values for one contact.
 
@@ -333,27 +359,17 @@ def verify_contact(contact: dict, client: ReacherClient, args, last_call: dict[s
 
     last_summary: dict | None = None
     for address in candidate_list(contact, args.max_probes):
-        domain = address.rpartition("@")[2].casefold()
-        wait = args.delay - (time.monotonic() - last_call.get(domain, 0.0))
-        if wait > 0:
-            time.sleep(wait)
-        try:
-            result = client.check(address)
-        except ReacherError as error:
-            client.version()  # raises ReacherUnavailable if Reacher itself died, so this contact is not marked unknown
-            probes.append({"email": address, "code": None, "message": str(error), "result": "unknown"})
-            return finish("unknown", note=str(error), retryable=True)
-        finally:
-            last_call[domain] = time.monotonic()
-        summary = summarize_reacher(result)
-        status = REACHER_STATUS.get(summary["is_reachable"], "unknown")
-        note = reacher_note(summary)
-        probes.append({"email": address, "code": None, "message": note or "safe", "result": summary["is_reachable"]})
+        outcome = check_address(address, client, args.delay, last_call)
+        summary, note = outcome["summary"], outcome["note"]
+        probes.append({"email": address, "code": None, "message": note or "safe",
+                       "result": (summary or {}).get("is_reachable") or "unknown"})
+        if summary is None:  # the call failed (timeout, dropped connection)
+            return finish("unknown", note=note, retryable=True)
         last_summary = summary
-        if status == "undeliverable":
+        if outcome["status"] == "undeliverable":
             continue  # this guess does not exist; try the next candidate
-        retryable = status == "unknown" and not (summary["smtp_error"] or "").startswith("permanent")
-        return finish(status, address if status == "deliverable" else None, note, summary, retryable)
+        status = outcome["status"]
+        return finish(status, address if status == "deliverable" else None, note, summary, outcome["retryable"])
     note = reacher_note(last_summary) if len(probes) == 1 else f"Reacher says none of the {len(probes)} candidate addresses exist"
     return finish("undeliverable", note=note, summary=last_summary)
 
@@ -403,38 +419,25 @@ def write_report(path: Path, rows: list[dict]) -> None:
     print(f"Report written to {path}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Verify contact emails with a self-hosted Reacher server in Docker. Sends no email."
-    )
-    parser.add_argument("--business-id", type=int, help="Verify one business only.")
-    parser.add_argument("--limit", type=int, help="Maximum number of contacts in this run.")
-    parser.add_argument("--primary-only", action="store_true", help="Only verify primary contacts.")
-    parser.add_argument("--recheck", action="store_true", help="Also re-verify contacts that already have a result.")
-    parser.add_argument("--max-probes", type=int, default=DEFAULT_MAX_PROBES, help="Candidate addresses to try per contact.")
+def add_reacher_arguments(parser: argparse.ArgumentParser) -> None:
+    """Options shared by every script that talks to the local Reacher container."""
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Minimum seconds between checks to one domain.")
-    parser.add_argument("--retry-rounds", type=int, default=DEFAULT_RETRY_ROUNDS,
-                        help="Extra passes for greylisted/timed-out contacts (default: 1; 0 disables).")
-    parser.add_argument("--retry-wait", type=float, default=DEFAULT_RETRY_WAIT,
-                        help="Seconds to wait before each retry pass (default: 120).")
     parser.add_argument("--reacher-url", help=f"Local Reacher base URL (default: REACHER_URL or {REACHER_DEFAULT_URL}).")
     parser.add_argument("--reacher-timeout", type=float, default=DEFAULT_REACHER_TIMEOUT,
                         help="Seconds to wait for one Reacher check (default: 90).")
     parser.add_argument("--mail-from", help="Sender address Reacher announces (default: VERIFY_MAIL_FROM).")
-    parser.add_argument("--helo", help="Fully-qualified hostname Reacher announces (default: VERIFY_HELO).")
+    parser.add_argument("--helo", help="Fully-qualified hostname or [ip] Reacher announces (default: VERIFY_HELO).")
     parser.add_argument("--no-auto-start", action="store_true",
                         help="Do not create/start/reconfigure the Reacher Docker container.")
     parser.add_argument("--reacher-container", default=REACHER_CONTAINER, help=argparse.SUPPRESS)
-    parser.add_argument("--report", type=Path, help="Write a CSV report of this run's results.")
-    parser.add_argument("--dry-run", action="store_true", help="Check and print results without writing to the database.")
-    args = parser.parse_args()
-    if args.max_probes < 1 or args.delay < 0 or args.reacher_timeout <= 0 or args.retry_rounds < 0 or args.retry_wait < 0:
-        parser.error("--max-probes must be >= 1, --reacher-timeout > 0, and the delay/retry options cannot be negative")
 
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        parser.error("DATABASE_URL is not set in the environment or project .env file")
+
+def prepare_reacher(parser: argparse.ArgumentParser, args) -> ReacherClient | None:
+    """Validate the sender identity, make sure Reacher runs with it, and check the sender can receive mail.
+
+    Calls parser.error() for configuration mistakes. Returns None (after printing why) when Reacher cannot be
+    used, so the caller can exit with status 1.
+    """
     mail_from = args.mail_from or os.environ.get("VERIFY_MAIL_FROM") or None
     helo = args.helo or os.environ.get("VERIFY_HELO") or None
     if helo and "." not in helo:
@@ -459,14 +462,44 @@ def main() -> int:
     except ReacherUnavailable as error:
         print(error)
         print("Reacher must run locally in Docker (see README).")
-        return 1
+        return None
     print(f"Using Reacher {version} at {client.base_url}. Outbound port 25 must be open for it. No email is sent.")
     if mail_from:
         problem = check_sender(client, mail_from)
         if problem:
             print(f"Sender problem: {problem}. Mail servers would reject every check and Reacher would report real "
                   "mailboxes as invalid. Set VERIFY_MAIL_FROM to an address on a domain you own that receives mail.")
-            return 1
+            return None
+    return client
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify contact emails with a self-hosted Reacher server in Docker. Sends no email."
+    )
+    parser.add_argument("--business-id", type=int, help="Verify one business only.")
+    parser.add_argument("--limit", type=int, help="Maximum number of contacts in this run.")
+    parser.add_argument("--primary-only", action="store_true", help="Only verify primary contacts.")
+    parser.add_argument("--recheck", action="store_true", help="Also re-verify contacts that already have a result.")
+    parser.add_argument("--max-probes", type=int, default=DEFAULT_MAX_PROBES, help="Candidate addresses to try per contact.")
+    add_reacher_arguments(parser)
+    parser.add_argument("--retry-rounds", type=int, default=DEFAULT_RETRY_ROUNDS,
+                        help="Extra passes for greylisted/timed-out contacts (default: 1; 0 disables).")
+    parser.add_argument("--retry-wait", type=float, default=DEFAULT_RETRY_WAIT,
+                        help="Seconds to wait before each retry pass (default: 120).")
+    parser.add_argument("--report", type=Path, help="Write a CSV report of this run's results.")
+    parser.add_argument("--dry-run", action="store_true", help="Check and print results without writing to the database.")
+    args = parser.parse_args()
+    if args.max_probes < 1 or args.delay < 0 or args.reacher_timeout <= 0 or args.retry_rounds < 0 or args.retry_wait < 0:
+        parser.error("--max-probes must be >= 1, --reacher-timeout > 0, and the delay/retry options cannot be negative")
+
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        parser.error("DATABASE_URL is not set in the environment or project .env file")
+    client = prepare_reacher(parser, args)
+    if client is None:
+        return 1
 
     engine = create_engine(database_url, pool_pre_ping=True)
     metadata = MetaData()
