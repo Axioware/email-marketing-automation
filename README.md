@@ -75,25 +75,30 @@ Options: `--business-id ID`, `--redo` (reprocess and replace this module's conta
 
 ## Verify contact emails (Module 4)
 
-Checks whether the emails in `business_contacts` can receive mail, without sending any. Two engines share the same database columns and CSV report:
+Checks whether the emails in `business_contacts` can receive mail, without sending any. All verification is done by [Reacher](https://github.com/reacherhq/check-if-email-exists) (`reacherhq/backend`) running in **your own Docker**; no hosted service or API key is used, and the script itself does no DNS or SMTP checking.
 
-- **`--engine reacher` (default):** calls a self-hosted [Reacher](https://github.com/reacherhq/check-if-email-exists) server running in Docker.
-- **`--engine smtp`:** the built-in prober (syntax, MX, provider detection, catch-all test, `RCPT TO`, greylist retries).
+Requirements: Docker, and **outbound port 25** open (Reacher opens the SMTP connections from its container, which normally shares your host's network path; many home ISPs and cloud providers block it, in which case results come back `unknown`).
 
-Both need **outbound port 25** open: Reacher opens the SMTP connections from its container, which normally share your host's network path. Many home ISPs and cloud providers block port 25; if so, results come back `unknown`.
+### Setup
 
-### Reacher setup
+Put a sender address and a fully-qualified hostname on a domain you control in `.env`. **The sender's domain must be real and able to receive mail**: mail servers reject checks sent from a sender that cannot receive mail (for example Hostinger answers `550 Sender address rejected: Domain example.org does not accept mail`), and Reacher reports that rejection as an invalid mailbox, which turns real addresses into false `undeliverable` results. The script therefore refuses placeholder domains (`example.com`, `*.invalid`, ...) and asks Reacher to confirm the sender's domain accepts mail before checking any contact.
 
-Start the container once. The sender address and HELO name are *container* settings (Reacher ignores them per request, and its default `localhost` is refused by servers such as Hostinger, giving false results), so set them from a domain you control:
+```sh
+VERIFY_MAIL_FROM=verify@yourdomain.com
+VERIFY_HELO=yourdomain.com
+```
+
+Reacher ignores the sender and HELO per request and defaults to `localhost`, which mail servers such as Hostinger refuse (giving false results), so they are container settings. The script manages the container for you: on each run it creates the `reacher` container if missing (`127.0.0.1:8080`, `--restart unless-stopped`), starts it if stopped, and **recreates it if its sender/HELO differ from `.env`**. Use `--no-auto-start` to manage Docker yourself, e.g.:
 
 ```sh
 docker run -d --name reacher --restart unless-stopped -p 127.0.0.1:8080:8080 \
-  -e RCH__FROM_EMAIL=verify@yourdomain.com \
-  -e RCH__HELLO_NAME=mail.yourdomain.com \
+  -e RCH__FROM_EMAIL=verify@yourdomain.com -e RCH__HELLO_NAME=mail.yourdomain.com \
   reacherhq/backend:latest
 ```
 
-Optionally set `REACHER_URL` (default `http://127.0.0.1:8080`) and `REACHER_API_SECRET` (if you start the container with `RCH__HEADER_SECRET`) in `.env`.
+**No domain of your own?** A mailbox you own works as the sender (`VERIFY_MAIL_FROM=you@gmail.com`; the script warns because some servers check SPF for the sender and may refuse the checks), and a host without a name can announce its IP as an address literal: `VERIFY_HELO=[203.0.113.7]` (RFC 5321). Home IPs change, so update the literal when yours does. A reverse-DNS name for your IP, if you have one (`dig +short -x <your ip>`), is better than the literal. Never use someone else's domain.
+
+`REACHER_URL` may change the local port; non-local URLs are refused.
 
 ```sh
 python -m pip install -r requirements.txt
@@ -101,17 +106,16 @@ alembic upgrade head
 python scripts/verify_contact_emails.py --primary-only --limit 5 --dry-run
 ```
 
-Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky` and `unknown` -> `unknown`. The last two are **needs review**: `email_check_details.needs_review` is set, they are listed in the run summary, and they must not be sent to automatically. For inferred emails the candidates are tried in order while Reacher says `invalid`; the first `safe` one replaces `email`. Any other verdict (catch-all, blocked, unreachable) stops the search, since every candidate would get the same answer. Per-candidate verdicts go in `candidate_emails`, and Reacher's SMTP fields in `email_check_details.reacher`.
+### Verdicts
 
-The run stops early if Reacher is unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked).
+Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky` and `unknown` -> `unknown`. The last two are **needs review**: `email_check_details.needs_review` is set, they are listed in the run summary, and they must not be sent to automatically. For inferred emails the candidates are tried in order while Reacher says `invalid`; the first `safe` one replaces `email`. Any other verdict (catch-all, blocked, unreachable) stops the search, since every candidate would get the same answer. Per-candidate verdicts go in `candidate_emails`, and Reacher's SMTP fields in `email_check_details.reacher`. Timeouts and transient (greylisting) failures are retried once after `--retry-wait`.
 
-### Built-in SMTP engine
+The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked). Options: `--business-id`, `--limit`, `--primary-only`, `--recheck`, `--max-probes`, `--delay`, `--retry-rounds`, `--retry-wait`, `--reacher-timeout`, `--report out.csv`, `--dry-run`.
 
-Add a sender address on a domain you control to `.env` (servers reject probes from non-existent sender domains), then run with `--engine smtp`:
+## Tests
 
 ```sh
-VERIFY_MAIL_FROM=verify@yourdomain.com
-VERIFY_HELO=host.yourdomain.com   # fully qualified; defaults to this machine's FQDN
+python -m unittest discover -s tests -t .
 ```
 
-`email_status` becomes `deliverable`, `undeliverable`, `risky` (catch-all, gateway, full mailbox) or `unknown` (blocked, greylisted, unreachable). Options for both engines: `--business-id`, `--recheck`, `--max-probes`, `--delay`, `--retry-rounds`, `--retry-wait`, `--report out.csv`, `--dry-run`.
+Unit tests use a fake Reacher server. The end-to-end tests run the real CLI against a throwaway local Postgres container with the real migrations (they never use your `.env` database), and one test starts the real Reacher image on a spare port. Without Docker, those tests are skipped.
