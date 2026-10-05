@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,6 @@ def contact(email="good@fake.org", candidates=(), source="website"):
     return {"email": email, "email_source": source, "candidate_emails": [{"email": c} for c in candidates]}
 
 
-ARGS = SimpleNamespace(delay=0, max_probes=6)
 
 
 class SenderGuardTests(unittest.TestCase):
@@ -46,12 +46,123 @@ class SenderGuardTests(unittest.TestCase):
         self.assertIsNone(v.check_sender(self.client, "good@mine.org"))
 
 
+class PureLogicTests(unittest.TestCase):
+    def test_candidate_addresses_puts_the_contact_email_first_and_dedupes(self):
+        contact = {"email": "Shoaib@x.pk", "candidate_emails": [
+            {"email": "shoaib@x.pk"}, {"email": "a@x.pk"}, {"email": "A@x.pk"}, {"email": "b@x.pk"}]}
+        self.assertEqual(v.candidate_addresses(contact), ["Shoaib@x.pk", "a@x.pk", "b@x.pk"])
+
+    def test_found_email_missing_from_candidates_is_still_checked(self):
+        contact = {"email": "owner@x.pk", "candidate_emails": [{"email": "other@x.pk"}]}
+        self.assertEqual(v.candidate_addresses(contact)[0], "owner@x.pk")
+
+    def test_junk_entries_are_ignored(self):
+        contact = {"email": None, "candidate_emails": [{"email": ""}, {"email": "no-at-sign"}, {}, {"email": None}, {"email": " ok@x.pk "}]}
+        self.assertEqual(v.candidate_addresses(contact), ["ok@x.pk"])
+        self.assertEqual(v.candidate_addresses({"email": None, "candidate_emails": None}), [])
+
+    def test_cap(self):
+        contact = {"email": "a@x.pk", "candidate_emails": [{"email": f"c{i}@x.pk"} for i in range(10)]}
+        self.assertEqual(len(v.candidate_addresses(contact, 3)), 3)
+        self.assertEqual(len(v.candidate_addresses(contact, 0)), 11)
+
+    def test_prospect_values_owns_only_verification_columns(self):
+        contact = {"id": 7, "business_id": 3, "qualification_score": 78}
+        values = v.prospect_values(contact, "a@x.pk", "deliverable", "NOW")
+        self.assertEqual(values, {
+            "business_id": 3, "contact_id": 7, "email": "a@x.pk", "email_status": "deliverable",
+            "email_verification_provider": "reacher", "email_verified_at": "NOW", "qualification_score": 78,
+            "outreach_status": "ready"})
+        for later in ("outreach_priority", "outreach_facts", "research_summary", "do_not_contact", "last_contacted_at"):
+            self.assertNotIn(later, values)
+
+    def test_outreach_status_for_a_prospect_that_stopped_being_deliverable(self):
+        self.assertEqual(v.OUTREACH_STATUS["deliverable"], "ready")
+        self.assertEqual(v.OUTREACH_STATUS["undeliverable"], "rejected")
+        self.assertEqual(v.OUTREACH_STATUS["risky"], "needs_review")
+        self.assertEqual(v.OUTREACH_STATUS["unknown"], "needs_review")
+
+    def test_record_check_stores_the_verdict_on_the_candidate_only(self):
+        when = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        contact = {"email": "own@x.pk", "candidate_emails": [{"email": "a@x.pk", "pattern": "p"}, {"email": "b@x.pk"}]}
+        values = v.record_check(contact, "A@x.pk", {"verdict": "invalid", "status": "undeliverable"}, when)
+        self.assertEqual(values, {"candidate_emails": [
+            {"email": "a@x.pk", "pattern": "p", "check": "invalid", "checked_at": when.isoformat()}, {"email": "b@x.pk"}]})
+        self.assertNotIn("check", contact["candidate_emails"][1])
+
+    def test_record_check_updates_the_contacts_own_status_but_never_its_email(self):
+        when = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        contact = {"email": "own@x.pk", "candidate_emails": []}
+        values = v.record_check(contact, "own@x.pk", {"verdict": "safe", "status": "deliverable"}, when)
+        self.assertEqual((values["email_status"], values["email_checked_at"]), ("deliverable", when))
+        self.assertNotIn("email", values)
+
+    def test_already_decided(self):
+        contact = {"email": "own@x.pk", "email_status": None, "candidate_emails": [
+            {"email": "no@x.pk", "check": "invalid"}, {"email": "rk@x.pk", "check": "risky"},
+            {"email": "ok@x.pk", "check": "safe"}, {"email": "uk@x.pk", "check": "unknown"}, {"email": "new@x.pk"}]}
+        self.assertTrue(v.already_decided(contact, "no@x.pk", None))
+        self.assertTrue(v.already_decided(contact, "rk@x.pk", None))
+        self.assertFalse(v.already_decided(contact, "uk@x.pk", None))  # unknown is checked again
+        self.assertFalse(v.already_decided(contact, "new@x.pk", None))
+        self.assertFalse(v.already_decided(contact, "ok@x.pk", None))  # a deliverable verdict counts only via prospects
+        self.assertTrue(v.already_decided(contact, "ok@x.pk", "deliverable"))
+        self.assertFalse(v.already_decided(contact, "own@x.pk", None))
+        self.assertTrue(v.already_decided({**contact, "email_status": "undeliverable"}, "own@x.pk", None))
+        self.assertFalse(v.already_decided({**contact, "email_status": "deliverable"}, "own@x.pk", None))
+
+    def test_domain_shortcut(self):
+        def outcome(status, summary, retryable=False):
+            return {"status": status, "summary": summary, "retryable": retryable}
+        self.assertEqual(v.domain_shortcut(outcome("unknown", None))[0], "unknown")
+        self.assertEqual(v.domain_shortcut(outcome("risky", {"is_catch_all": True}))[0], "risky")
+        self.assertEqual(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": False}))[0], "unknown")
+        self.assertEqual(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": True}, retryable=False))[0], "unknown")
+        self.assertIsNone(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": True}, retryable=True)))  # greylisting
+        self.assertIsNone(v.domain_shortcut(outcome("deliverable", {"can_connect_smtp": True})))
+        self.assertIsNone(v.domain_shortcut(outcome("undeliverable", {"can_connect_smtp": True})))
+        self.assertIsNone(v.domain_shortcut(outcome("risky", {"is_catch_all": False, "has_full_inbox": True})))
+
+
+class CheckAddressTests(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeReacher()
+        self.addCleanup(self.server.close)
+        self.client = v.ReacherClient(self.server.url, 5)
+
+    def test_outcomes(self):
+        for local, status, verdict in [("good", "deliverable", "safe"), ("bad", "undeliverable", "invalid"),
+                                       ("catchall", "risky", "risky"), ("blocked", "unknown", "unknown")]:
+            outcome = v.check_address(f"{local}@x.org", self.client, 0, {})
+            self.assertEqual((outcome["status"], outcome["verdict"]), (status, verdict), local)
+
+    def test_retryable_flags(self):
+        self.assertTrue(v.check_address("grey@x.org", self.client, 0, {})["retryable"])
+        self.assertFalse(v.check_address("blocked@x.org", self.client, 0, {})["retryable"])
+
+    def test_failed_call_is_unknown_without_summary(self):
+        self.server.die_on = "drop"
+        outcome = v.check_address("drop@x.org", self.client, 0, {})
+        self.assertEqual((outcome["status"], outcome["summary"], outcome["retryable"]), ("unknown", None, True))
+
+    def test_dead_server_raises(self):
+        self.server.shutdown_on = "drop"
+        with self.assertRaises(v.ReacherUnavailable):
+            v.check_address("drop@x.org", self.client, 0, {})
+
+    def test_throttles_per_domain(self):
+        last = {}
+        started = time.monotonic()
+        v.check_address("good@x.org", self.client, 0.4, last)
+        v.check_address("good2@x.org", self.client, 0.4, last)
+        self.assertGreaterEqual(time.monotonic() - started, 0.4)
+
+
 class MappingTests(unittest.TestCase):
     def test_reacher_status_mapping(self):
         self.assertEqual(
             v.REACHER_STATUS, {"safe": "deliverable", "invalid": "undeliverable", "risky": "risky", "unknown": "unknown"}
         )
-        self.assertEqual(v.NEEDS_REVIEW_STATUSES, {"risky", "unknown"})
 
     def test_notes_cover_every_verdict(self):
         cases = [
@@ -141,129 +252,6 @@ class ClientTests(unittest.TestCase):
     def test_server_down_during_check_is_unavailable(self):
         with self.assertRaises(v.ReacherUnavailable):
             v.ReacherClient("http://127.0.0.1:9", 2).check("a@b.org")
-
-
-class VerifyContactReacherTests(unittest.TestCase):
-    def setUp(self):
-        self.server = FakeReacher()
-        self.addCleanup(self.server.close)
-        self.client = v.ReacherClient(self.server.url, 5)
-
-    def run_contact(self, *args, **kwargs):
-        return v.verify_contact(contact(*args, **kwargs), self.client, ARGS, {})
-
-    def test_each_verdict(self):
-        expected = {
-            "good": ("deliverable", False), "bad": ("undeliverable", False), "nomx": ("undeliverable", False),
-            "catchall": ("risky", True), "full": ("risky", True), "odd": ("risky", True),
-            "blocked": ("unknown", True), "grey": ("unknown", True),
-        }
-        for local, (status, review) in expected.items():
-            values = self.run_contact(f"{local}@fake.org")
-            self.assertEqual(values["email_status"], status, local)
-            self.assertEqual(values["email_check_details"]["needs_review"], review, local)
-
-    def test_safe_never_changes_the_email(self):
-        self.assertNotIn("email", self.run_contact("good@fake.org"))
-
-    def test_catch_all_flag_recorded(self):
-        details = self.run_contact("catchall@fake.org")["email_check_details"]
-        self.assertTrue(details["catch_all"])
-        self.assertTrue(details["reacher"]["is_catch_all"])
-
-    def test_role_based_comes_only_from_reacher(self):
-        self.assertTrue(self.run_contact("info@fake.org")["email_check_details"]["role_based"])
-        self.assertFalse(self.run_contact("good@fake.org")["email_check_details"]["role_based"])
-        self.server.raw_response = b'{"is_reachable": "unknown"}'  # Reacher gave no role information
-        self.assertFalse(self.run_contact("admin@fake.org")["email_check_details"]["role_based"])  # no local guessing
-
-    def test_retryable_only_for_transient_unknowns(self):
-        self.assertTrue(self.run_contact("grey@fake.org")["email_check_details"]["retryable"])
-        self.assertFalse(self.run_contact("blocked@fake.org")["email_check_details"]["retryable"])
-        self.assertFalse(self.run_contact("good@fake.org")["email_check_details"]["retryable"])
-
-    def test_inferred_candidates_promote_first_safe(self):
-        values = self.run_contact("bad@fake.org", ["bad2@fake.org", "good@fake.org", "never@fake.org"], "inferred")
-        self.assertEqual(values["email_status"], "deliverable")
-        self.assertEqual(values["email"], "good@fake.org")
-        self.assertEqual(self.server.calls, ["bad@fake.org", "bad2@fake.org", "good@fake.org"])
-        checks = {c["email"]: c.get("check") for c in values["candidate_emails"]}
-        self.assertEqual(checks, {"bad2@fake.org": "invalid", "good@fake.org": "safe", "never@fake.org": None})
-
-    def test_catch_all_stops_the_candidate_search(self):
-        values = self.run_contact("catchall@fake.org", ["good@fake.org"], "inferred")
-        self.assertEqual(values["email_status"], "risky")
-        self.assertNotIn("email", values)
-        self.assertEqual(self.server.calls, ["catchall@fake.org"])
-
-    def test_blocked_and_grey_stop_the_candidate_search(self):
-        for local in ("blocked", "grey", "nosmtp"):
-            self.server.calls.clear()
-            values = self.run_contact(f"{local}@fake.org", ["good@fake.org"], "inferred")
-            self.assertEqual(values["email_status"], "unknown", local)
-            self.assertEqual(len(self.server.calls), 1, local)
-
-    def test_website_email_ignores_candidates(self):
-        values = self.run_contact("bad@fake.org", ["good@fake.org"], "website")
-        self.assertEqual(values["email_status"], "undeliverable")
-        self.assertEqual(self.server.calls, ["bad@fake.org"])
-
-    def test_all_invalid_is_undeliverable_with_count(self):
-        values = self.run_contact("bad@fake.org", ["bad2@fake.org"], "inferred")
-        self.assertEqual(values["email_status"], "undeliverable")
-        self.assertIn("2 candidate", values["email_check_details"]["note"])
-
-    def test_max_probes_caps_calls(self):
-        args = SimpleNamespace(delay=0, max_probes=2)
-        v.verify_contact(contact("bad@fake.org", ["bad2@fake.org", "good@fake.org"], "inferred"),
-                                 self.client, args, {})
-        self.assertEqual(len(self.server.calls), 2)
-
-    def test_syntax_is_left_to_reacher(self):
-        values = self.run_contact("not@@valid")
-        self.assertEqual(self.server.calls, ["not@@valid"])  # no local pre-check
-        self.assertEqual(values["email_status"], "undeliverable")
-
-    def test_timeout_marks_unknown_retryable(self):
-        self.server.delays["slow"] = 3
-        client = v.ReacherClient(self.server.url, 1)
-        values = v.verify_contact(contact("slow@fake.org"), client, ARGS, {})
-        self.assertEqual(values["email_status"], "unknown")
-        self.assertTrue(values["email_check_details"]["retryable"])
-        self.assertTrue(v.was_retryable(values))
-
-    def test_per_domain_throttle(self):
-        args = SimpleNamespace(delay=0.4, max_probes=6)
-        last = {}
-        started = time.monotonic()
-        v.verify_contact(contact("good@fake.org"), self.client, args, last)
-        v.verify_contact(contact("good2@fake.org"), self.client, args, last)
-        self.assertGreaterEqual(time.monotonic() - started, 0.4)
-        started = time.monotonic()
-        v.verify_contact(contact("good@other.org"), self.client, args, last)
-        self.assertLess(time.monotonic() - started, 0.4)  # a different domain is not throttled
-
-    def test_dropped_connection_marks_unknown_and_retryable(self):
-        self.server.die_on = "drop"
-        values = self.run_contact("drop@fake.org")
-        self.assertEqual(values["email_status"], "unknown")
-        self.assertTrue(values["email_check_details"]["retryable"])
-
-    def test_check_failure_with_dead_server_raises_unavailable(self):
-        self.server.shutdown_on = "drop"
-        with self.assertRaises(v.ReacherUnavailable):
-            self.run_contact("drop@fake.org")
-
-    def test_unavailable_propagates(self):
-        client = v.ReacherClient("http://127.0.0.1:9", 2)
-        with self.assertRaises(v.ReacherUnavailable):
-            v.verify_contact(contact("good@fake.org"), client, ARGS, {})
-
-    def test_retry_predicate(self):
-        retryable = {"email_status": "unknown", "email_check_details": {"retryable": True}}
-        self.assertTrue(v.was_retryable(retryable))
-        self.assertFalse(v.was_retryable({"email_status": "unknown", "email_check_details": {"retryable": False}}))
-        self.assertFalse(v.was_retryable({"email_status": "deliverable", "email_check_details": {"retryable": True}}))
 
 
 def completed(returncode=0, stdout="", stderr=""):

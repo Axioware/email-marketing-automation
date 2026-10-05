@@ -1,7 +1,16 @@
-"""Verify contact emails with a self-hosted Reacher server (reacherhq/backend in Docker).
+"""Verify candidate emails with a self-hosted Reacher server (Docker) and store the verified ones in `prospects`.
 
-All verification is done by Reacher. This script only sets Reacher up, asks it about each address, maps
-its verdict to `email_status` and stores the result. Nothing here probes mail servers itself and no email
+Flow: for each contact in `business_contacts`, take the contact's own `email` plus every address in
+`candidate_emails`, check each with Reacher, and store the ones Reacher confirms as deliverable in `prospects`.
+Every address's outcome (deliverable, undeliverable, risky, unknown) is also recorded on the contact in
+`business_contacts.candidate_emails`, so reruns skip addresses already checked and nothing is lost.
+
+If a stored prospect is rechecked and is no longer deliverable, its row is updated so it cannot stay "ready".
+
+This script owns only the verification columns of `prospects` (`email_status`, `email_verification_provider`,
+`email_verified_at`, `qualification_score` and the verification-derived `outreach_status`). Columns that later
+stages fill (`outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact`, `last_contacted_at`)
+are never overwritten. All verification is done by Reacher; nothing here probes mail servers itself and no email
 is ever sent.
 """
 import argparse
@@ -20,8 +29,9 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from sqlalchemy import MetaData, Table, create_engine, or_, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import MetaData, Table, and_, case, create_engine, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 REACHER_IMAGE = "reacherhq/backend:latest"
 REACHER_CONTAINER = "reacher"
@@ -36,16 +46,19 @@ CONSUMER_SENDER_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.
 RESERVED_DOMAINS = {"example.com", "example.net", "example.org", "localhost"}
 RESERVED_TLDS = {"example", "invalid", "test", "localhost", "local"}
 
-DEFAULT_MAX_PROBES = 6
 DEFAULT_DELAY = 2.0
-DEFAULT_RETRY_ROUNDS = 1
-DEFAULT_RETRY_WAIT = 120.0
 DEFAULT_REACHER_TIMEOUT = 90.0  # a real SMTP conversation with a slow server can take a minute
 MAX_CONSECUTIVE_NO_SMTP = 3
-VERIFIABLE_STATUSES = ("unverified", "unknown")
 
 REACHER_STATUS = {"safe": "deliverable", "invalid": "undeliverable", "risky": "risky", "unknown": "unknown"}
-NEEDS_REVIEW_STATUSES = {"risky", "unknown"}  # held for review, never used automatically
+
+PROVIDER = "reacher"
+CONSTRAINT = "uq_prospects_contact_email"
+# What verification alone says about outreach. Later stages may move a prospect on (e.g. to "contacted"); the
+# upsert only ever rewrites these values and never touches a prospect that has moved on or is do_not_contact.
+OUTREACH_STATUS = {"deliverable": "ready", "risky": "needs_review", "unknown": "needs_review", "undeliverable": "rejected"}
+MANAGED_OUTREACH_STATUSES = ("pending", "ready", "needs_review", "rejected")
+CONCLUSIVE_VERDICTS = {"safe", "invalid", "risky"}  # Reacher verdicts that stay as recorded; unknown is checked again
 
 
 class ReacherUnavailable(RuntimeError):
@@ -283,20 +296,6 @@ def check_sender(client: ReacherClient, mail_from: str) -> str | None:
     return None
 
 
-def candidate_list(contact: dict, max_probes: int) -> list[str]:
-    """Current email first, then the other guesses (inferred emails only), de-duplicated."""
-    addresses = [contact["email"]]
-    if contact["email_source"] in ("inferred", "pattern"):
-        addresses += [item["email"] for item in contact["candidate_emails"] or [] if item.get("email")]
-    seen, ordered = set(), []
-    for address in addresses:
-        key = address.casefold()
-        if key not in seen:
-            seen.add(key)
-            ordered.append(address)
-    return ordered[:max_probes]
-
-
 def check_address(address: str, client: ReacherClient, delay: float, last_call: dict[str, float]) -> dict:
     """Ask Reacher about one address (spaced out per domain). Returns the mapped outcome.
 
@@ -321,102 +320,6 @@ def check_address(address: str, client: ReacherClient, delay: float, last_call: 
     retryable = status == "unknown" and not (summary["smtp_error"] or "").startswith("permanent")
     return {"address": address, "status": status, "verdict": summary["is_reachable"] or "unknown",
             "summary": summary, "note": reacher_note(summary), "retryable": retryable}
-
-
-def verify_contact(contact: dict, client: ReacherClient, args, last_call: dict[str, float]) -> dict:
-    """Return the update values for one contact.
-
-    safe -> deliverable, invalid -> undeliverable, risky/unknown -> needs review. For inferred emails the
-    candidates are tried in order while Reacher says invalid; any other verdict stops the search, since
-    catch-all, blocked or unreachable servers give the same answer for every candidate.
-    """
-    now = datetime.now(timezone.utc)
-    details: dict = {"engine": "reacher", "probes": [], "checked_at": now.isoformat()}
-    probes = details["probes"]
-
-    def finish(status: str, email: str | None = None, note: str | None = None, summary: dict | None = None,
-               retryable: bool = False) -> dict:
-        values = {"email_checked_at": now, "email_check_details": details, "email_status": status}
-        if email and email.casefold() != contact["email"].casefold():
-            values["email"] = email
-        summary = summary or {}
-        details.update(
-            needs_review=status in NEEDS_REVIEW_STATUSES,
-            retryable=retryable,
-            catch_all=summary.get("is_catch_all"),
-            role_based=bool(summary.get("is_role_account")),
-            reacher=summary or None,
-        )
-        if note:
-            details["note"] = note
-        results = {p["email"].casefold(): p for p in probes}
-        values["candidate_emails"] = [
-            {**item, "check": results[item["email"].casefold()]["result"]}
-            if item.get("email", "").casefold() in results else item
-            for item in contact["candidate_emails"] or []
-        ]
-        return values
-
-    last_summary: dict | None = None
-    for address in candidate_list(contact, args.max_probes):
-        outcome = check_address(address, client, args.delay, last_call)
-        summary, note = outcome["summary"], outcome["note"]
-        probes.append({"email": address, "code": None, "message": note or "safe",
-                       "result": (summary or {}).get("is_reachable") or "unknown"})
-        if summary is None:  # the call failed (timeout, dropped connection)
-            return finish("unknown", note=note, retryable=True)
-        last_summary = summary
-        if outcome["status"] == "undeliverable":
-            continue  # this guess does not exist; try the next candidate
-        status = outcome["status"]
-        return finish(status, address if status == "deliverable" else None, note, summary, outcome["retryable"])
-    note = reacher_note(last_summary) if len(probes) == 1 else f"Reacher says none of the {len(probes)} candidate addresses exist"
-    return finish("undeliverable", note=note, summary=last_summary)
-
-
-def was_retryable(values: dict) -> bool:
-    return values["email_status"] == "unknown" and bool(values["email_check_details"].get("retryable"))
-
-
-# ---------------------------------------------------------------- database and main
-
-
-def load_contacts(connection, contacts, args):
-    statement = (
-        select(
-            contacts.c.id,
-            contacts.c.business_id,
-            contacts.c.name,
-            contacts.c.email,
-            contacts.c.email_source,
-            contacts.c.email_status,
-            contacts.c.candidate_emails,
-            contacts.c.is_primary,
-        )
-        .where(contacts.c.email.is_not(None), contacts.c.email != "")
-        .order_by(contacts.c.is_primary.desc(), contacts.c.business_id, contacts.c.id)
-    )
-    if not args.recheck:
-        statement = statement.where(
-            or_(*(contacts.c.email_status == s for s in VERIFIABLE_STATUSES), contacts.c.email_status.is_(None))
-        )
-    if args.business_id is not None:
-        statement = statement.where(contacts.c.business_id == args.business_id)
-    if args.primary_only:
-        statement = statement.where(contacts.c.is_primary.is_(True))
-    if args.limit is not None:
-        statement = statement.limit(args.limit)
-    return [dict(row._mapping) for row in connection.execute(statement)]
-
-
-def write_report(path: Path, rows: list[dict]) -> None:
-    fields = ["contact_id", "business_id", "name", "original_email", "email", "status", "catch_all",
-              "role_based", "probes", "note", "last_reply"]
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Report written to {path}")
 
 
 def add_reacher_arguments(parser: argparse.ArgumentParser) -> None:
@@ -473,25 +376,169 @@ def prepare_reacher(parser: argparse.ArgumentParser, args) -> ReacherClient | No
     return client
 
 
+def candidate_addresses(contact: dict, max_candidates: int = 0) -> list[str]:
+    """The contact's own email first, then candidate_emails; de-duplicated, order kept (0 = no cap)."""
+    entries = [contact.get("email")] + [item.get("email") for item in contact.get("candidate_emails") or []]
+    seen, ordered = set(), []
+    for entry in entries:
+        address = entry.strip() if isinstance(entry, str) else ""
+        if "@" not in address or address.casefold() in seen:
+            continue
+        seen.add(address.casefold())
+        ordered.append(address)
+    return ordered[:max_candidates] if max_candidates else ordered
+
+
+def domain_shortcut(outcome: dict) -> tuple[str, str] | None:
+    """(status, reason) when this outcome means every other address on the same domain would get the same answer."""
+    summary = outcome["summary"]
+    if summary is None:
+        return "unknown", "the mail server did not answer"
+    if summary.get("is_catch_all"):
+        return "risky", "the domain accepts mail for any address (catch-all)"
+    if summary.get("can_connect_smtp") is False:
+        return "unknown", "Reacher could not connect to the mail server"
+    if outcome["status"] == "unknown" and not outcome["retryable"]:
+        return "unknown", "the mail server refused the checks"
+    return None
+
+
+def record_check(contact: dict, address: str, outcome: dict, when: datetime) -> dict:
+    """Merge one outcome into the contact's candidate_emails (in place) and return the columns to update.
+
+    Every checked address keeps Reacher's verdict (`check`) and time. If the address is the contact's own email,
+    the contact's email_status/email_checked_at are updated too (never `email` itself).
+    """
+    stamp = when.isoformat()
+    for item in contact.get("candidate_emails") or []:
+        if isinstance(item, dict) and str(item.get("email", "")).strip().casefold() == address.casefold():
+            item["check"] = outcome["verdict"]
+            item["checked_at"] = stamp
+    values = {"candidate_emails": contact.get("candidate_emails") or []}
+    if address.casefold() == (contact.get("email") or "").strip().casefold():
+        values.update(email_status=outcome["status"], email_checked_at=when)
+    return values
+
+
+def already_decided(contact: dict, address: str, prospect_status: str | None) -> bool:
+    """True when this address needs no new check: it is a stored deliverable prospect, or was already found
+    undeliverable/risky. A deliverable verdict is only trusted through the prospects table."""
+    if prospect_status == "deliverable":
+        return True
+    key = address.casefold()
+    for item in contact.get("candidate_emails") or []:
+        if isinstance(item, dict) and str(item.get("email", "")).strip().casefold() == key:
+            if item.get("check") in CONCLUSIVE_VERDICTS and item.get("check") != "safe":
+                return True
+    return key == (contact.get("email") or "").strip().casefold() and contact.get("email_status") in {"undeliverable", "risky"}
+
+
+def prospect_values(contact: dict, address: str, status: str, now: datetime) -> dict:
+    return {
+        "business_id": contact["business_id"],
+        "contact_id": contact["id"],
+        "email": address,
+        "email_status": status,
+        "email_verification_provider": PROVIDER,
+        "email_verified_at": now,
+        "qualification_score": contact["qualification_score"],
+        "outreach_status": OUTREACH_STATUS[status],
+    }
+
+
+def upsert_prospect(connection, prospects: Table, values: dict) -> None:
+    statement = pg_insert(prospects).values(**values)
+    movable = and_(prospects.c.outreach_status.in_(MANAGED_OUTREACH_STATUSES), prospects.c.do_not_contact.is_(False))
+    connection.execute(
+        statement.on_conflict_do_update(
+            constraint=CONSTRAINT,
+            set_={
+                "email_status": statement.excluded.email_status,
+                "email_verification_provider": statement.excluded.email_verification_provider,
+                "email_verified_at": statement.excluded.email_verified_at,
+                "qualification_score": statement.excluded.qualification_score,
+                "outreach_status": case((movable, statement.excluded.outreach_status), else_=prospects.c.outreach_status),
+            },
+        )
+    )
+
+
+def update_existing_prospect(connection, prospects: Table, contact_id: int, address: str, status: str, now: datetime) -> None:
+    """A stored prospect was rechecked and is no longer deliverable: reflect it, without touching later-stage columns."""
+    movable = and_(prospects.c.outreach_status.in_(MANAGED_OUTREACH_STATUSES), prospects.c.do_not_contact.is_(False))
+    connection.execute(
+        prospects.update()
+        .where(prospects.c.contact_id == contact_id, prospects.c.email == address)
+        .values(
+            email_status=status,
+            email_verified_at=now,
+            outreach_status=case((movable, OUTREACH_STATUS[status]), else_=prospects.c.outreach_status),
+        )
+    )
+
+
+def load_contacts(connection, contacts: Table, profiles: Table, args) -> list[dict]:
+    statement = (
+        select(
+            contacts.c.id,
+            contacts.c.business_id,
+            contacts.c.name,
+            contacts.c.email,
+            contacts.c.email_status,
+            contacts.c.candidate_emails,
+            contacts.c.is_primary,
+            profiles.c.qualification_score,
+        )
+        .outerjoin(profiles, profiles.c.business_id == contacts.c.business_id)
+        .order_by(contacts.c.business_id, contacts.c.is_primary.desc(), contacts.c.id)
+    )
+    if args.business_id is not None:
+        statement = statement.where(contacts.c.business_id == args.business_id)
+    if args.primary_only:
+        statement = statement.where(contacts.c.is_primary.is_(True))
+    if args.min_score is not None:
+        statement = statement.where(profiles.c.qualification_score >= args.min_score)
+    if args.limit is not None:
+        statement = statement.limit(args.limit)
+    return [dict(row._mapping) for row in connection.execute(statement)]
+
+
+def existing_statuses(connection, prospects: Table, contact_ids: list[int]) -> dict[tuple[int, str], str | None]:
+    if not contact_ids:
+        return {}
+    rows = connection.execute(
+        select(prospects.c.contact_id, prospects.c.email, prospects.c.email_status).where(prospects.c.contact_id.in_(contact_ids))
+    )
+    return {(row.contact_id, row.email): row.email_status for row in rows}
+
+
+def write_report(path: Path, rows: list[dict]) -> None:
+    fields = ["contact_id", "business_id", "email", "status", "verdict", "probed", "catch_all", "role_account", "note"]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Report written to {path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Verify contact emails with a self-hosted Reacher server in Docker. Sends no email."
+        description="Check every candidate email with Reacher; verified (deliverable) ones become prospects. Sends no email."
     )
-    parser.add_argument("--business-id", type=int, help="Verify one business only.")
+    parser.add_argument("--business-id", type=int, help="Process one business only.")
     parser.add_argument("--limit", type=int, help="Maximum number of contacts in this run.")
-    parser.add_argument("--primary-only", action="store_true", help="Only verify primary contacts.")
-    parser.add_argument("--recheck", action="store_true", help="Also re-verify contacts that already have a result.")
-    parser.add_argument("--max-probes", type=int, default=DEFAULT_MAX_PROBES, help="Candidate addresses to try per contact.")
+    parser.add_argument("--primary-only", action="store_true", help="Only process primary contacts.")
+    parser.add_argument("--min-score", type=int, help="Only businesses with at least this qualification score.")
+    parser.add_argument("--recheck", action="store_true", help="Check again addresses that were already checked.")
+    parser.add_argument("--max-candidates", type=int, default=0, help="Cap on addresses checked per contact (0 = all).")
+    parser.add_argument("--probe-all", action="store_true",
+                        help="Check every address even after the domain is known to be catch-all or unreachable.")
     add_reacher_arguments(parser)
-    parser.add_argument("--retry-rounds", type=int, default=DEFAULT_RETRY_ROUNDS,
-                        help="Extra passes for greylisted/timed-out contacts (default: 1; 0 disables).")
-    parser.add_argument("--retry-wait", type=float, default=DEFAULT_RETRY_WAIT,
-                        help="Seconds to wait before each retry pass (default: 120).")
-    parser.add_argument("--report", type=Path, help="Write a CSV report of this run's results.")
+    parser.add_argument("--report", type=Path, help="Write a CSV report (with reasons) of this run's results.")
     parser.add_argument("--dry-run", action="store_true", help="Check and print results without writing to the database.")
     args = parser.parse_args()
-    if args.max_probes < 1 or args.delay < 0 or args.reacher_timeout <= 0 or args.retry_rounds < 0 or args.retry_wait < 0:
-        parser.error("--max-probes must be >= 1, --reacher-timeout > 0, and the delay/retry options cannot be negative")
+    if args.delay < 0 or args.reacher_timeout <= 0 or args.max_candidates < 0:
+        parser.error("--delay and --max-candidates cannot be negative and --reacher-timeout must be > 0")
 
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     database_url = os.environ.get("DATABASE_URL")
@@ -504,84 +551,103 @@ def main() -> int:
     engine = create_engine(database_url, pool_pre_ping=True)
     metadata = MetaData()
     try:
-        contacts = Table("business_contacts", metadata, autoload_with=engine)
+        try:
+            contacts = Table("business_contacts", metadata, autoload_with=engine)
+            profiles = Table("business_website_profiles", metadata, autoload_with=engine)
+            prospects = Table("prospects", metadata, autoload_with=engine)
+        except NoSuchTableError as error:
+            print(f"Table {error} does not exist. Run `alembic upgrade head` first.")
+            return 1
         with engine.connect() as connection:
-            queue = load_contacts(connection, contacts, args)
+            queue = load_contacts(connection, contacts, profiles, args)
+            known = existing_statuses(connection, prospects, [c["id"] for c in queue])
         if not queue:
-            print("No contacts need email verification (use --recheck to verify again).")
+            print("No contacts to process.")
             return 0
 
-        print(f"Verifying {len(queue)} contact(s).")
-        final: dict[int, dict] = {}
-        report_rows: dict[int, dict] = {}
+        print(f"Checking candidate emails for {len(queue)} contact(s).")
         last_call: dict[str, float] = {}
-        state = {"no_smtp_streak": 0, "warned_helo": False}
-
-        def process(contact: dict) -> dict:
-            values = verify_contact(contact, client, args, last_call)
-            details = values["email_check_details"]
-            summary = details.get("reacher") or {}
-            if summary.get("can_connect_smtp") is False:
-                state["no_smtp_streak"] += 1
-            elif summary.get("can_connect_smtp"):
-                state["no_smtp_streak"] = 0
-            if not state["warned_helo"] and "fully-qualified" in (summary.get("smtp_error") or "").casefold():
-                state["warned_helo"] = True
-                print("  Warning: the mail server refused Reacher's HELO name. Set VERIFY_HELO to a fully-qualified "
-                      "hostname in .env and rerun (the container is reconfigured automatically).")
-            chosen = values.get("email", contact["email"])
-            tags = ["catch-all"] * bool(details["catch_all"]) + ["role-based"] * details["role_based"]
-            review = " NEEDS REVIEW" if details["needs_review"] else ""
-            tag_text = f" ({', '.join(tags)})" if tags else ""
-            print(f"  [{values['email_status']}]{review} {contact['name']} <{chosen}>{tag_text} {details.get('note', '')}".rstrip())
-            if not args.dry_run:
-                with engine.begin() as connection:
-                    connection.execute(update(contacts).where(contacts.c.id == contact["id"]).values(**values))
-            report_rows[contact["id"]] = {
-                "contact_id": contact["id"], "business_id": contact["business_id"], "name": contact["name"],
-                "original_email": contact["email"], "email": chosen, "status": values["email_status"],
-                "catch_all": details["catch_all"], "role_based": details["role_based"],
-                "probes": len(details["probes"]), "note": details.get("note", ""),
-                "last_reply": details["probes"][-1]["message"] if details["probes"] else "",
-            }
-            return values
-
-        aborted = False
-        pending = list(queue)
-        for round_number in range(args.retry_rounds + 1):
-            retry: list[dict] = []
-            if round_number:
-                print(f"Retry pass {round_number}: waiting {args.retry_wait:.0f}s for greylisting to expire...")
-                time.sleep(args.retry_wait)
-                state["no_smtp_streak"] = 0
-            for contact in pending:
-                try:
-                    values = process(contact)
-                except ReacherUnavailable as error:
-                    print(f"{error} Stopping; rerun once Reacher is back.")
-                    aborted = True
-                    break
-                final[contact["id"]] = values
-                if was_retryable(values):
-                    retry.append(contact)
-                if state["no_smtp_streak"] >= MAX_CONSECUTIVE_NO_SMTP:
-                    print(f"Reacher could not open an SMTP connection to {state['no_smtp_streak']} servers in a row; "
-                          "outbound port 25 is probably blocked for Docker or your network. Stopping.")
-                    aborted = True
-                    break
-            if aborted or not retry:
-                break
-            pending = retry
-
+        domain_state: dict[str, tuple[str, str]] = {}
         counts: dict[str, int] = {}
-        for values in final.values():
-            counts[values["email_status"]] = counts.get(values["email_status"], 0) + 1
-        print("Done: " + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())) + ".")
-        held = sum(1 for v in final.values() if v["email_status"] in NEEDS_REVIEW_STATUSES)
-        if held:
-            print(f"{held} contact(s) need review (risky/unknown); do not send to them automatically.")
+        report: list[dict] = []
+        skipped = streak = prospect_count = 0
+        aborted = False
+        for contact in queue:
+            addresses = candidate_addresses(contact, args.max_candidates)
+            print(f"Contact {contact['id']} ({contact['name']}), business {contact['business_id']}: {len(addresses)} address(es)")
+            for address in addresses:
+                prospect_status = known.get((contact["id"], address))
+                if not args.recheck and already_decided(contact, address, prospect_status):
+                    skipped += 1
+                    continue
+                domain = address.rpartition("@")[2].casefold()
+                if domain in domain_state and not args.probe_all:
+                    status, reason = domain_state[domain]
+                    outcome = {"status": status, "verdict": status, "summary": None, "note": f"not checked: {reason}"}
+                    probed = False
+                else:
+                    try:
+                        outcome = check_address(address, client, args.delay, last_call)
+                    except ReacherUnavailable as error:
+                        print(f"{error} Stopping; rerun once Reacher is back. Results so far are saved.")
+                        aborted = True
+                        break
+                    probed = True
+                    shortcut = domain_shortcut(outcome)
+                    if shortcut and not args.probe_all:
+                        domain_state[domain] = shortcut
+                    summary = outcome["summary"] or {}
+                    if summary.get("can_connect_smtp") is False:
+                        streak += 1
+                    elif summary.get("can_connect_smtp"):
+                        streak = 0
+                status = outcome["status"]
+                counts[status] = counts.get(status, 0) + 1
+                summary = outcome["summary"] or {}
+                note = outcome["note"] or ""
+                now = datetime.now(timezone.utc)
+                stored = ""
+                if status == "deliverable":
+                    stored = " -> prospect"
+                elif prospect_status is not None:
+                    stored = " -> existing prospect updated"
+                print(f"  [{status}] <{address}>{' (not checked)' if not probed else ''}{stored} {note}".rstrip())
+                if not args.dry_run:
+                    with engine.begin() as connection:
+                        connection.execute(contacts.update().where(contacts.c.id == contact["id"]).values(**record_check(contact, address, outcome, now)))
+                        if status == "deliverable":
+                            upsert_prospect(connection, prospects, prospect_values(contact, address, status, now))
+                        elif prospect_status is not None:
+                            update_existing_prospect(connection, prospects, contact["id"], address, status, now)
+                else:
+                    record_check(contact, address, outcome, now)  # keep the in-memory view consistent within the run
+                if status == "deliverable":
+                    prospect_count += 1
+                known[(contact["id"], address)] = status if (status == "deliverable" or prospect_status is not None) else prospect_status
+                report.append({
+                    "contact_id": contact["id"], "business_id": contact["business_id"], "email": address,
+                    "status": status, "verdict": outcome["verdict"], "probed": probed,
+                    "catch_all": summary.get("is_catch_all"), "role_account": summary.get("is_role_account"), "note": note,
+                })
+                if streak >= MAX_CONSECUTIVE_NO_SMTP:
+                    print(f"Reacher could not open an SMTP connection to {streak} servers in a row; outbound port 25 is "
+                          "probably blocked for Docker or your network. Stopping. Results so far are saved.")
+                    aborted = True
+                    break
+            if aborted:
+                break
+
+        total = sum(counts.values())
+        verb = "would be" if args.dry_run else "added or updated as"
+        print(f"Done: {total} address(es) checked ("
+              + (", ".join(f"{n} {st}" for st, n in sorted(counts.items())) if counts else "none")
+              + f"); {prospect_count} {verb} prospects"
+              + (f"; {skipped} skipped (already checked)" if skipped else "") + ".")
+        needs_review = counts.get("risky", 0) + counts.get("unknown", 0)
+        if needs_review:
+            print(f"{needs_review} address(es) need review (risky/unknown); they are not prospects and must not be emailed automatically.")
         if args.report:
-            write_report(args.report, list(report_rows.values()))
+            write_report(args.report, report)
         return 1 if aborted else 0
     except SQLAlchemyError as error:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")

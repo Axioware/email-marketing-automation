@@ -73,9 +73,14 @@ For each qualified business (completed profile, score >= `--min-score`, default 
 
 Options: `--business-id ID`, `--redo` (reprocess and replace this module's contacts), `--no-search`, `--no-crawl`, `--dry-run`, `--delay SECONDS`, `--profile PATH` (copy of a Firefox profile, e.g. one signed in to Google, to reduce CAPTCHAs). Automated search may be restricted by Google's and DuckDuckGo's terms.
 
-## Verify contact emails (Module 4)
+## Verify contact emails and build prospects (Module 4)
 
-Checks whether the emails in `business_contacts` can receive mail, without sending any. All verification is done by [Reacher](https://github.com/reacherhq/check-if-email-exists) (`reacherhq/backend`) running in **your own Docker**; no hosted service or API key is used, and the script itself does no DNS or SMTP checking.
+One script, `scripts/verify_contact_emails.py`:
+
+1. You run it.
+2. For each contact in `business_contacts` it takes the contact's own `email` plus every address in `candidate_emails`.
+3. Each address is checked with [Reacher](https://github.com/reacherhq/check-if-email-exists) (`reacherhq/backend`) running in **your own Docker**; no hosted service or API key is used, the script does no DNS or SMTP checking itself, and no email is sent.
+4. Addresses Reacher confirms as deliverable are stored in `prospects` (one row per contact and email). Every address's outcome (`safe`, `invalid`, `risky`, `unknown`) is also recorded on the contact in `candidate_emails`, so reruns skip addresses already checked.
 
 Requirements: Docker, and **outbound port 25** open (Reacher opens the SMTP connections from its container, which normally shares your host's network path; many home ISPs and cloud providers block it, in which case results come back `unknown`).
 
@@ -106,11 +111,30 @@ alembic upgrade head
 python scripts/verify_contact_emails.py --primary-only --limit 5 --dry-run
 ```
 
-### Verdicts
+### What is stored
 
-Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky` and `unknown` -> `unknown`. The last two are **needs review**: `email_check_details.needs_review` is set, they are listed in the run summary, and they must not be sent to automatically. For inferred emails the candidates are tried in order while Reacher says `invalid`; the first `safe` one replaces `email`. Any other verdict (catch-all, blocked, unreachable) stops the search, since every candidate would get the same answer. Per-candidate verdicts go in `candidate_emails`, and Reacher's SMTP fields in `email_check_details.reacher`. Timeouts and transient (greylisting) failures are retried once after `--retry-wait`.
+Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky`, `unknown` -> `unknown`. Only `deliverable` addresses become `prospects` rows:
 
-The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked). Options: `--business-id`, `--limit`, `--primary-only`, `--recheck`, `--max-probes`, `--delay`, `--retry-rounds`, `--retry-wait`, `--reacher-timeout`, `--report out.csv`, `--dry-run`.
+| `prospects` column | Set by this script |
+|---|---|
+| `business_id`, `contact_id`, `email` | the contact and address |
+| `email_status` | `deliverable` |
+| `email_verification_provider` | `reacher` |
+| `email_verified_at` | when it was checked |
+| `qualification_score` | copied from the business's website profile (Module 2) |
+| `outreach_status` | `ready` |
+
+`outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact` and `last_contacted_at` belong to later stages and are never overwritten on a rerun. A rerun that finds a stored prospect is no longer deliverable updates that row (`email_status`, and `outreach_status` to `rejected` or `needs_review`) so it cannot stay `ready`; a prospect with `do_not_contact` set or one a later stage has moved on (e.g. `contacted`) keeps its `outreach_status`.
+
+`risky` and `unknown` addresses are not prospects and must not be emailed automatically; their verdicts stay on the contact's `candidate_emails`. `unknown` (timeouts, greylisting, blocked) is checked again on the next run.
+
+If a domain is a catch-all, or its mail server cannot be reached, the remaining addresses on that domain are not probed (they would get the same answer) and are recorded with that outcome; `--probe-all` checks every address anyway. The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked); results so far are kept.
+
+```sh
+python scripts/verify_contact_emails.py --limit 5 --dry-run --report out.csv
+```
+
+Options: `--business-id`, `--limit` (contacts), `--primary-only`, `--min-score`, `--recheck`, `--max-candidates`, `--probe-all`, `--delay`, `--reacher-timeout`, `--mail-from`, `--helo`, `--no-auto-start`, `--report out.csv`, `--dry-run`.
 
 ## Tests
 
