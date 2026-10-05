@@ -1,0 +1,3 @@
+contact_id,business_id,name,original_email,email,status,provider,catch_all,role_based,probes,note
+114,54,Kashif Jamal,kashif@kashifdental.com,kashif@kashifdental.com,unknown,other,,False,0,mail server unreachable: SMTPServerDisconnected: Connection unexpectedly closed: timed out
+113,93,Muhammad Shoaib Ahmed,shoaib@smilesolutions.pk,shoaib@smilesolutions.pk,undeliverable,hostinger,False,False,6,server rejected every candidate address
