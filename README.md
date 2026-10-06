@@ -41,7 +41,7 @@ Each new business is saved with a `business_sources` record containing the unnor
 
 ## Research business websites
 
-Set `OPENAI_API_KEY` in `.env` (optionally set `OPENAI_MODEL`; the default is `gpt-5.4-mini`), install dependencies and Chromium, and apply migrations. Jina Reader's public endpoint is used by default for cleaned page text; it requires no API key and is limited to 20 requests per 60 seconds. If Jina fails, the worker falls back to local extraction. Use `--local-only` to keep page content local.
+Set an LLM key in `.env`: `GROQ_API_KEY` (or `GROK_API_KEY`; used when present; optionally `GROQ_MODEL`, default `openai/gpt-oss-120b`) or, as the fallback, `OPENAI_API_KEY` (optionally `OPENAI_MODEL`, default `gpt-5.4-mini`). The script prints which provider and model it uses. Groq is called through its OpenAI-compatible API, so no extra package is needed. The agent needs strict JSON-schema output, so a different `GROQ_MODEL` must support it. Then install dependencies and Chromium, and apply migrations. Jina Reader's public endpoint is used by default for cleaned page text; it requires no API key and is limited to 20 requests per 60 seconds. If Jina fails, the worker falls back to local extraction. Use `--local-only` to keep page content local.
 
 ```sh
 python -m pip install -r requirements.txt
