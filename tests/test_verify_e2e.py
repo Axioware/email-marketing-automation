@@ -281,15 +281,15 @@ class EndToEndTests(unittest.TestCase):
         self.run_cli("--primary-only", expect=0)
         self.assertEqual(set(self.by_email()), {"good@a.org", "good@b.org"})
         with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects restart identity"))
+            conn.execute(text("truncate prospects restart identity cascade"))
         self.run_cli("--business-id", "2", "--recheck", expect=0)
         self.assertEqual(set(self.by_email()), {"good@b.org"})
         with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects restart identity"))
+            conn.execute(text("truncate prospects restart identity cascade"))
         self.run_cli("--min-score", "50", "--recheck", expect=0)
         self.assertEqual({r["business_id"] for r in self.rows()}, {1})
         with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects restart identity"))
+            conn.execute(text("truncate prospects restart identity cascade"))
         self.run_cli("--limit", "1", "--recheck", expect=0)
         self.assertEqual(len({r["contact_id"] for r in self.rows()}), 1)
 

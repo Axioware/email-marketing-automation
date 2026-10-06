@@ -136,10 +136,80 @@ python scripts/verify_contact_emails.py --limit 5 --dry-run --report out.csv
 
 Options: `--business-id`, `--limit` (contacts), `--primary-only`, `--min-score`, `--recheck`, `--max-candidates`, `--probe-all`, `--delay`, `--reacher-timeout`, `--mail-from`, `--helo`, `--no-auto-start`, `--report out.csv`, `--dry-run`.
 
+## Generate outreach emails and track opens (Module 5)
+
+### Generate drafts
+
+`scripts/generate_emails.py` writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `draft`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`scripts/llm.py`).
+
+The prompt is a placeholder (`SYSTEM_PROMPT` in `scripts/generate_emails.py`); the script warns until `PROMPT_IS_PLACEHOLDER` is set to `False`.
+
+```sh
+alembic upgrade head
+python scripts/generate_emails.py --limit 1 --dry-run
+```
+
+Options: `--prospect-id`, `--business-id`, `--limit`, `--regenerate` (rewrites drafts, keeping their tracking token; sent emails are never modified), `--dry-run`.
+
+### Open tracking
+
+Each email gets a random tracking token (`secrets.token_urlsafe(32)`) that contains nothing about the recipient. The HTML footer image points at the Supabase Edge Function `email`:
+
+```
+https://<project>.supabase.co/functions/v1/email/footer/{tracking_token}
+```
+
+When an email client loads the image, the function calls the database function `record_email_open`, which, in one atomic statement, sets `first_opened_at` (once), `last_opened_at`, increments `open_count`, changes `status` from `sent` to `opened`, and stores an `email_open_events` row (time, user agent). Only emails with `sent_at` set count, so previews of drafts are ignored. The function always returns the footer image, even for unknown tokens, and asks clients not to cache it. `emails` and `email_open_events` have row level security on with no policies, so only the service role (the edge function and this backend) can read them.
+
+The tracking base URL is derived from a Supabase `DATABASE_URL`; set `EMAIL_TRACKING_BASE_URL` to override it.
+
+**Deploy (once):**
+
+1. Apply the migration (`alembic upgrade head`). It also creates the public Storage bucket `email-assets`.
+2. Upload `assets/email-footer.png` to Storage as `email-assets/footer.png` (Dashboard -> Storage). It is the Axioware footer (logo, tagline, site, email, city). The text footer in emails (`FOOTER_TEXT` in `generate_emails.py`) carries the same details for clients that block images. If it is missing, the function returns a transparent 1x1 image so emails never show a broken image. Other names: set the `FOOTER_BUCKET` / `FOOTER_PATH` function secrets.
+3. Deploy the function without JWT verification (email clients send no auth header; `supabase/config.toml` sets this too):
+
+   ```sh
+   npx supabase login
+   npx supabase functions deploy email --project-ref <project-ref> --no-verify-jwt
+   ```
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided to the function by Supabase automatically.
+
+Requests are rate limited per client IP (60/min) and per token (10/min); over the limit the image is still returned but no open is recorded. Limits are kept in memory per function instance, so they guard against abuse rather than enforce an exact quota.
+
+**Limitations:** an open means the image was requested, not that a person read the email. Clients that block images miss opens, image proxies and caches can hide repeat opens, and security scanners can load the image before the recipient does. Treat it as an engagement signal.
+
+### Send
+
+`scripts/send_emails.py` sends drafts through SMTP (Hostinger: `smtp.hostinger.com`, port 465, SSL) using the `SMTP_*` settings in `.env`. **Without `--send` it only previews.**
+
+```sh
+python scripts/send_emails.py --limit 1          # preview
+python scripts/send_emails.py --limit 1 --send   # send
+```
+
+- Only drafts whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not `do_not_contact`, same address) are sent.
+- Each email is claimed (`draft` -> `sending`) before sending, so two runs never send the same email. On success it becomes `sent` (`sent_at`, `message_id`, `sent_from`) and the prospect becomes `contacted` with `last_contacted_at`; open tracking counts from then on.
+- A rejected recipient or content marks that email `failed` (`send_error`). A login, connection or temporary error puts the email back to `draft` and stops the run. An email left in `sending` (the process died mid-send) is reported and never retried automatically, since it may have been delivered.
+- Placeholders: `--send` refuses while `SYSTEM_PROMPT`/`FOOTER_TEXT` in `generate_emails.py` are placeholders, and skips any email containing `PLACEHOLDER`, unless `--allow-placeholders` is given.
+- Each message has a plain-text and HTML part, the footer (`FOOTER_TEXT`), and a `List-Unsubscribe` header pointing at `SMTP_REPLY_TO` (or the sender).
+
+Options: `--email-id`, `--business-id`, `--limit`, `--delay` (seconds between sends, default 20), `--timeout`, `--allow-placeholders`.
+
+### Placeholders to fill
+
+| What | Where |
+|---|---|
+| Email prompt | `SYSTEM_PROMPT` in `scripts/generate_emails.py`, then `PROMPT_IS_PLACEHOLDER = False` |
+| Footer image | upload `assets/email-footer.png` to Supabase Storage as `email-assets/footer.png` |
+| SMTP account and sender | `SMTP_*` in `.env` |
+
 ## Tests
 
 ```sh
 python -m unittest discover -s tests -t .
+npx deno test supabase/functions/email/handler_test.ts
 ```
 
 Unit tests use a fake Reacher server. The end-to-end tests run the real CLI against a throwaway local Postgres container with the real migrations (they never use your `.env` database), and one test starts the real Reacher image on a spare port. Without Docker, those tests are skipped.

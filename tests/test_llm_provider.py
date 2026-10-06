@@ -5,7 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import research_business_websites as r  # noqa: E402
+import llm as r  # noqa: E402
+import research_business_websites  # noqa: E402
 
 KEYS = ("GROQ_API_KEY", "GROK_API_KEY", "GROQ_MODEL", "OPENAI_API_KEY", "OPENAI_MODEL")
 
@@ -66,7 +67,7 @@ class AgentCallTests(unittest.TestCase):
         for model in (r.DEFAULT_GROQ_MODEL, r.DEFAULT_OPENAI_MODEL):
             client = mock.Mock()
             client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=content))]
-            decision = r.validate_agent_response(client, model, {"current_page_url": "https://x.com/"}, must_score=False)
+            decision = research_business_websites.validate_agent_response(client, model, {"current_page_url": "https://x.com/"}, must_score=False)
             self.assertEqual((decision["action"], decision["qualification_score"]), ("SCORE", 72))
             kwargs = client.chat.completions.create.call_args.kwargs
             self.assertEqual(kwargs["model"], model)

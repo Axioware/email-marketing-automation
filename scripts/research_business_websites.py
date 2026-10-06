@@ -19,13 +19,12 @@ import trafilatura
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from llm import make_llm_client
 from playwright.sync_api import sync_playwright
 from sqlalchemy import MetaData, Table, create_engine, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"  # OpenAI-compatible endpoint, so the OpenAI SDK is reused
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"  # supports the strict JSON-schema responses the agent requires
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 MAX_PAGES_PER_BUSINESS = 5
 MAX_AGENT_RETRIES = 3
 MAX_CONTENT_CHARS = 16000
@@ -257,22 +256,6 @@ def guard_navigation(route, homepage_url: str) -> None:
             route.abort()
             return
     route.continue_()
-
-
-def make_llm_client() -> tuple[OpenAI, str, str] | None:
-    """(client, model, provider name). Groq when its key is set, otherwise OpenAI; None if neither.
-
-    The Groq key is read from GROQ_API_KEY, or GROK_API_KEY as an alias.
-    """
-    groq_key = (os.environ.get("GROQ_API_KEY", "") or os.environ.get("GROK_API_KEY", "")).strip()
-    if groq_key:
-        model = os.environ.get("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
-        return OpenAI(api_key=groq_key, base_url=GROQ_BASE_URL), model, "groq"
-    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if openai_key:
-        model = os.environ.get("OPENAI_MODEL", "").strip() or DEFAULT_OPENAI_MODEL
-        return OpenAI(api_key=openai_key), model, "openai"
-    return None
 
 
 def validate_agent_response(client: OpenAI, model: str, context: dict, must_score: bool) -> dict:
