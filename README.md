@@ -138,9 +138,9 @@ Options: `--business-id`, `--limit` (contacts), `--primary-only`, `--min-score`,
 
 ## Generate outreach emails and track opens (Module 5)
 
-### Generate drafts
+### Generate emails
 
-`scripts/generate_emails.py` writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `draft`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`scripts/llm.py`).
+`scripts/generate_emails.py` writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`scripts/llm.py`).
 
 The prompt (`SYSTEM_PROMPT` in `scripts/generate_emails.py`) writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SMTP_FROM_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
 
@@ -149,7 +149,7 @@ alembic upgrade head
 python scripts/generate_emails.py --limit 1 --dry-run
 ```
 
-Options: `--prospect-id`, `--business-id`, `--limit`, `--regenerate` (rewrites drafts, keeping their tracking token; sent emails are never modified), `--dry-run`.
+Options: `--prospect-id`, `--business-id`, `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
 
 ### Open tracking
 
@@ -159,7 +159,7 @@ Each email gets a random tracking token (`secrets.token_urlsafe(32)`) that conta
 https://<project>.supabase.co/functions/v1/email/footer/{tracking_token}
 ```
 
-When an email client loads the image, the function calls the database function `record_email_open`, which, in one atomic statement, sets `first_opened_at` (once), `last_opened_at`, increments `open_count`, changes `status` from `sent` to `opened`, and stores an `email_open_events` row (time, user agent). Only emails with `sent_at` set count, so previews of drafts are ignored. The function always returns the footer image, even for unknown tokens, and asks clients not to cache it. `emails` and `email_open_events` have row level security on with no policies, so only the service role (the edge function and this backend) can read them.
+When an email client loads the image, the function calls the database function `record_email_open`, which, in one atomic statement, sets `first_opened_at` (once), `last_opened_at`, increments `open_count`, changes `status` from `sent` to `opened`, and stores an `email_open_events` row (time, user agent). Only emails with `sent_at` set count, so previews of unsent emails are ignored. The function always returns the footer image, even for unknown tokens, and asks clients not to cache it. `emails` and `email_open_events` have row level security on with no policies, so only the service role (the edge function and this backend) can read them.
 
 The tracking base URL is derived from a Supabase `DATABASE_URL`; set `EMAIL_TRACKING_BASE_URL` to override it.
 
@@ -180,18 +180,34 @@ Opens are rate limited in the database: at most 10 recorded opens per email per 
 
 **Limitations:** an open means the image was requested, not that a person read the email. Clients that block images miss opens, image proxies and caches can hide repeat opens, and security scanners can load the image before the recipient does. Treat it as an engagement signal.
 
+### Review dashboard
+
+Every generated email starts in `in_review`. Review them in a local dashboard:
+
+```sh
+python -m dashboard            # http://127.0.0.1:8001
+```
+
+- **Review queue**: emails waiting for review, with counts per status, sent/opened totals and open rate; search by business, recipient or subject; approve or reject several at once.
+- **Email page**: edit the subject and body (the footer and tracking image are added automatically), see a preview (which loads the footer directly, so viewing never counts as an open), and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (then jumps to the next email in review), **Reject** with an optional note, **Back to review**, **Regenerate with AI**, and **Send** for approved emails (type the recipient's address to confirm; uses the `SMTP_*` settings in `.env`).
+- Editing an approved email sends it back to review. Emails with `PLACEHOLDER` text cannot be approved. Sent emails are read-only and show their opens.
+
+Statuses: `in_review` -> `approved` -> `sending` -> `sent` -> `opened`, plus `rejected` and `failed`. Only `approved` emails are ever sent, by the dashboard or by `send_emails.py`.
+
+The dashboard listens only on 127.0.0.1, refuses requests for any other host name, and every form carries a per-process secret token, so other websites open in your browser cannot trigger actions.
+
 ### Send
 
-`scripts/send_emails.py` sends drafts through SMTP (Hostinger: `smtp.hostinger.com`, port 465, SSL) using the `SMTP_*` settings in `.env`. **Without `--send` it only previews.**
+`scripts/send_emails.py` sends **approved** emails in bulk through SMTP (Hostinger: `smtp.hostinger.com`, port 465, SSL) using the `SMTP_*` settings in `.env`. **Without `--send` it only previews.**
 
 ```sh
 python scripts/send_emails.py --limit 1          # preview
 python scripts/send_emails.py --limit 1 --send   # send
 ```
 
-- Only drafts whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not `do_not_contact`, same address) are sent.
-- Each email is claimed (`draft` -> `sending`) before sending, so two runs never send the same email. On success it becomes `sent` (`sent_at`, `message_id`, `sent_from`) and the prospect becomes `contacted` with `last_contacted_at`; open tracking counts from then on.
-- A rejected recipient or content marks that email `failed` (`send_error`). A login, connection or temporary error puts the email back to `draft` and stops the run. An email left in `sending` (the process died mid-send) is reported and never retried automatically, since it may have been delivered.
+- Only approved emails whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not `do_not_contact`, same address) are sent.
+- Each email is claimed (`approved` -> `sending`) before sending, so two runs never send the same email. On success it becomes `sent` (`sent_at`, `message_id`, `sent_from`) and the prospect becomes `contacted` with `last_contacted_at`; open tracking counts from then on.
+- A rejected recipient or content marks that email `failed` (`send_error`). A login, connection or temporary error puts the email back to `approved` and stops the run. An email left in `sending` (the process died mid-send) is reported and never retried automatically, since it may have been delivered.
 - Placeholders: `--send` refuses while `SYSTEM_PROMPT`/`FOOTER_TEXT` in `generate_emails.py` are placeholders, and skips any email containing `PLACEHOLDER`, unless `--allow-placeholders` is given.
 - Each message has a plain-text and HTML part, the footer (`FOOTER_TEXT`), and a `List-Unsubscribe` header pointing at `SMTP_REPLY_TO` (or the sender).
 

@@ -123,7 +123,7 @@ class SendEndToEndTests(unittest.TestCase):
                            "discovery_campaigns restart identity cascade"))
             c.execute(text("insert into discovery_campaigns (id, name) values (1, 't')"))
 
-    def draft(self, recipient, body="Hi there", subject="Hello", **prospect_cols):
+    def draft(self, recipient, body="Hi there", subject="Hello", status="approved", **prospect_cols):
         cols = {"email_status": "deliverable", "outreach_status": "ready", "do_not_contact": False, **prospect_cols}
         with self.engine.begin() as c:
             n = c.execute(text("select count(*) from businesses")).scalar() + 1
@@ -133,9 +133,9 @@ class SendEndToEndTests(unittest.TestCase):
                                  "do_not_contact) values (:i, :i, :e, :email_status, :outreach_status, :do_not_contact) "
                                  "returning id"), {"i": n, "e": recipient, **cols}).scalar_one()
             return c.execute(text("insert into emails (prospect_id, business_id, contact_id, recipient, subject, body_text, "
-                                  "body_html, tracking_token) values (:p, :i, :i, :r, :s, :b, :h, :t) returning id"),
+                                  "body_html, tracking_token, status) values (:p, :i, :i, :r, :s, :b, :h, :t, :st) returning id"),
                              {"p": pid, "i": n, "r": recipient, "s": subject, "b": body, "h": f"<p>{body}</p>",
-                              "t": uuid.uuid4().hex + uuid.uuid4().hex}).scalar_one()
+                              "t": uuid.uuid4().hex + uuid.uuid4().hex, "st": status}).scalar_one()
 
     def row(self, email_id):
         with self.engine.connect() as c:
@@ -161,7 +161,7 @@ class SendEndToEndTests(unittest.TestCase):
         out = self.run_cli(expect=0).stdout
         self.assertIn("Preview", out)
         self.assertEqual(self.smtp.messages, [])
-        self.assertEqual(self.row(eid)["status"], "draft")
+        self.assertEqual(self.row(eid)["status"], "approved")
 
     def test_send_marks_sent_and_updates_the_prospect(self):
         eid = self.draft("a@b.org", body="Hi Ali")
@@ -191,22 +191,29 @@ class SendEndToEndTests(unittest.TestCase):
     def test_a_rerun_never_sends_twice(self):
         self.draft("a@b.org")
         self.run_cli("--send", expect=0)
-        self.assertIn("No draft emails ready", self.run_cli("--send", expect=0).stdout)
+        self.assertIn("No approved emails ready", self.run_cli("--send", expect=0).stdout)
         self.assertEqual(len(self.smtp.messages), 1)
 
     def test_ineligible_prospects_are_never_emailed(self):
         ids = [self.draft("a@b.org", do_not_contact=True), self.draft("b@b.org", outreach_status="needs_review"),
                self.draft("c@b.org", email_status="undeliverable")]
-        self.assertIn("No draft emails ready", self.run_cli("--send", expect=0).stdout)
+        self.assertIn("No approved emails ready", self.run_cli("--send", expect=0).stdout)
         self.assertEqual(self.smtp.messages, [])
-        self.assertEqual({self.row(i)["status"] for i in ids}, {"draft"})
+        self.assertEqual({self.row(i)["status"] for i in ids}, {"approved"})
+
+    def test_only_approved_emails_are_ever_sent(self):
+        ids = {status: self.draft(f"{status}@b.org", status=status) for status in ("in_review", "rejected", "failed")}
+        self.assertIn("No approved emails ready", self.run_cli("--send", expect=0).stdout)
+        self.assertEqual(self.smtp.messages, [])
+        self.assertEqual({s: self.row(i)["status"] for s, i in ids.items()},
+                         {"in_review": "in_review", "rejected": "rejected", "failed": "failed"})
 
     def test_recipient_must_still_match_the_prospect(self):
         eid = self.draft("a@b.org")
         with self.engine.begin() as c:
             c.execute(text("update prospects set email='changed@b.org'"))
-        self.assertIn("No draft emails ready", self.run_cli("--send", expect=0).stdout)
-        self.assertEqual(self.row(eid)["status"], "draft")
+        self.assertIn("No approved emails ready", self.run_cli("--send", expect=0).stdout)
+        self.assertEqual(self.row(eid)["status"], "approved")
 
     def test_rejected_recipient_is_failed_and_others_still_send(self):
         bad = self.draft("reject@b.org")
@@ -230,29 +237,29 @@ class SendEndToEndTests(unittest.TestCase):
         second = self.draft("ok@b.org")
         result = self.run_cli("--send", expect=1)
         self.assertIn("Stopping", result.stdout)
-        self.assertEqual(self.row(first)["status"], "draft")
+        self.assertEqual(self.row(first)["status"], "approved")
         self.assertIn("451", self.row(first)["send_error"])
-        self.assertEqual(self.row(second)["status"], "draft")  # not attempted
+        self.assertEqual(self.row(second)["status"], "approved")  # not attempted
         self.assertEqual(self.smtp.messages, [])
 
     def test_wrong_password_stops_without_sending(self):
         eid = self.draft("a@b.org")
         result = self.run_cli("--send", expect=1, SMTP_PASSWORD="wrong")
         self.assertIn("login failed", result.stdout)
-        self.assertEqual(self.row(eid)["status"], "draft")
+        self.assertEqual(self.row(eid)["status"], "approved")
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_unreachable_server_stops_cleanly(self):
         eid = self.draft("a@b.org")
         result = self.run_cli("--send", expect=1, SMTP_PORT="9")
-        self.assertEqual(self.row(eid)["status"], "draft")
+        self.assertEqual(self.row(eid)["status"], "approved")
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_server_hanging_up_mid_send_returns_to_draft(self):
         self.smtp.drop_on.add("drop")
         eid = self.draft("drop@b.org")
         result = self.run_cli("--send", expect=1)
-        self.assertEqual(self.row(eid)["status"], "draft")
+        self.assertEqual(self.row(eid)["status"], "approved")
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_email_stuck_in_sending_is_reported_and_not_resent(self):
@@ -275,7 +282,7 @@ class SendEndToEndTests(unittest.TestCase):
         preview = subprocess.run([sys.executable, str(SCRIPT), "--delay", "0"], cwd=ROOT, env=env,
                                  capture_output=True, text=True, timeout=60)
         self.assertIn("contains placeholder text", preview.stdout)
-        self.assertEqual(self.row(eid)["status"], "draft")
+        self.assertEqual(self.row(eid)["status"], "approved")
         self.assertEqual(self.smtp.messages, [])
 
     def test_missing_smtp_settings_are_refused(self):
@@ -290,9 +297,9 @@ class SendEndToEndTests(unittest.TestCase):
         second = self.draft("b@b.org")
         third = self.draft("c@b.org")
         self.run_cli("--send", "--email-id", str(second), expect=0)
-        self.assertEqual([self.row(i)["status"] for i in (first, second, third)], ["draft", "sent", "draft"])
+        self.assertEqual([self.row(i)["status"] for i in (first, second, third)], ["approved", "sent", "approved"])
         self.run_cli("--send", "--limit", "1", expect=0)
-        self.assertEqual([self.row(i)["status"] for i in (first, third)], ["sent", "draft"])
+        self.assertEqual([self.row(i)["status"] for i in (first, third)], ["sent", "approved"])
 
     def test_delay_between_sends(self):
         self.draft("a@b.org")

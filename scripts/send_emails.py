@@ -1,14 +1,16 @@
-"""Send draft emails through SMTP (Hostinger by default) and mark them sent, so open tracking starts counting.
+"""Send approved emails through SMTP (Hostinger by default) and mark them sent, so open tracking starts counting.
 
-By default this only previews what would be sent. Pass `--send` to actually send.
+By default this only previews what would be sent. Pass `--send` to actually send. Emails are approved in the review
+dashboard (`python -m dashboard`); anything still in review or rejected is never sent.
 
 Safety:
-- Only drafts whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not `do_not_contact`) are sent.
-- Each email is claimed (`draft` -> `sending`) before it is sent, so two runs can never send the same email.
+- Only approved emails whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not
+  `do_not_contact`) are sent.
+- Each email is claimed (`approved` -> `sending`) before it is sent, so two runs can never send the same email.
 - Emails that still contain placeholder text, or a run while the prompt/footer constants are placeholders, are
   refused unless `--allow-placeholders` is given.
 - A rejected recipient marks that email `failed`; a connection/login/temporary error puts the email back to
-  `draft` and stops the run. An email left in `sending` (the process died mid-send) is never retried
+  `approved` and stops the run. An email left in `sending` (the process died mid-send) is never retried
   automatically, because it may already have been delivered.
 """
 import argparse
@@ -35,7 +37,7 @@ PLACEHOLDER_MARKER = "PLACEHOLDER"
 
 
 class SendStop(RuntimeError):
-    """A problem with the connection or account; the run stops and the email goes back to draft."""
+    """A problem with the connection or account; the run stops and the email goes back to approved."""
 
 
 def smtp_config(args) -> dict:
@@ -146,7 +148,47 @@ def classify_send_error(error: Exception) -> tuple[str, str]:
     return "stop", f"{type(error).__name__}: {error}"[:1000]
 
 
-def load_drafts(connection, emails: Table, prospects: Table, args) -> list[dict]:
+def send_one(engine, emails: Table, prospects: Table, email: dict, config: dict, mailer: "Mailer") -> tuple[str, str]:
+    """Claim, send and record one approved email. Returns (outcome, detail):
+
+    ("sent", message_id) | ("failed", reason: this recipient/content was rejected) |
+    ("stop", reason: login, connection or temporary problem; the email is back in approved) |
+    ("skipped", reason: it was no longer approved, e.g. another run or the dashboard took it).
+    """
+    with engine.begin() as connection:
+        claimed = connection.execute(
+            update(emails)
+            .where(emails.c.id == email["id"], emails.c.status == "approved")
+            .values(status="sending", sent_from=config["from_email"], send_error=None)
+            .returning(emails.c.id)
+        ).first()
+    if not claimed:
+        return "skipped", "no longer approved (another run took it, or it was changed)"
+    message = build_message(email, config)
+    try:
+        mailer.send(message)
+    except Exception as error:  # noqa: BLE001 - every outcome must be written back
+        outcome, reason = classify_send_error(error)
+        with engine.begin() as connection:
+            connection.execute(
+                update(emails).where(emails.c.id == email["id"])
+                .values(status="failed" if outcome == "failed" else "approved", send_error=reason)
+            )
+        return outcome, reason
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            update(emails).where(emails.c.id == email["id"])
+            .values(status="sent", sent_at=now, message_id=message["Message-ID"])
+        )
+        connection.execute(
+            update(prospects).where(prospects.c.id == email["prospect_id"])
+            .values(last_contacted_at=now, outreach_status="contacted")
+        )
+    return "sent", message["Message-ID"]
+
+
+def load_approved(connection, emails: Table, prospects: Table, args) -> list[dict]:
     statement = (
         select(
             emails.c.id, emails.c.prospect_id, emails.c.business_id, emails.c.recipient, emails.c.subject,
@@ -154,7 +196,7 @@ def load_drafts(connection, emails: Table, prospects: Table, args) -> list[dict]
         )
         .join(prospects, prospects.c.id == emails.c.prospect_id)
         .where(
-            emails.c.status == "draft",
+            emails.c.status == "approved",
             prospects.c.email_status == "deliverable",
             prospects.c.outreach_status == "ready",
             prospects.c.do_not_contact.is_(False),
@@ -172,7 +214,7 @@ def load_drafts(connection, emails: Table, prospects: Table, args) -> list[dict]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send draft emails via SMTP. Previews only unless --send is given.")
+    parser = argparse.ArgumentParser(description="Send approved emails via SMTP. Previews only unless --send is given.")
     parser.add_argument("--send", action="store_true", help="Actually send. Without it, nothing is sent or changed.")
     parser.add_argument("--email-id", type=int, help="Send one email only.")
     parser.add_argument("--business-id", type=int, help="Send one business's emails only.")
@@ -211,12 +253,12 @@ def main() -> int:
             return 1
         with engine.connect() as connection:
             stuck = connection.execute(select(emails.c.id).where(emails.c.status == "sending")).scalars().all()
-            queue = load_drafts(connection, emails, prospects, args)
+            queue = load_approved(connection, emails, prospects, args)
         if stuck:
             print(f"Warning: email(s) {', '.join(map(str, stuck))} are stuck in 'sending' (a previous run stopped "
                   "mid-send). They may have been delivered; check the mailbox's Sent folder, then set their status by hand.")
         if not queue:
-            print("No draft emails ready to send.")
+            print("No approved emails ready to send.")
             return 0
 
         mode = "Sending" if args.send else "Preview (nothing is sent; pass --send to send)"
@@ -232,48 +274,22 @@ def main() -> int:
             if not args.send:
                 print(f"  Email {email['id']} -> {email['recipient']}: {email['subject']}")
                 continue
-            with engine.begin() as connection:
-                claimed = connection.execute(
-                    update(emails)
-                    .where(emails.c.id == email["id"], emails.c.status == "draft")
-                    .values(status="sending", sent_from=config["from_email"], send_error=None)
-                    .returning(emails.c.id)
-                ).first()
-            if not claimed:
-                skipped += 1
-                print(f"  Email {email['id']} skipped: no longer a draft (another run took it).")
-                continue
             if sent or failed:
                 time.sleep(args.delay)
-            message = build_message(email, config)
-            try:
-                mailer.send(message)
-            except Exception as error:  # noqa: BLE001 - every outcome must be written back
-                outcome, reason = classify_send_error(error)
-                with engine.begin() as connection:
-                    connection.execute(
-                        update(emails).where(emails.c.id == email["id"])
-                        .values(status="failed" if outcome == "failed" else "draft", send_error=reason)
-                    )
-                if outcome == "failed":
-                    failed += 1
-                    print(f"  Email {email['id']} <{email['recipient']}> FAILED: {reason}")
-                    continue
-                print(f"  Email {email['id']} <{email['recipient']}> not sent: {reason}. Stopping; it is back in draft.")
+            outcome, detail = send_one(engine, emails, prospects, email, config, mailer)
+            if outcome == "skipped":
+                skipped += 1
+                print(f"  Email {email['id']} skipped: {detail}")
+            elif outcome == "failed":
+                failed += 1
+                print(f"  Email {email['id']} <{email['recipient']}> FAILED: {detail}")
+            elif outcome == "stop":
+                print(f"  Email {email['id']} <{email['recipient']}> not sent: {detail}. Stopping; it is back in approved.")
                 stopped = True
                 break
-            now = datetime.now(timezone.utc)
-            with engine.begin() as connection:
-                connection.execute(
-                    update(emails).where(emails.c.id == email["id"])
-                    .values(status="sent", sent_at=now, message_id=message["Message-ID"])
-                )
-                connection.execute(
-                    update(prospects).where(prospects.c.id == email["prospect_id"])
-                    .values(last_contacted_at=now, outreach_status="contacted")
-                )
-            sent += 1
-            print(f"  Email {email['id']} sent to {email['recipient']}: {email['subject']}")
+            else:
+                sent += 1
+                print(f"  Email {email['id']} sent to {email['recipient']}: {email['subject']}")
 
         if args.send:
             print(f"Done: {sent} sent, {failed} failed, {skipped} skipped" + (" (stopped early)." if stopped else "."))

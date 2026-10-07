@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Email {{ email.id }}{% endblock %}
+{% block content %}
+<div class="head">
+  <div>
+    <a class="back" href="/emails?status={{ email.status }}">← {{ labels.get(email.status, email.status) }}</a>
+    <h1>{{ email.business_name }} <span class="status s-{{ email.status }}">{{ labels.get(email.status, email.status) }}</span></h1>
+    <p class="meta">To <b class="mono">{{ email.recipient }}</b> · {{ email.contact_name }}{% if email.job_title %} ({{ email.job_title }}){% endif %}
+      · email #{{ email.id }}{% if email.generation_model %} · written by {{ email.generation_provider }} {{ email.generation_model }}{% endif %}
+      {% if email.edited_at %} · <span class="tag">edited</span>{% endif %}</p>
+  </div>
+</div>
+
+{% if email.review_note %}<div class="flash note">Review note: {{ email.review_note }}</div>{% endif %}
+{% if email.send_error %}<div class="flash err">Last send error: {{ email.send_error }}</div>{% endif %}
+{% if not prospect_ready and email.status in ("in_review", "approved") %}<div class="flash err">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</div>{% endif %}
+
+<div class="grid">
+  <section class="card">
+    <h2>{% if editable %}Edit{% else %}Content{% endif %}</h2>
+    <form method="post" action="/emails/{{ email.id }}/save">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>Subject <input name="subject" value="{{ email.subject }}" maxlength="200" {{ "" if editable else "readonly" }}></label>
+      <label>Body <textarea name="body" rows="16" {{ "" if editable else "readonly" }}>{{ body }}</textarea></label>
+      <p class="hint">The Axioware footer and tracking image are added automatically below the body.</p>
+      {% if editable %}<button class="btn">Save changes</button>{% if email.status == "approved" %} <span class="hint">Saving sends it back to review.</span>{% endif %}{% endif %}
+    </form>
+
+    <div class="actions">
+      {% if email.status == "in_review" %}
+        <form method="post" action="/emails/{{ email.id }}/approve"><input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="btn primary" {{ "disabled" if has_placeholder }}>Approve</button></form>
+      {% endif %}
+      {% if email.status in ("in_review", "approved") %}
+        <form method="post" action="/emails/{{ email.id }}/reject" class="inline-reject"><input type="hidden" name="csrf" value="{{ csrf }}">
+          <input name="note" placeholder="Reason (optional)"><button class="btn danger">Reject</button></form>
+      {% endif %}
+      {% if email.status in ("rejected", "approved") %}
+        <form method="post" action="/emails/{{ email.id }}/reopen"><input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="btn">Back to review</button></form>
+      {% endif %}
+      {% if email.status in ("in_review", "rejected") %}
+        <form method="post" action="/emails/{{ email.id }}/regenerate" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='Regenerating…'">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn">Regenerate with AI</button></form>
+      {% endif %}
+    </div>
+    {% if has_placeholder %}<p class="hint err-text">Contains placeholder text; edit it before approving.</p>{% endif %}
+
+    {% if email.status == "approved" %}
+    <div class="send">
+      <h2>Send</h2>
+      {% if smtp_problems %}
+        <p class="hint err-text">SMTP is not configured in .env: {{ smtp_problems|join("; ") }}.</p>
+      {% else %}
+        <form method="post" action="/emails/{{ email.id }}/send" onsubmit="return confirm('Send this email to {{ email.recipient }} now?')">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label>Type <b class="mono">{{ email.recipient }}</b> to confirm
+            <input name="confirm" autocomplete="off" required></label>
+          <button class="btn primary">Send from {{ sender }}</button>
+        </form>
+      {% endif %}
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Preview</h2>
+    <p class="hint">Subject: <b>{{ email.subject }}</b></p>
+    <iframe class="preview" sandbox srcdoc="{{ preview }}"></iframe>
+    <p class="hint">The preview loads the footer directly, so viewing it never counts as an open.</p>
+  </section>
+
+  <section class="card">
+    <h2>What we know about them</h2>
+    <dl>
+      <dt>Business</dt><dd>{{ email.business_name }}{% if email.city %}, {{ email.city }}{% endif %}{% if email.country %}, {{ email.country }}{% endif %}</dd>
+      {% if email.website_url %}<dt>Website</dt><dd><a href="{{ email.website_url }}" target="_blank" rel="noopener noreferrer">{{ email.website_url }}</a></dd>{% endif %}
+      {% if email.google_rating %}<dt>Google rating</dt><dd>{{ email.google_rating }}</dd>{% endif %}
+      <dt>Qualification score</dt><dd>{{ email.qualification_score if email.qualification_score is not none else "–" }}</dd>
+    </dl>
+    {% if findings %}<h3>From their website</h3><ul>{% for f in findings %}<li>{{ f }}</li>{% endfor %}</ul>{% endif %}
+    {% if email.qualification_reasons %}<h3>Why they qualified</h3><ul>{% for r in email.qualification_reasons %}<li>{{ r }}</li>{% endfor %}</ul>{% endif %}
+    {% if email.outreach_facts %}<h3>Outreach facts</h3><ul>{% for r in email.outreach_facts %}<li>{{ r }}</li>{% endfor %}</ul>{% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Activity</h2>
+    <dl>
+      <dt>Generated</dt><dd>{{ email.generated_at.strftime("%Y-%m-%d %H:%M") if email.generated_at else "–" }}</dd>
+      <dt>Reviewed</dt><dd>{{ email.reviewed_at.strftime("%Y-%m-%d %H:%M") if email.reviewed_at else "–" }}</dd>
+      <dt>Sent</dt><dd>{{ email.sent_at.strftime("%Y-%m-%d %H:%M") if email.sent_at else "–" }}{% if email.sent_from %} from {{ email.sent_from }}{% endif %}</dd>
+      <dt>Opens</dt><dd>{{ email.open_count }}{% if email.first_opened_at %} (first {{ email.first_opened_at.strftime("%Y-%m-%d %H:%M") }}, last {{ email.last_opened_at.strftime("%Y-%m-%d %H:%M") }}){% endif %}</dd>
+    </dl>
+    {% if events %}<h3>Recent opens</h3><ul class="events">{% for ev in events %}<li>{{ ev.opened_at.strftime("%Y-%m-%d %H:%M") }} <span class="hint">{{ ev.user_agent or "" }}</span></li>{% endfor %}</ul>{% endif %}
+  </section>
+</div>
+{% endblock %}

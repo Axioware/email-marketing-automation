@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}{{ labels.get(status, "All emails") }}{% endblock %}
+{% block content %}
+<section class="stats">
+  <div><b>{{ counts.in_review }}</b><span>in review</span></div>
+  <div><b>{{ counts.approved }}</b><span>approved</span></div>
+  <div><b>{{ sent_total }}</b><span>sent</span></div>
+  <div><b>{{ counts.opened }}</b><span>opened</span></div>
+  <div><b>{{ open_rate if open_rate is not none else "–" }}{% if open_rate is not none %}%{% endif %}</b><span>open rate</span></div>
+</section>
+
+<div class="tabs">
+  {% for s in order %}
+    <a class="{{ 'active' if s == status }}" href="/emails?status={{ s }}">{{ labels[s] }} <em>{{ counts[s] }}</em></a>
+  {% endfor %}
+  <a class="{{ 'active' if status == 'all' }}" href="/emails?status=all">All <em>{{ total }}</em></a>
+  <form class="search" method="get" action="/emails">
+    <input type="hidden" name="status" value="{{ status }}">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search business, recipient, subject">
+  </form>
+</div>
+
+{% if emails %}
+<form method="post" action="/emails/bulk">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="status" value="{{ status }}">
+  {% if status in ("in_review", "approved") %}
+  <div class="bulk">
+    {% if status == "in_review" %}<button class="btn primary" name="action" value="approve">Approve selected</button>{% endif %}
+    <button class="btn danger" name="action" value="reject">Reject selected</button>
+  </div>
+  {% endif %}
+  <table class="list">
+    <thead><tr>
+      {% if status in ("in_review", "approved") %}<th class="check"><input type="checkbox" onclick="document.querySelectorAll('.pick').forEach(c => c.checked = this.checked)"></th>{% endif %}
+      <th>#</th><th>Business</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Opens</th>
+    </tr></thead>
+    <tbody>
+    {% for e in emails %}
+      <tr>
+        {% if status in ("in_review", "approved") %}<td class="check"><input class="pick" type="checkbox" name="ids" value="{{ e.id }}"></td>{% endif %}
+        <td><a href="/emails/{{ e.id }}">{{ e.id }}</a></td>
+        <td>{{ e.business_name }}</td>
+        <td class="mono">{{ e.recipient }}</td>
+        <td><a href="/emails/{{ e.id }}">{{ e.subject }}</a>{% if e.edited_at %} <span class="tag">edited</span>{% endif %}</td>
+        <td><span class="status s-{{ e.status }}">{{ labels.get(e.status, e.status) }}</span></td>
+        <td>{{ e.open_count or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</form>
+<div class="pager">
+  {% if page > 1 %}<a href="/emails?status={{ status }}&q={{ q|urlencode }}&page={{ page - 1 }}">← Previous</a>{% endif %}
+  {% if has_more %}<a href="/emails?status={{ status }}&q={{ q|urlencode }}&page={{ page + 1 }}">Next →</a>{% endif %}
+</div>
+{% else %}
+<p class="empty">No emails here. {% if status == "in_review" %}Generate some with <code>python scripts/generate_emails.py</code>.{% endif %}</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Email review{% endblock %} · Axioware outreach</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/emails?status=in_review">Axio<span>ware</span> <small>outreach review</small></a>
+    <nav>
+      <a href="/emails?status=in_review">Review queue</a>
+      <a href="/emails?status=approved">Approved</a>
+      <a href="/emails?status=all">All emails</a>
+    </nav>
+  </header>
+  <main>
+    {% if msg %}<div class="flash ok">{{ msg }}</div>{% endif %}
+    {% if error %}<div class="flash err">{{ error }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

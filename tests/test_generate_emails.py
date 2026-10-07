@@ -306,7 +306,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertEqual(set(rows), {p1, p2})
         first = rows[p1]
         self.assertEqual((first["recipient"], first["business_id"], first["contact_id"]), ("a@b1.org", 1, 1))
-        self.assertEqual((first["status"], first["sequence_step"], first["open_count"]), ("draft", 1, 0))
+        self.assertEqual((first["status"], first["sequence_step"], first["open_count"]), ("in_review", 1, 0))
         self.assertEqual((first["generation_provider"], first["generation_model"]), ("openai", "fake-model"))
         self.assertIsNotNone(first["generated_at"])
         self.assertIsNone(first["sent_at"])
@@ -316,7 +316,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertIn(f'src="{BASE}/{first["tracking_token"]}"', first["body_html"])
         self.assertNotEqual(rows[p1]["tracking_token"], rows[p2]["tracking_token"])
         self.assertNotIn("prompt is still a placeholder", out)
-        self.assertIn("2 email(s) saved as drafts", out)
+        self.assertIn("2 email(s) saved for review", out)
 
     def test_ineligible_prospects_are_skipped(self):
         self.prospect(1, "a@b1.org", email_status="undeliverable")
@@ -344,6 +344,20 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertIn("No prospects need an email", self.run_cli("--regenerate", expect=0).stdout)
         self.assertEqual(self.emails()[0]["subject"], before["subject"])
 
+    def test_regenerate_rewrites_rejected_back_to_review_but_never_approved(self):
+        self.prospect(1, "a@b1.org")
+        self.prospect(2, "a@b2.org")
+        self.run_cli(expect=0)
+        self.sql("update emails set status='rejected', review_note='too long' where business_id=1")
+        self.sql("update emails set status='approved' where business_id=2")
+        before = {r["business_id"]: r for r in self.emails()}
+        self.run_cli("--regenerate", expect=0)
+        after = {r["business_id"]: r for r in self.emails()}
+        self.assertEqual((after[1]["status"], after[1]["review_note"]), ("in_review", None))
+        self.assertNotEqual(after[1]["subject"], before[1]["subject"])
+        self.assertEqual(after[2]["subject"], before[2]["subject"])  # approved: untouched
+        self.assertEqual(after[2]["status"], "approved")
+
     def test_dry_run_writes_nothing(self):
         self.prospect(1, "a@b1.org")
         out = self.run_cli("--dry-run", expect=0).stdout
@@ -355,7 +369,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.prospect(2, "a@b2.org")
         self.llm.mode = "bad-for-b2"
         result = self.run_cli(expect=1)
-        self.assertIn("1 email(s) saved as drafts, 1 failed", result.stdout)
+        self.assertIn("1 email(s) saved for review, 1 failed", result.stdout)
         self.assertEqual([r["business_id"] for r in self.emails()], [1])
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
@@ -420,7 +434,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertFalse(self.record(email["tracking_token"]))
         self.assertFalse(self.record("x" * 43))
         row = self.emails()[0]
-        self.assertEqual((row["status"], row["open_count"], row["first_opened_at"]), ("draft", 0, None))
+        self.assertEqual((row["status"], row["open_count"], row["first_opened_at"]), ("in_review", 0, None))
         with self.engine.connect() as c:
             self.assertEqual(c.execute(text("select count(*) from email_open_events")).scalar(), 0)
 

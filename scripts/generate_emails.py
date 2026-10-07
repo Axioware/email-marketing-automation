@@ -1,11 +1,12 @@
-"""Generate one outreach email per prospect and store it as a draft in `emails`, ready for open tracking.
+"""Generate one outreach email per prospect and store it in `emails` for review, ready for open tracking.
 
 For every prospect that is ready for outreach (deliverable email, `outreach_status = 'ready'`, not
 `do_not_contact`) the LLM writes a subject and body from what earlier modules learned about the business and the
 contact. Each email gets a cryptographically random tracking token, and its HTML footer image points at the
 tracking edge function (`/email/footer/{token}`), which records opens once the email has been sent.
 
-Nothing is sent here: emails are stored with status `draft`. The LLM is Groq when its key is set, otherwise
+Nothing is sent here: emails are stored with status `in_review`; approve or edit them in the review dashboard
+(`python -m dashboard`). The LLM is Groq when its key is set, otherwise
 OpenAI (see `llm.py`).
 """
 import argparse
@@ -79,6 +80,7 @@ If you would rather not hear from us, reply with "unsubscribe"."""
 FOOTER_IS_PLACEHOLDER = False
 FOOTER_LINK = "https://axioware.tech"
 
+REGENERATABLE_STATUSES = ("in_review", "rejected")
 SEQUENCE_STEP = 1  # first email of the sequence; follow-ups would use later steps
 MAX_ATTEMPTS = 3
 MAX_SUBJECT_CHARS = 200
@@ -134,7 +136,23 @@ def _paragraphs_html(text: str) -> str:
 
 def render_text(body: str) -> str:
     """Plain-text version: the body followed by the footer text."""
-    return f"{body.strip()}\n\n--\n{FOOTER_TEXT.strip()}"
+    return f"{body.strip()}{FOOTER_SEPARATOR}{FOOTER_TEXT.strip()}"
+
+
+FOOTER_SEPARATOR = "\n\n--\n"
+
+
+def editable_body(body_text: str) -> str:
+    """The part of a stored plain-text email that a person writes: everything before the footer."""
+    head, sep, _ = (body_text or "").rpartition(FOOTER_SEPARATOR)
+    return head if sep else (body_text or "")
+
+
+def footer_preview_url(base_url: str | None) -> str | None:
+    """Public Storage URL of the footer image, for previews that must not count as opens."""
+    if base_url and base_url.endswith("/functions/v1/email/footer"):
+        return base_url[: -len("/functions/v1/email/footer")] + "/storage/v1/object/public/email-assets/footer.png"
+    return None
 
 
 def render_html(body: str, footer_url: str) -> str:
@@ -295,7 +313,7 @@ def load_prospects(connection, tables: dict[str, Table], args) -> list[dict]:
         .order_by(prospects.c.qualification_score.desc().nulls_last(), prospects.c.id)
     )
     if args.regenerate:
-        statement = statement.where((emails.c.id.is_(None)) | (emails.c.status == "draft"))
+        statement = statement.where((emails.c.id.is_(None)) | (emails.c.status.in_(REGENERATABLE_STATUSES)))
     else:
         statement = statement.where(emails.c.id.is_(None))
     if args.prospect_id is not None:
@@ -309,7 +327,8 @@ def load_prospects(connection, tables: dict[str, Table], args) -> list[dict]:
 
 def save_draft(connection, emails: Table, row: dict, draft: EmailDraft, body_html: str, token: str,
                provider: str, model: str, now: datetime) -> None:
-    """Insert the draft, or replace the content of an existing draft. A sent email is never modified."""
+    """Insert the email for review, or replace an existing one that is in review or rejected (it goes back to review).
+    Approved, sent and failed emails are never modified."""
     content = {
         "subject": draft.subject,
         "body_text": render_text(draft.body),
@@ -325,14 +344,15 @@ def save_draft(connection, emails: Table, row: dict, draft: EmailDraft, body_htm
         sequence_step=SEQUENCE_STEP,
         recipient=row["recipient"],
         tracking_token=token,
-        status="draft",
+        status="in_review",
         **content,
     )
     connection.execute(
         statement.on_conflict_do_update(
             constraint="uq_emails_prospect_step",
-            set_={key: statement.excluded[key] for key in content},
-            where=emails.c.status == "draft",
+            set_={**{key: statement.excluded[key] for key in content},
+                  "status": "in_review", "reviewed_at": None, "review_note": None, "edited_at": None},
+            where=emails.c.status.in_(REGENERATABLE_STATUSES),
         )
     )
 
@@ -345,7 +365,8 @@ def main() -> int:
     parser.add_argument("--prospect-id", type=int, help="Generate for one prospect only.")
     parser.add_argument("--business-id", type=int, help="Generate for one business only.")
     parser.add_argument("--limit", type=int, help="Maximum number of prospects in this run.")
-    parser.add_argument("--regenerate", action="store_true", help="Rewrite existing drafts (sent emails are never touched).")
+    parser.add_argument("--regenerate", action="store_true",
+                        help="Rewrite emails that are in review or rejected (approved and sent emails are never touched).")
     parser.add_argument("--dry-run", action="store_true", help="Generate and print without writing to the database.")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
@@ -382,13 +403,13 @@ def main() -> int:
         with engine.connect() as connection:
             queue = load_prospects(connection, tables, args)
         if not queue:
-            print("No prospects need an email (use --regenerate to rewrite drafts).")
+            print("No prospects need an email (use --regenerate to rewrite emails in review).")
             return 0
 
         print(f"Generating emails for {len(queue)} prospect(s).")
         created = failed = 0
         for row in queue:
-            token = row["tracking_token"] or new_tracking_token()  # a regenerated draft keeps its token
+            token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
             try:
                 draft = generate_draft(client, model, prospect_context(row))
             except Exception as error:  # one bad prospect (bad output, API error) must not stop the run
@@ -404,7 +425,7 @@ def main() -> int:
                     save_draft(connection, tables["emails"], row, draft, body_html, token, provider, model,
                                datetime.now(timezone.utc))
             created += 1
-        verb = "generated (dry run, not saved)" if args.dry_run else "saved as drafts"
+        verb = "generated (dry run, not saved)" if args.dry_run else "saved for review"
         print(f"Done: {created} email(s) {verb}, {failed} failed.")
         return 1 if failed else 0
     except SQLAlchemyError as error:
