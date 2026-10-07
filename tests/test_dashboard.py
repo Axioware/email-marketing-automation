@@ -143,6 +143,16 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("Hours: 9-5", page.text)  # website findings shown to the reviewer
         self.assertIn("Strong reviews", page.text)
 
+    def test_hostile_recipient_cannot_reach_inline_javascript(self):
+        evil = "x');alert(document.cookie);//@evil.org"
+        eid = self.email("approved", recipient=evil)
+        page = self.client.get(f"/emails/{eid}").text
+        # No database value may be interpolated into an inline event handler (browsers decode entities there).
+        for handler in re.findall(r'\son\w+="([^"]*)"', page):
+            self.assertNotIn("alert", handler)
+            self.assertNotIn("evil.org", handler)
+        self.assertRegex(page, r'data-recipient="x&#39;\);alert\(document\.cookie\);//@evil\.org"')
+
     def test_unknown_email_is_404(self):
         self.assertEqual(self.client.get("/emails/999999").status_code, 404)
 

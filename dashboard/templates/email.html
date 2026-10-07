@@ -52,7 +52,7 @@
       {% if smtp_problems %}
         <p class="hint err-text">SMTP is not configured in .env: {{ smtp_problems|join("; ") }}.</p>
       {% else %}
-        <form method="post" action="/emails/{{ email.id }}/send" onsubmit="return confirm('Send this email to {{ email.recipient }} now?')">
+        <form method="post" action="/emails/{{ email.id }}/send" data-recipient="{{ email.recipient }}" onsubmit="return confirm('Send this email to ' + this.dataset.recipient + ' now?')">
           <input type="hidden" name="csrf" value="{{ csrf }}">
           <label>Type <b class="mono">{{ email.recipient }}</b> to confirm
             <input name="confirm" autocomplete="off" required></label>
