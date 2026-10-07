@@ -134,12 +134,16 @@ if env_bool("DJANGO_SECURE_COOKIES"):
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
 
+# Every API request must send this value in its `Auth` header (pipeline/api/security.py). Empty: API disabled.
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "pipeline.api.security.AuthHeaderAuthentication",
         "rest_framework.authentication.TokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAdminUser"],
+    "DEFAULT_PERMISSION_CLASSES": ["pipeline.api.security.HasAuthHeader"],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
     "DEFAULT_FILTER_BACKENDS": [

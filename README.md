@@ -78,6 +78,7 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 | Needed for | Keys |
 |---|---|
 | Everything | `DATABASE_URL`, `DJANGO_SECRET_KEY` (`DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS` optional) |
+| The API | `AUTH_TOKEN` (sent in every request's `Auth` header) |
 | Research and email writing | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
 | Sending | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` (host, port and security default to Hostinger) |
@@ -117,12 +118,9 @@ Notes:
 
 ## REST API
 
-Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger) are at `/api/docs/` and the OpenAPI schema at `/api/schema/`. Every endpoint requires a staff user: log in to the admin (session) or use a token.
+Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger) are at `/api/docs/` and the OpenAPI schema at `/api/schema/` (both need an admin login; in the docs click **Authorize** and enter the key to try requests).
 
-```sh
-python manage.py drf_create_token admin           # or Admin > Auth Token > Tokens, or:
-curl -X POST -d username=admin -d password=... http://127.0.0.1:8000/api/auth/token/
-```
+**Every request must send the `Auth` header** with the value of `AUTH_TOKEN` from `.env`; anything else gets `401`. With `AUTH_TOKEN` empty the API refuses every request. Generate a key with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and restart the server after changing it. Optionally also send `Authorization: Token <user token>` (Admin > Auth Token > Tokens) so runs you start are attributed to that user.
 
 | Endpoint | What |
 |---|---|
@@ -139,10 +137,10 @@ curl -X POST -d username=admin -d password=... http://127.0.0.1:8000/api/auth/to
 Start a step (e.g. from a cron job) and follow it:
 
 ```sh
-curl -X POST -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
+curl -X POST -H "Auth: $AUTH_TOKEN" -H "Content-Type: application/json" \
   -d '{"command": "verify_emails", "options": {"limit": 50, "primary_only": true}}' \
   http://127.0.0.1:8000/api/runs/
-curl -H "Authorization: Token $TOKEN" http://127.0.0.1:8000/api/runs/1/     # status, exit_code, output
+curl -H "Auth: $AUTH_TOKEN" http://127.0.0.1:8000/api/runs/1/     # status, exit_code, output
 ```
 
 `options` uses the command's option names (`--dry-run` is `"dry_run": true`, repeatable options take a list: `"business_id": [1, 2]`); raw `"arguments": ["--limit", "5"]` works too. Invalid options are refused with `400` before anything starts. A cron job can also run the command directly: `cd /path/to/project && .venv/bin/python manage.py verify_emails --limit 50`.

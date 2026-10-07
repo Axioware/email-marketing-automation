@@ -142,6 +142,8 @@ class PipelineAdminSite(admin.AdminSite):
                           run_url("research_websites", "--retry-failed")))
 
         warnings = []
+        if not settings.AUTH_TOKEN:
+            warnings.append("The API is disabled: set AUTH_TOKEN in .env.")
         if make_llm_client() is None:
             warnings.append("No LLM key: set GROQ_API_KEY or OPENAI_API_KEY in .env (needed to research and write emails).")
         if not os.environ.get("VERIFY_HELO"):

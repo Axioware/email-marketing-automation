@@ -1,5 +1,4 @@
 from django.urls import include, path
-from rest_framework.authtoken.views import obtain_auth_token
 from rest_framework.routers import DefaultRouter
 
 from pipeline.api import views
@@ -18,5 +17,4 @@ router.register("runs", views.PipelineRunViewSet)
 urlpatterns = [
     path("", include(router.urls)),
     path("stats/", views.StatsView.as_view(), name="api-stats"),
-    path("auth/token/", obtain_auth_token, name="api-token"),
 ]

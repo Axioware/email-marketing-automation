@@ -193,18 +193,20 @@ Keep in mind:
 
 Everything in the admin is also available through the API, so a scheduled job (cron) can run steps automatically.
 
-1. Create a token: sidebar > **Auth Token > Tokens > Add**, choose your user.
+1. Every API request must include the header `Auth` with the API key, which is `AUTH_TOKEN` in `.env`. Requests without it, or with a wrong key, are refused. Keep this key secret: anyone who has it can use the whole API.
 2. Start a step:
 
    ```sh
    curl -X POST http://127.0.0.1:8000/api/runs/ \
-     -H "Authorization: Token YOUR_TOKEN" -H "Content-Type: application/json" \
+     -H "Auth: YOUR_AUTH_TOKEN" -H "Content-Type: application/json" \
      -d '{"command": "verify_emails", "options": {"limit": 50}}'
    ```
 
-3. Follow it at `/api/runs/<id>/`.
+3. Follow it at `/api/runs/<id>/` (with the same header).
 
-The full list of endpoints, with a "Try it out" button, is at **API** (top right, or http://127.0.0.1:8000/api/docs/).
+The full list of endpoints is at **API** (top right, or http://127.0.0.1:8000/api/docs/). To try requests there, click **Authorize**, paste the key into **AuthHeader**, and click **Authorize** again.
+
+To change the key, edit `AUTH_TOKEN` in `.env` and restart the app; the old key stops working at once.
 
 ## 9. Settings
 
@@ -214,6 +216,7 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 |---|---|
 | `DATABASE_URL` | Everything (the Supabase database) |
 | `DJANGO_SECRET_KEY` | Logging in (any long random text) |
+| `AUTH_TOKEN` | The API: every request must send it in the `Auth` header |
 | `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) and writing emails (step 6) |
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
 | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` | Sending (step 8); `SMTP_FROM_NAME` is also the name in each email's sign-off |
@@ -233,4 +236,6 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | Generate: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to rewrite those in review |
 | "Only emails in review can be approved" | The email was already approved, rejected or sent, perhaps by someone else |
 | A run stays "Running" after the computer restarted | Open **Pipeline runs**; it is marked Failed automatically. Run it again |
+| API answers 401 "Send the API key in the 'Auth' header" | Add `-H "Auth: <AUTH_TOKEN>"` with the exact value from `.env` |
+| API answers "The API is disabled" | Set `AUTH_TOKEN` in `.env` and restart the app |
 | Forgot your password | In a terminal: `python manage.py changepassword admin` |

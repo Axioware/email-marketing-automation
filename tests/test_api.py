@@ -3,7 +3,7 @@ import os
 from unittest import mock
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
@@ -13,6 +13,10 @@ from tests.support import BASE, make_business, make_campaign, make_contact, make
 from tests.test_generate_emails import FakeLLM
 
 
+KEY = "test-api-key-0123456789"
+
+
+@override_settings(AUTH_TOKEN=KEY)
 class ApiCase(TestCase):
     def setUp(self):
         self.smtp = FakeSmtpServer()
@@ -24,42 +28,70 @@ class ApiCase(TestCase):
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_user("staff", "staff@example.org", "pw", is_staff=True)
         self.api = APIClient()
+        self.api.credentials(HTTP_AUTH=KEY)
         self.api.force_authenticate(self.user)
 
 
 class AuthTests(ApiCase):
-    def test_anonymous_and_non_staff_users_are_refused(self):
-        anonymous = APIClient()
-        for path in ("/api/emails/", "/api/runs/", "/api/stats/", "/api/schema/", "/api/docs/"):
-            self.assertIn(anonymous.get(path).status_code, (401, 403), path)
-        member = get_user_model().objects.create_user("member", "m@example.org", "pw")
-        client = APIClient()
-        client.force_authenticate(member)
-        self.assertEqual(client.get("/api/emails/").status_code, 403)
+    PATHS = ("/api/", "/api/emails/", "/api/runs/", "/api/runs/commands/", "/api/stats/", "/api/campaigns/")
 
-    def test_token_authentication(self):
+    def test_every_endpoint_needs_the_auth_header(self):
+        for headers in ({}, {"HTTP_AUTH": "wrong"}, {"HTTP_AUTH": KEY[:-1]}, {"HTTP_AUTHORIZATION": KEY}):
+            client = APIClient()
+            client.force_authenticate(self.user)  # even a logged-in staff user is refused without the key
+            for path in self.PATHS:
+                response = client.get(path, **headers)
+                self.assertEqual(response.status_code, 401, (path, headers))
+                self.assertEqual(response["WWW-Authenticate"], "Auth")
+        self.assertEqual(APIClient().post("/api/campaigns/", {"name": "x"}).status_code, 401)
+        self.assertFalse(DiscoveryCampaign.objects.exists())
+
+    def test_the_header_alone_is_enough(self):
+        client = APIClient()
+        client.credentials(HTTP_AUTH=KEY)
+        for path in self.PATHS:
+            self.assertEqual(client.get(path).status_code, 200, path)
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            response = client.post("/api/runs/", {"command": "send_emails"}, format="json")
+        self.assertEqual(response.status_code, 202)
+        self.assertIsNone(PipelineRun.objects.get().created_by)
+
+    @override_settings(AUTH_TOKEN="")
+    def test_api_is_disabled_without_a_configured_key(self):
+        for headers in ({}, {"HTTP_AUTH": ""}):
+            response = self.api.get("/api/stats/", **headers)
+            self.assertEqual(response.status_code, 401)
+            self.assertIn("AUTH_TOKEN", response.json()["detail"])
+
+    def test_user_token_with_the_header_attributes_runs(self):
         token = Token.objects.create(user=self.user)
         client = APIClient()
-        client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
-        self.assertEqual(client.get("/api/stats/").status_code, 200)
-        client.credentials(HTTP_AUTHORIZATION="Token wrong")
+        client.credentials(HTTP_AUTH=KEY, HTTP_AUTHORIZATION=f"Token {token.key}")
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            client.post("/api/runs/", {"command": "send_emails"}, format="json")
+        self.assertEqual(PipelineRun.objects.get().created_by, self.user)
+        client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")  # a user token without the header is refused
         self.assertEqual(client.get("/api/stats/").status_code, 401)
 
-    def test_token_can_be_obtained_with_a_password(self):
-        response = APIClient().post("/api/auth/token/", {"username": "staff", "password": "pw"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["token"], Token.objects.get(user=self.user).key)
-
-    def test_session_writes_need_csrf(self):
+    def test_session_writes_still_need_csrf(self):
         client = APIClient(enforce_csrf_checks=True)
         client.login(username="staff", password="pw")
+        client.credentials(HTTP_AUTH=KEY)
         self.assertEqual(client.get("/api/emails/").status_code, 200)
         self.assertEqual(client.post("/api/campaigns/", {"name": "x"}).status_code, 403)
 
-    def test_schema_and_docs_for_staff(self):
-        schema = self.api.get("/api/schema/")
+    def test_password_token_endpoint_is_gone(self):
+        self.assertEqual(self.api.post("/api/auth/token/", {"username": "staff", "password": "pw"}).status_code, 404)
+
+    def test_docs_need_an_admin_login_and_describe_the_header(self):
+        anonymous = APIClient()
+        self.assertIn(anonymous.get("/api/schema/", HTTP_AUTH=KEY).status_code, (401, 403))
+        schema = self.api.get("/api/schema/", {"format": "json"})
         self.assertEqual(schema.status_code, 200)
-        self.assertIn(b"/api/emails/{id}/approve/", schema.content)
+        data = schema.json()
+        self.assertEqual(data["components"]["securitySchemes"]["AuthHeader"],
+                         {"type": "apiKey", "in": "header", "name": "Auth", "description": "The AUTH_TOKEN value from .env."})
+        self.assertIn("/api/emails/{id}/approve/", data["paths"])
         self.assertEqual(self.api.get("/api/docs/").status_code, 200)
 
 

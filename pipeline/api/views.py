@@ -1,4 +1,4 @@
-"""REST API over the whole pipeline. Every endpoint requires a staff user (session or `Authorization: Token ...`).
+"""REST API over the whole pipeline. Every request must send the `Auth` header (AUTH_TOKEN in .env).
 
 Long steps (scraping, research, discovery, verification, generation, bulk sending) are started as pipeline runs:
 `POST /api/runs/` returns at once, and `GET /api/runs/{id}/` shows progress and output.
