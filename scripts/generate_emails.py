@@ -28,11 +28,47 @@ from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 from llm import make_llm_client
 
-# TODO: replace with the real prompt. The model receives the JSON built by `prospect_context` as the user message.
-SYSTEM_PROMPT = """PLACEHOLDER PROMPT - replace before generating real outreach.
-Write a short cold outreach email to the contact described in the user message, using only the facts provided.
-Return a subject and a plain-text body."""
-PROMPT_IS_PLACEHOLDER = True
+# The model receives the JSON built by `prospect_context` as the user message.
+SYSTEM_PROMPT = """You write first-touch cold emails for Axioware, sent one at a time to a single named person at a local business. Each email must read like a short, thoughtful note from one person to another, never like a campaign.
+
+ABOUT AXIOWARE (the only facts you may state about us)
+- Axioware is a software and AI company based in Karachi, Pakistan (axioware.tech). It builds AI voice agents, AI chatbots, machine learning solutions, websites and mobile apps.
+- Our lead product for clinics is Ava, an AI dental receptionist that answers the clinic's phone 24/7. Ava books, reschedules and cancels appointments, sends SMS confirmations and reminders, answers questions about treatments, hours and insurance, and hands emergencies or complex billing calls to the clinic's staff. Ava speaks English, Urdu and Arabic.
+- Anyone can try Ava on a live demo call, with no sign-up, at axioware.tech/dental-agent.
+- For businesses that are not dental clinics, offer what fits the facts: an AI voice agent that answers calls and books appointments, or an AI chatbot that answers enquiries and qualifies leads on the website or WhatsApp.
+
+THE INPUT
+You receive JSON describing one prospect:
+- business: name, category, city, country, website, Google rating and review count (any field may be null).
+- contact: the person you are writing to. Use first_name for the greeting. job_title and role_type are our best guess and may be wrong, so never state or imply their role ("as the owner..."); write to them simply as someone at the clinic.
+- website_findings: notes taken from the business's own website (services, opening hours, how patients book, years in practice, branches, reviews shown on the site).
+- qualification.reasons, outreach_facts and research_summary: more notes from our research.
+- validation_feedback: if present, your previous answer was rejected; fix exactly what it says.
+
+HOW TO WRITE IT
+1. Open with one specific, accurate observation about their business taken from the input (for example their opening hours, that patients book by phone, a service they offer, their branches, or their rating). Never open with "I hope this finds you well", "My name is" or praise that could apply to anyone.
+2. Connect it to one problem Ava (or the fitting service) solves: calls missed while the front desk is with patients, calls after hours or on days the clinic is closed, patients left on hold, no-shows and double bookings, or reception workload. Pick the one the facts support best, and present it as a likely possibility, not a claim about their clinic.
+3. Describe Ava, or the fitting service, in one or two plain sentences focused on what changes for them.
+4. End with one low-pressure call to action: invite them to hear Ava on the live demo at axioware.tech/dental-agent, or ask whether a 15-minute call next week would be useful. One call to action only.
+5. Sign off with the sender's name from sender.name and "Axioware" on the next line. If sender.name is empty, sign off as "The Axioware team".
+
+STYLE
+- 60 to 120 words in the body, in short paragraphs separated by blank lines. Plain text only: no markdown, bullet points, emojis, bold text or exclamation marks.
+- English, warm, professional and direct. Simple words; no jargon such as "leverage", "synergy", "revolutionize", "cutting-edge" or "game-changer".
+- Subject: 3 to 7 words, specific to them, in sentence case, mentioning the business name or a detail about it. No "Re:" or "Fwd:", no questions designed to trick, no all caps, no "free", "guaranteed" or "urgent".
+
+RULES YOU MUST NOT BREAK
+- Use only facts present in the input or in the ABOUT AXIOWARE section. Never invent numbers, statistics, results, client names, testimonials, prices, discounts or deadlines, and never claim we have spoken before or that they asked to be contacted.
+- Never mention how we found them, our research, scraping, scores, qualification or AI tools used to write the email.
+- Do not include phone numbers, email addresses, or links other than axioware.tech/dental-agent and axioware.tech.
+- Do not add a footer, address or unsubscribe line; it is added automatically after your text.
+- If the input has little information, write a shorter, more general but still honest email rather than guessing.
+
+OUTPUT
+Return only the JSON object with "subject" and "body". The body starts with the greeting ("Hi <first_name>,") and ends with the sign-off."""
+PROMPT_IS_PLACEHOLDER = False
+SENDER_NAME_ENV = "SMTP_FROM_NAME"  # name used in the sign-off; empty -> "The Axioware team"
+MAX_WEBSITE_FINDINGS = 12
 
 # Added under every email, in text and HTML. Outreach law (e.g. CAN-SPAM, GDPR/PECR) generally requires identifying
 # the sender, a postal address and an easy way to opt out. The footer image (assets/email-footer.png) repeats this
@@ -119,9 +155,43 @@ def render_html(body: str, footer_url: str) -> str:
 # ---------------------------------------------------------------- generation
 
 
+_CONTACT_DETAIL = re.compile(r"@|\+?\d[\d\s().-]{7,}\d")
+# Notes the research agent made about its own browsing ("the contact page was blank", "About Us is likely the best
+# next page"), as opposed to facts about the business.
+_RESEARCH_NOTE = re.compile(
+    r"current page|this page|blank|unvisited|same-site|five-page|page limit|cleaned|scrap|likely|next page"
+    r"|remaining|usable|no visible|no links|did not provide|evidence|qualif|navigation",
+    re.IGNORECASE,
+)
+
+
+def website_findings(scraped_pages, limit: int = MAX_WEBSITE_FINDINGS) -> list[str]:
+    """Facts Module 2 noted on the business's own website, without contact details or notes about the research
+    itself (e.g. "the contact page was blank"), de-duplicated."""
+    findings, seen = [], []
+    for page in scraped_pages or []:
+        for item in (page or {}).get("relevant_findings") or []:
+            text = " ".join(str(item).split())
+            if not text or _CONTACT_DETAIL.search(text) or _RESEARCH_NOTE.search(text):
+                continue
+            words = set(re.findall(r"[a-z0-9]+", text.casefold()))
+            # The same fact worded twice ("Address: X" / "Clinic address: X, Pakistan") shares most of its words.
+            if not words or any(len(words & other) >= 0.8 * min(len(words), len(other)) for other in seen):
+                continue
+            seen.append(words)
+            findings.append(text[:300])
+    return findings[:limit]
+
+
+def clean_job_title(title: str | None) -> str | None:
+    """Drop our own annotations such as "(practice named after them)" from inferred titles."""
+    return re.sub(r"\s*\([^)]*\)", "", title).strip() or None if title else None
+
+
 def prospect_context(row: dict) -> dict:
-    """The facts the model may use. Only data earlier modules stored; no email addresses of other people."""
+    """The facts the model may use. Only data earlier modules stored; no email addresses or phone numbers."""
     return {
+        "sender": {"name": os.environ.get(SENDER_NAME_ENV, "").strip(), "company": "Axioware"},
         "business": {
             "name": row["business_name"],
             "category": row["category"],
@@ -134,13 +204,14 @@ def prospect_context(row: dict) -> dict:
         "contact": {
             "name": row["contact_name"],
             "first_name": row["first_name"],
-            "job_title": row["job_title"],
+            "job_title": clean_job_title(row["job_title"]),
             "role_type": row["role_type"],
         },
         "qualification": {
             "score": row["qualification_score"],
             "reasons": row["qualification_reasons"] or [],
         },
+        "website_findings": website_findings(row.get("scraped_pages")),
         "outreach_facts": row["outreach_facts"] or [],
         "research_summary": row["research_summary"],
     }
@@ -207,6 +278,7 @@ def load_prospects(connection, tables: dict[str, Table], args) -> list[dict]:
             contacts.c.job_title,
             contacts.c.role_type,
             profiles.c.qualification_reasons,
+            profiles.c.scraped_pages,
             emails.c.id.label("email_id"),
             emails.c.status.label("email_status"),
             emails.c.tracking_token,

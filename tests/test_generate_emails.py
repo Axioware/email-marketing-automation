@@ -78,6 +78,55 @@ class RenderTests(unittest.TestCase):
         self.assertIn('src="' + BASE + '/a&quot;b"', out)
 
 
+class PromptAndContextTests(unittest.TestCase):
+    def test_prompt_is_the_real_axioware_prompt(self):
+        self.assertFalse(g.PROMPT_IS_PLACEHOLDER)
+        self.assertNotIn("PLACEHOLDER", g.SYSTEM_PROMPT)
+        for must in ("Axioware", "Ava", "axioware.tech/dental-agent", "Never invent", "first_name", "website_findings"):
+            self.assertIn(must, g.SYSTEM_PROMPT)
+
+    def test_prompt_mentions_every_context_field(self):
+        row = {"business_name": "B", "category": None, "city": None, "country": None, "website_url": None,
+               "google_rating": None, "google_review_count": None, "contact_name": "A B", "first_name": "A",
+               "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
+               "outreach_facts": [], "research_summary": None, "scraped_pages": []}
+        for key in g.prospect_context(row):
+            self.assertIn(key, g.SYSTEM_PROMPT, key)
+
+    def test_website_findings_keep_business_facts_only(self):
+        pages = [
+            {"relevant_findings": ["Dental clinic in Lahore, Pakistan.", "Shows 155 Google reviews and a 5-star rating widget on-page.",
+                                   "About Us page likely contains clinic background, credentials, and team details.",
+                                   "Current page content is empty/blank after cleaning", "Five-page limit has not been reached yet"]},
+            {"relevant_findings": ["Phone: +92 300 0933343; emails include admin@b.pk", "Hours: Monday-Saturday 11:00 AM to 09:00 PM.",
+                                   "Clinic address: Shop #12, Model Town, Lahore, Punjab.",
+                                   "Address: Shop #12, Model Town, Lahore, Punjab, Pakistan."]},
+            None, {"relevant_findings": None}, {},
+        ]
+        self.assertEqual(g.website_findings(pages), [
+            "Dental clinic in Lahore, Pakistan.", "Shows 155 Google reviews and a 5-star rating widget on-page.",
+            "Hours: Monday-Saturday 11:00 AM to 09:00 PM.", "Clinic address: Shop #12, Model Town, Lahore, Punjab."])
+        self.assertEqual(g.website_findings(None), [])
+        many = [{"relevant_findings": [f"Offers treatment number {i} for patients" for i in range(40)]}]
+        self.assertLessEqual(len(g.website_findings(many)), g.MAX_WEBSITE_FINDINGS)
+
+    def test_job_title_annotations_are_removed(self):
+        self.assertEqual(g.clean_job_title("Principal (practice named after them)"), "Principal")
+        self.assertEqual(g.clean_job_title("Owner"), "Owner")
+        self.assertIsNone(g.clean_job_title("(guess)"))
+        self.assertIsNone(g.clean_job_title(None))
+
+    def test_sender_name_comes_from_smtp_from_name(self):
+        row = {"business_name": "B", "category": None, "city": None, "country": None, "website_url": None,
+               "google_rating": None, "google_review_count": None, "contact_name": "A B", "first_name": "A",
+               "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
+               "outreach_facts": [], "research_summary": None}
+        with mock.patch.dict(os.environ, {"SMTP_FROM_NAME": "Abdul Rauf"}):
+            self.assertEqual(g.prospect_context(row)["sender"], {"name": "Abdul Rauf", "company": "Axioware"})
+        with mock.patch.dict(os.environ, {"SMTP_FROM_NAME": ""}):
+            self.assertEqual(g.prospect_context(row)["sender"]["name"], "")
+
+
 class FooterImageTests(unittest.TestCase):
     def test_built_footer_matches_the_declared_width_at_2x(self):
         import struct
@@ -122,8 +171,11 @@ class GenerationTests(unittest.TestCase):
                "google_rating": None, "google_review_count": 5, "contact_name": "Shoaib Ahmed", "first_name": "Shoaib",
                "job_title": "Owner", "role_type": "owner", "qualification_score": 85, "qualification_reasons": ["r"],
                "outreach_facts": ["f"], "research_summary": "s", "recipient": "shoaib@b.pk"}
+        row["scraped_pages"] = [{"relevant_findings": ["Phone: +92 300 0933343; email info@b.pk", "Hours: 9-5"]}]
         context = g.prospect_context(row)
         self.assertNotIn("@", json.dumps(context))
+        self.assertNotIn("0933343", json.dumps(context))
+        self.assertEqual(context["website_findings"], ["Hours: 9-5"])
         self.assertEqual(context["contact"]["first_name"], "Shoaib")
         self.assertEqual(context["outreach_facts"], ["f"])
 
@@ -263,7 +315,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertRegex(first["tracking_token"], EDGE_TOKEN_PATTERN)
         self.assertIn(f'src="{BASE}/{first["tracking_token"]}"', first["body_html"])
         self.assertNotEqual(rows[p1]["tracking_token"], rows[p2]["tracking_token"])
-        self.assertIn("placeholder", out)
+        self.assertNotIn("prompt is still a placeholder", out)
         self.assertIn("2 email(s) saved as drafts", out)
 
     def test_ineligible_prospects_are_skipped(self):

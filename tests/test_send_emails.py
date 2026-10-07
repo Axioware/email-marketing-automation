@@ -270,8 +270,8 @@ class SendEndToEndTests(unittest.TestCase):
                "SMTP_SECURITY": "none", "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret", "SMTP_FROM_EMAIL": "user@x.org"}
         result = subprocess.run([sys.executable, str(SCRIPT), "--send", "--delay", "0"], cwd=ROOT, env=env,
                                 capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 2)  # the generate_emails constants are still placeholders
-        self.assertIn("placeholder", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)  # prompt/footer are real now...
+        self.assertIn("contains placeholder text", result.stdout)  # ...but this draft still has placeholder text
         preview = subprocess.run([sys.executable, str(SCRIPT), "--delay", "0"], cwd=ROOT, env=env,
                                  capture_output=True, text=True, timeout=60)
         self.assertIn("contains placeholder text", preview.stdout)

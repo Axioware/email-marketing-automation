@@ -142,7 +142,7 @@ Options: `--business-id`, `--limit` (contacts), `--primary-only`, `--min-score`,
 
 `scripts/generate_emails.py` writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `draft`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`scripts/llm.py`).
 
-The prompt is a placeholder (`SYSTEM_PROMPT` in `scripts/generate_emails.py`); the script warns until `PROMPT_IS_PLACEHOLDER` is set to `False`.
+The prompt (`SYSTEM_PROMPT` in `scripts/generate_emails.py`) writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SMTP_FROM_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
 
 ```sh
 alembic upgrade head
@@ -201,7 +201,6 @@ Options: `--email-id`, `--business-id`, `--limit`, `--delay` (seconds between se
 
 | What | Where |
 |---|---|
-| Email prompt | `SYSTEM_PROMPT` in `scripts/generate_emails.py`, then `PROMPT_IS_PLACEHOLDER = False` |
 | Footer image | upload `assets/email-footer.png` to Supabase Storage as `email-assets/footer.png` |
 | SMTP account and sender | `SMTP_*` in `.env` |
 
