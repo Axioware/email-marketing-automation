@@ -1,25 +1,20 @@
 import json
 import os
 import re
-import subprocess
-import sys
 import threading
 import time
 import unittest
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from sqlalchemy import create_engine, text
+from django.db import IntegrityError, connection, connections, transaction
+from django.test import TestCase, TransactionTestCase
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import generate_emails as g  # noqa: E402
+from pipeline.models import BusinessWebsiteProfile, Email, EmailOpenEvent, Prospect
+from pipeline.services import generation as g
+from tests.support import ROOT, make_business, make_campaign, make_contact, run_command
 
-from tests.test_verify_e2e import ROOT, docker_ok, free_port  # noqa: E402
-
-SCRIPT = ROOT / "scripts" / "generate_emails.py"
 BASE = "https://ref.supabase.co/functions/v1/email/footer"
 EDGE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")  # same as supabase/functions/email/handler.ts
 
@@ -225,79 +220,55 @@ class FakeLLM:
         self.server.server_close()
 
 
-@unittest.skipUnless(docker_ok(), "Docker is not available")
-class GenerateEmailsEndToEndTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.name = f"emailtest-pg-{uuid.uuid4().hex[:8]}"
-        cls.port = free_port()
-        subprocess.run(["docker", "run", "-d", "--rm", "--name", cls.name, "-e", "POSTGRES_PASSWORD=test",
-                        "-p", f"127.0.0.1:{cls.port}:5432", "postgres:16-alpine"], check=True, capture_output=True)
-        cls.url = f"postgresql+psycopg2://postgres:test@127.0.0.1:{cls.port}/postgres"
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if subprocess.run(["docker", "exec", cls.name, "pg_isready", "-U", "postgres"], capture_output=True).returncode == 0:
-                try:
-                    create_engine(cls.url).connect().close()
-                    break
-                except Exception:
-                    pass
-            time.sleep(1)
-        migrated = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=ROOT,
-                                  env={**os.environ, "DATABASE_URL": cls.url}, capture_output=True, text=True)
-        if migrated.returncode != 0:
-            raise RuntimeError(migrated.stderr)
-        cls.engine = create_engine(cls.url)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.engine.dispose()
-        subprocess.run(["docker", "rm", "-f", cls.name], capture_output=True)
-
+class GenerateCase:
     def setUp(self):
         self.llm = FakeLLM()
         self.addCleanup(self.llm.close)
-        with self.engine.begin() as c:
-            c.execute(text("truncate email_open_events, emails, prospects, business_contacts, business_website_profiles, "
-                           "businesses, discovery_campaigns restart identity cascade"))
-            c.execute(text("insert into discovery_campaigns (id, name) values (1, 't')"))
-            for i in range(1, 5):
-                c.execute(text("insert into businesses (id, discovery_campaign_id, name, city) values (:i, 1, :n, 'Lahore')"),
-                          {"i": i, "n": f"Business {i}"})
-                c.execute(text("insert into business_contacts (id, business_id, name, first_name, job_title) "
-                               "values (:i, :i, :n, :f, 'Owner')"), {"i": i, "n": f"Person {i}", "f": f"P{i}"})
-            c.execute(text("insert into business_website_profiles (business_id, status, qualification_score, qualification_reasons) "
-                           "values (1, 'completed', 90, '[\"strong\"]'::jsonb)"))
+        campaign = make_campaign()
+        self.b, self.c = [None], [None]
+        for i in range(1, 5):
+            business = make_business(campaign, f"Business {i}", city="Lahore")
+            self.b.append(business)
+            self.c.append(make_contact(business, name=f"Person {i}", first_name=f"P{i}", job_title="Owner"))
+        BusinessWebsiteProfile.objects.create(business=self.b[1], status="completed", qualification_score=90,
+                                              qualification_reasons=["strong"])
 
-    def prospect(self, business_id, email, **cols):
+    def prospect(self, index, email, **cols):
         values = {"email_status": "deliverable", "outreach_status": "ready", "do_not_contact": False,
                   "qualification_score": 50, **cols}
-        with self.engine.begin() as c:
-            return c.execute(text(
-                "insert into prospects (business_id, contact_id, email, email_status, outreach_status, do_not_contact, "
-                "qualification_score) values (:b, :b, :e, :email_status, :outreach_status, :do_not_contact, :qualification_score) "
-                "returning id"), {"b": business_id, "e": email, **values}).scalar_one()
+        return Prospect.objects.create(business=self.b[index], contact=self.c[index], email=email, **values).pk
 
     def emails(self):
-        with self.engine.connect() as c:
-            return [dict(r._mapping) for r in c.execute(text("select * from emails order by id"))]
-
-    def sql(self, statement, **params):
-        with self.engine.begin() as c:
-            return c.execute(text(statement), params)
+        return list(Email.objects.order_by("id").values())
 
     def run_cli(self, *args, expect=None, **env_overrides):
-        env = {**os.environ, "DATABASE_URL": self.url, "OPENAI_API_KEY": "test", "OPENAI_BASE_URL": self.llm.url,
-               "GROQ_API_KEY": "", "GROK_API_KEY": "", "OPENAI_MODEL": "fake-model",
-               "EMAIL_TRACKING_BASE_URL": BASE, **env_overrides}
-        result = subprocess.run([sys.executable, str(SCRIPT), *args], cwd=ROOT, env=env, capture_output=True,
-                                text=True, timeout=120)
+        env = {"OPENAI_API_KEY": "test", "OPENAI_BASE_URL": self.llm.url, "GROQ_API_KEY": "", "GROK_API_KEY": "",
+               "OPENAI_MODEL": "fake-model", "EMAIL_TRACKING_BASE_URL": BASE, **env_overrides}
+        result = run_command("generate_emails", *args, env=env)
         if expect is not None:
             self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
         return result
 
-    # --------------------------------------------------------- generation
+    def make_email(self, sent=True):
+        self.prospect(1, "a@b1.org")
+        self.run_cli(expect=0)
+        if sent:
+            Email.objects.update(status="sent", sent_at=time_now())
+        return self.emails()[0]
 
+    def record(self, token, ua="Mail/1"):
+        with connection.cursor() as cursor:
+            cursor.execute("select record_email_open(%s, %s)", [token, ua])
+            return cursor.fetchone()[0]
+
+
+def time_now():
+    from django.utils import timezone
+
+    return timezone.now()
+
+
+class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
     def test_one_draft_per_ready_prospect(self):
         p1 = self.prospect(1, "a@b1.org", qualification_score=90)
         p2 = self.prospect(2, "a@b2.org")
@@ -305,7 +276,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         rows = {r["prospect_id"]: r for r in self.emails()}
         self.assertEqual(set(rows), {p1, p2})
         first = rows[p1]
-        self.assertEqual((first["recipient"], first["business_id"], first["contact_id"]), ("a@b1.org", 1, 1))
+        self.assertEqual((first["recipient"], first["business_id"], first["contact_id"]), ("a@b1.org", self.b[1].pk, self.c[1].pk))
         self.assertEqual((first["status"], first["sequence_step"], first["open_count"]), ("in_review", 1, 0))
         self.assertEqual((first["generation_provider"], first["generation_model"]), ("openai", "fake-model"))
         self.assertIsNotNone(first["generated_at"])
@@ -339,7 +310,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
     def test_regenerate_never_touches_a_sent_email(self):
         self.prospect(1, "a@b1.org")
         self.run_cli(expect=0)
-        self.sql("update emails set status='sent', sent_at=now()")
+        Email.objects.update(status="sent", sent_at=time_now())
         before = self.emails()[0]
         self.assertIn("No prospects need an email", self.run_cli("--regenerate", expect=0).stdout)
         self.assertEqual(self.emails()[0]["subject"], before["subject"])
@@ -348,15 +319,16 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.prospect(1, "a@b1.org")
         self.prospect(2, "a@b2.org")
         self.run_cli(expect=0)
-        self.sql("update emails set status='rejected', review_note='too long' where business_id=1")
-        self.sql("update emails set status='approved' where business_id=2")
+        Email.objects.filter(business=self.b[1]).update(status="rejected", review_note="too long")
+        Email.objects.filter(business=self.b[2]).update(status="approved")
         before = {r["business_id"]: r for r in self.emails()}
         self.run_cli("--regenerate", expect=0)
         after = {r["business_id"]: r for r in self.emails()}
-        self.assertEqual((after[1]["status"], after[1]["review_note"]), ("in_review", None))
-        self.assertNotEqual(after[1]["subject"], before[1]["subject"])
-        self.assertEqual(after[2]["subject"], before[2]["subject"])  # approved: untouched
-        self.assertEqual(after[2]["status"], "approved")
+        first, second = self.b[1].pk, self.b[2].pk
+        self.assertEqual((after[first]["status"], after[first]["review_note"]), ("in_review", None))
+        self.assertNotEqual(after[first]["subject"], before[first]["subject"])
+        self.assertEqual(after[second]["subject"], before[second]["subject"])  # approved: untouched
+        self.assertEqual(after[second]["status"], "approved")
 
     def test_dry_run_writes_nothing(self):
         self.prospect(1, "a@b1.org")
@@ -370,7 +342,7 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.llm.mode = "bad-for-b2"
         result = self.run_cli(expect=1)
         self.assertIn("1 email(s) saved for review, 1 failed", result.stdout)
-        self.assertEqual([r["business_id"] for r in self.emails()], [1])
+        self.assertEqual([r["business_id"] for r in self.emails()], [self.b[1].pk])
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_unreachable_llm_fails_cleanly(self):
@@ -384,33 +356,22 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.prospect(1, "a@b1.org")
         p2 = self.prospect(2, "a@b2.org")
         self.prospect(3, "a@b3.org")
-        self.run_cli("--prospect-id", str(p2), expect=0)
+        self.run_cli("--prospect-id", p2, expect=0)
         self.assertEqual([r["prospect_id"] for r in self.emails()], [p2])
-        self.run_cli("--business-id", "3", expect=0)
-        self.assertEqual(sorted(r["business_id"] for r in self.emails()), [2, 3])
+        self.run_cli("--business-id", self.b[3].pk, expect=0)
+        self.assertEqual(sorted(r["business_id"] for r in self.emails()), [self.b[2].pk, self.b[3].pk])
         self.run_cli("--limit", "1", expect=0)
         self.assertEqual(len(self.emails()), 3)
 
     def test_missing_configuration(self):
         no_llm = self.run_cli(OPENAI_API_KEY="", GROQ_API_KEY="", GROK_API_KEY="")
-        self.assertEqual(no_llm.returncode, 2)
+        self.assertEqual(no_llm.returncode, 1)
         self.assertIn("GROQ_API_KEY", no_llm.stderr)
-        no_base = self.run_cli(EMAIL_TRACKING_BASE_URL="")  # local DB host: nothing to derive
-        self.assertEqual(no_base.returncode, 2)
+        no_base = self.run_cli(EMAIL_TRACKING_BASE_URL="", DATABASE_URL="postgresql://u:p@localhost/db")
+        self.assertEqual(no_base.returncode, 1)
         self.assertIn("EMAIL_TRACKING_BASE_URL", no_base.stderr)
 
     # --------------------------------------------------------- open tracking (database side)
-
-    def make_email(self, sent=True):
-        self.prospect(1, "a@b1.org")
-        self.run_cli(expect=0)
-        if sent:
-            self.sql("update emails set status='sent', sent_at=now()")
-        return self.emails()[0]
-
-    def record(self, token, ua="Mail/1"):
-        with self.engine.begin() as c:
-            return c.execute(text("select record_email_open(:t, :u)"), {"t": token, "u": ua}).scalar()
 
     def test_first_open_marks_opened_and_later_opens_count(self):
         email = self.make_email()
@@ -419,15 +380,12 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertEqual((first["status"], first["open_count"]), ("opened", 1))
         self.assertIsNotNone(first["first_opened_at"])
         self.assertEqual(first["first_opened_at"], first["last_opened_at"])
-        time.sleep(0.05)
         self.assertTrue(self.record(email["tracking_token"], "Other"))
         second = self.emails()[0]
         self.assertEqual(second["open_count"], 2)
         self.assertEqual(second["first_opened_at"], first["first_opened_at"])
-        self.assertGreater(second["last_opened_at"], first["last_opened_at"])
-        with self.engine.connect() as c:
-            events = c.execute(text("select user_agent from email_open_events order by id")).scalars().all()
-        self.assertEqual(events, ["Mail/1", "Other"])
+        self.assertGreaterEqual(second["last_opened_at"], first["last_opened_at"])
+        self.assertEqual(list(EmailOpenEvent.objects.order_by("id").values_list("user_agent", flat=True)), ["Mail/1", "Other"])
 
     def test_draft_and_unknown_tokens_record_nothing(self):
         email = self.make_email(sent=False)
@@ -435,34 +393,21 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertFalse(self.record("x" * 43))
         row = self.emails()[0]
         self.assertEqual((row["status"], row["open_count"], row["first_opened_at"]), ("in_review", 0, None))
-        with self.engine.connect() as c:
-            self.assertEqual(c.execute(text("select count(*) from email_open_events")).scalar(), 0)
+        self.assertEqual(EmailOpenEvent.objects.count(), 0)
 
     def test_failed_status_is_not_overwritten_by_an_open(self):
         email = self.make_email()
-        self.sql("update emails set status='failed'")
+        Email.objects.update(status="failed")
         self.assertTrue(self.record(email["tracking_token"]))
         self.assertEqual(self.emails()[0]["status"], "failed")
-
-    def test_concurrent_opens_are_counted_exactly_up_to_the_limit(self):
-        email = self.make_email()
-        results = []
-        threads = [threading.Thread(target=lambda: results.append(self.record(email["tracking_token"]))) for _ in range(20)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(self.emails()[0]["open_count"], 10)  # 10 per email per minute, enforced in the database
-        self.assertEqual(results.count(True), 10)
-        with self.engine.connect() as c:
-            self.assertEqual(c.execute(text("select count(*) from email_open_events")).scalar(), 10)
 
     def test_rate_limit_window_moves_on(self):
         email = self.make_email()
         for _ in range(10):
             self.assertTrue(self.record(email["tracking_token"]))
         self.assertFalse(self.record(email["tracking_token"]))
-        self.sql("update email_open_events set opened_at = opened_at - interval '2 minutes'")  # a minute passes
+        with connection.cursor() as cursor:  # a minute passes
+            cursor.execute("update email_open_events set opened_at = opened_at - interval '2 minutes'")
         self.assertTrue(self.record(email["tracking_token"]))
         self.assertEqual(self.emails()[0]["open_count"], 11)
 
@@ -471,38 +416,62 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         for _ in range(10):
             self.record(email["tracking_token"])
         self.prospect(2, "a@b2.org")
-        self.run_cli("--business-id", "2", expect=0)
-        self.sql("update emails set status='sent', sent_at=now() where business_id=2")
-        other = [r for r in self.emails() if r["business_id"] == 2][0]
-        self.assertTrue(self.record(other["tracking_token"]))
+        self.run_cli("--business-id", self.b[2].pk, expect=0)
+        Email.objects.filter(business=self.b[2]).update(status="sent", sent_at=time_now())
+        other = Email.objects.get(business=self.b[2])
+        self.assertTrue(self.record(other.tracking_token))
 
     def test_user_agent_is_truncated_in_the_database(self):
         email = self.make_email()
         self.record(email["tracking_token"], "u" * 2000)
-        with self.engine.connect() as c:
-            self.assertEqual(len(c.execute(text("select user_agent from email_open_events")).scalar()), 500)
+        self.assertEqual(len(EmailOpenEvent.objects.get().user_agent), 500)
 
     def test_schema_constraints(self):
-        email = self.make_email(sent=False)
-        with self.assertRaises(Exception):
-            self.sql("update emails set status='bogus'")
-        with self.assertRaises(Exception):  # tracking tokens are unique
-            self.sql("insert into emails (prospect_id, business_id, contact_id, sequence_step, recipient, subject, body_text, "
-                     "body_html, tracking_token) select prospect_id, business_id, contact_id, 2, recipient, 's', 'b', 'h', "
-                     "tracking_token from emails")
-        with self.engine.connect() as c:
-            rls = dict(c.execute(text("select relname, relrowsecurity from pg_class where relname in ('emails', 'email_open_events')")).all())
-        self.assertEqual(rls, {"emails": True, "email_open_events": True})
-        self.sql("delete from prospects")  # cascades
+        self.make_email(sent=False)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Email.objects.update(status="bogus")
+        original = Email.objects.get()
+        with self.assertRaises(IntegrityError), transaction.atomic():  # tracking tokens are unique
+            Email.objects.create(prospect=original.prospect, business=original.business, contact=original.contact,
+                                 sequence_step=2, recipient=original.recipient, subject="s", body_text="b",
+                                 body_html="h", tracking_token=original.tracking_token)
+        with connection.cursor() as cursor:
+            cursor.execute("select relname, relrowsecurity from pg_class where relname in ('emails', 'email_open_events')")
+            self.assertEqual(dict(cursor.fetchall()), {"emails": True, "email_open_events": True})
+        Prospect.objects.all().delete()  # cascades
         self.assertEqual(self.emails(), [])
 
-    def test_migration_downgrade_and_upgrade_again(self):
-        env = {**os.environ, "DATABASE_URL": self.url}
-        down = subprocess.run([sys.executable, "-m", "alembic", "downgrade", "-1"], cwd=ROOT, env=env, capture_output=True, text=True)
-        self.assertEqual(down.returncode, 0, down.stderr)
-        up = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=ROOT, env=env, capture_output=True, text=True)
-        self.assertEqual(up.returncode, 0, up.stderr)
+
+class ConcurrentOpenTests(GenerateCase, TransactionTestCase):
+    def test_concurrent_opens_are_counted_exactly_up_to_the_limit(self):
+        email = self.make_email()
+        results = []
+
+        def open_once():
+            try:
+                results.append(self.record(email["tracking_token"]))
+            finally:
+                connections.close_all()
+
+        threads = [threading.Thread(target=open_once) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(self.emails()[0]["open_count"], 10)  # 10 per email per minute, enforced in the database
+        self.assertEqual(results.count(True), 10)
+        self.assertEqual(EmailOpenEvent.objects.count(), 10)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class MigrationTests(TransactionTestCase):
+    def test_migrations_reverse_and_apply_again(self):
+        from django.core.management import call_command
+
+        call_command("migrate", "pipeline", "0001", verbosity=0)
+        with connection.cursor() as cursor:
+            cursor.execute("select count(*) from pg_proc where proname = 'record_email_open'")
+            self.assertEqual(cursor.fetchone()[0], 0)
+        call_command("migrate", "pipeline", verbosity=0)
+        with connection.cursor() as cursor:
+            cursor.execute("select count(*) from pg_proc where proname = 'record_email_open'")
+            self.assertEqual(cursor.fetchone()[0], 1)

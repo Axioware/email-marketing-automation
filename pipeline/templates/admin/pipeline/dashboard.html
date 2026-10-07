@@ -1,0 +1,55 @@
+{% extends "admin/index.html" %}
+{% block coltype %}colM{% endblock %}
+{% block sidebar %}{% endblock %}
+{% block content %}
+<div id="content-main">
+  <div class="pipeline-dash">
+    {% if warnings %}
+      <ul class="pipeline-warnings">{% for warning in warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+    {% endif %}
+
+    <div class="pipeline-funnel">
+      {% for label, count, url, note in funnel %}
+        <a href="{{ url }}"><b>{{ count }}</b><span>{{ label }}</span><small>{{ note }}</small></a>
+      {% endfor %}
+    </div>
+
+    <div class="module">
+      <h2>What to do next</h2>
+      {% if steps %}
+        <ul class="pipeline-steps">
+          {% for text, label, url in steps %}
+            <li><span>{{ text }}</span><a class="button" href="{{ url }}">{{ label }}</a></li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="pipeline-empty">Nothing waiting. Start a new campaign or fetch more businesses to keep the pipeline moving.</p>
+      {% endif %}
+    </div>
+
+    <div class="module">
+      <h2>Recent pipeline runs {% if running %}<small>({{ running }} running)</small>{% endif %}</h2>
+      {% if recent_runs %}
+        <table>
+          <thead><tr><th>Run</th><th>Command</th><th>Status</th><th>Started by</th><th>When</th></tr></thead>
+          <tbody>
+          {% for run in recent_runs %}
+            <tr>
+              <td><a href="{% url 'admin:pipeline_pipelinerun_change' run.pk %}">#{{ run.pk }}</a></td>
+              <td>{{ run.command }} {{ run.arguments|join:" "|truncatechars:50 }}</td>
+              <td><span class="pipeline-badge pipeline-{{ run.status }}">{{ run.get_status_display }}</span></td>
+              <td>{{ run.created_by|default:"-" }}</td>
+              <td>{{ run.created_at|timesince }} ago</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="pipeline-empty">No runs yet. Every step you start from here appears in this list.</p>
+      {% endif %}
+      <p class="pipeline-empty"><a href="{% url 'admin:pipeline_pipelinerun_add' %}">Run a pipeline step</a> · <a href="{% url 'admin:pipeline_pipelinerun_changelist' %}">All runs</a> · <a href="{% url 'admin:guide' %}">How to use this</a></p>
+    </div>
+  </div>
+  {% include "admin/app_list.html" with app_list=app_list show_changelinks=True %}
+</div>
+{% endblock %}

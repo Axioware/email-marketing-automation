@@ -1,16 +1,12 @@
 import json
-import sys
 import time
 from datetime import datetime, timezone
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import verify_contact_emails as v  # noqa: E402
-
-from tests.fakes import FakeReacher, reacher_body  # noqa: E402
+from pipeline.services import verification as v
+from tests.fakes import FakeReacher, reacher_body
 
 
 def contact(email="good@fake.org", candidates=(), source="website"):

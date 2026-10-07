@@ -1,0 +1,4 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'pipeline/admin.css' %}">{% endblock %}
+{% block userlinks %}<a href="{% url 'admin:guide' %}">Guide</a> / <a href="{% url 'api-docs' %}">API</a> / {{ block.super }}{% endblock %}

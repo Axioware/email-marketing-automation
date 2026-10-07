@@ -1,0 +1,75 @@
+{% extends "admin/change_form.html" %}
+{% block object-tools %}
+{{ block.super }}
+{% if email %}
+<div class="pipeline-review-nav">
+  <a href="{% url 'admin:pipeline_email_changelist' %}?status__exact={{ email.status }}">&larr; All {{ email.get_status_display|lower }} emails</a>
+  {% if next_review %}<a href="{% url 'admin:pipeline_email_change' next_review %}">Next in review &rarr;</a>{% endif %}
+</div>
+{% url 'admin:pipeline_email_approve' email.pk as approve_url %}
+{% url 'admin:pipeline_email_reject' email.pk as reject_url %}
+{% url 'admin:pipeline_email_reopen' email.pk as reopen_url %}
+{% url 'admin:pipeline_email_regenerate' email.pk as regenerate_url %}
+{% url 'admin:pipeline_email_send' email.pk as send_url %}
+<div class="pipeline-review">
+  <div class="pipeline-card">
+    <h2>Review <span class="pipeline-badge pipeline-{{ email.status }}">{{ email.get_status_display }}</span>
+      {% if in_review_count %}<small>({{ in_review_count }} in review)</small>{% endif %}</h2>
+    {% if email.review_note %}<p class="pipeline-note">Review note: {{ email.review_note }}</p>{% endif %}
+    {% if email.send_error %}<p class="pipeline-error">Last send error: {{ email.send_error }}</p>{% endif %}
+    {% if not prospect_ready and email.status in "in_review approved" %}<p class="pipeline-error">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</p>{% endif %}
+    {% if has_placeholder %}<p class="pipeline-error">Contains placeholder text; edit it before approving.</p>{% endif %}
+
+    <div class="pipeline-actions">
+      {% if email.status == "in_review" %}
+        <form method="post" action="{{ approve_url }}">{% csrf_token %}
+          <input type="submit" class="default" value="Approve" {% if has_placeholder %}disabled{% endif %}></form>
+      {% endif %}
+      {% if email.status == "in_review" or email.status == "approved" %}
+        <form method="post" action="{{ reject_url }}">{% csrf_token %}
+          <input type="text" name="note" placeholder="Reason (optional)" maxlength="2000">
+          <input type="submit" class="danger" value="Reject"></form>
+      {% endif %}
+      {% if email.status == "rejected" or email.status == "approved" %}
+        <form method="post" action="{{ reopen_url }}">{% csrf_token %}<input type="submit" value="Back to review"></form>
+      {% endif %}
+      {% if email.status == "in_review" or email.status == "rejected" %}
+        <form method="post" action="{{ regenerate_url }}">{% csrf_token %}<input type="submit" value="Regenerate with AI"></form>
+      {% endif %}
+    </div>
+
+    {% if email.status == "approved" %}
+      <h3>Send now</h3>
+      {% if smtp_problems %}
+        <p class="pipeline-error">SMTP is not configured in .env: {{ smtp_problems|join:"; " }}.</p>
+      {% else %}
+        <form method="post" action="{{ send_url }}" class="pipeline-actions">{% csrf_token %}
+          <label>Type <b>{{ email.recipient }}</b> to confirm:
+            <input type="text" name="confirm" autocomplete="off" required></label>
+          <input type="submit" class="default" value="Send from {{ sender }}">
+        </form>
+      {% endif %}
+    {% endif %}
+
+    <h3>What we know about them</h3>
+    <dl class="pipeline-dl">
+      <dt>Business</dt><dd>{{ email.business.name }}{% if email.business.city %}, {{ email.business.city }}{% endif %}{% if email.business.country %}, {{ email.business.country }}{% endif %}</dd>
+      {% if email.business.website_url %}<dt>Website</dt><dd>{% if website_link %}<a href="{{ website_link }}" target="_blank" rel="noopener noreferrer">{{ website_link }}</a>{% else %}{{ email.business.website_url }}{% endif %}</dd>{% endif %}
+      {% if email.business.google_rating %}<dt>Google rating</dt><dd>{{ email.business.google_rating }} ({{ email.business.google_review_count|default:"0" }} reviews)</dd>{% endif %}
+      <dt>Contact</dt><dd>{{ email.contact.name }}{% if email.contact.job_title %} ({{ email.contact.job_title }}){% endif %}</dd>
+      <dt>Qualification score</dt><dd>{{ qualification_score|default_if_none:"-" }}</dd>
+    </dl>
+    {% if findings %}<h3>From their website</h3><ul>{% for item in findings %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+    {% if qualification_reasons %}<h3>Why they qualified</h3><ul>{% for item in qualification_reasons %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+    {% if email.prospect.outreach_facts %}<h3>Outreach facts</h3><ul>{% for item in email.prospect.outreach_facts %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+  </div>
+
+  <div class="pipeline-card">
+    <h2>Preview</h2>
+    <p>Subject: <b>{{ email.subject }}</b></p>
+    <iframe class="pipeline-preview" sandbox srcdoc="{{ preview }}" title="Email preview"></iframe>
+    <p class="help">The preview loads the footer image directly, so viewing it never counts as an open.</p>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

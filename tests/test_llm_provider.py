@@ -1,12 +1,9 @@
 import os
-import sys
 import unittest
-from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import llm as r  # noqa: E402
-import research_business_websites  # noqa: E402
+from pipeline.services import llm as r
+from pipeline.services import research as research_business_websites
 
 KEYS = ("GROQ_API_KEY", "GROK_API_KEY", "GROQ_MODEL", "OPENAI_API_KEY", "OPENAI_MODEL")
 

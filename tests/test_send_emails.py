@@ -1,25 +1,19 @@
-import json
 import os
 import smtplib
-import subprocess
-import sys
 import time
-import unittest
 import uuid
-from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
-from sqlalchemy import create_engine, text
+from django.db import connection
+from django.test import TestCase
+import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import generate_emails as g  # noqa: E402
-import send_emails as s  # noqa: E402
+from pipeline.models import Email, Prospect
+from pipeline.services import generation as g
+from pipeline.services import sending as s
+from tests.fake_smtp import FakeSmtpServer
+from tests.support import make_business, make_campaign, make_contact, run_command
 
-from tests.fake_smtp import FakeSmtpServer  # noqa: E402
-from tests.test_verify_e2e import ROOT, docker_ok, free_port  # noqa: E402
-
-SCRIPT = ROOT / "scripts" / "send_emails.py"
 CONFIG = {"host": "h", "port": 465, "security": "ssl", "username": "u@axo.dev", "password": "p",
           "from_email": "u@axo.dev", "from_name": "Abdul Rauf", "reply_to": "", "timeout": 5}
 
@@ -52,11 +46,11 @@ class MessageTests(unittest.TestCase):
     def test_config_from_env(self):
         with mock.patch.dict(os.environ, {"SMTP_USERNAME": "a@b.org", "SMTP_PASSWORD": "x", "SMTP_PORT": "",
                                           "SMTP_HOST": "", "SMTP_SECURITY": "", "SMTP_FROM_EMAIL": ""}):
-            config = s.smtp_config(SimpleNamespace(timeout=5))
+            config = s.smtp_config(5)
         self.assertEqual((config["host"], config["port"], config["security"], config["from_email"]),
                          ("smtp.hostinger.com", 465, "ssl", "a@b.org"))
         with mock.patch.dict(os.environ, {"SMTP_PORT": "587", "SMTP_SECURITY": ""}):
-            self.assertEqual(s.smtp_config(SimpleNamespace(timeout=5))["security"], "starttls")
+            self.assertEqual(s.smtp_config(5)["security"], "starttls")
 
     def test_config_problems(self):
         self.assertEqual(s.config_problems(CONFIG), [])
@@ -86,72 +80,40 @@ class MessageTests(unittest.TestCase):
         self.assertNotIn("PLACEHOLDER", g.FOOTER_TEXT)
 
 
-@unittest.skipUnless(docker_ok(), "Docker is not available")
-class SendEndToEndTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.name = f"emailtest-pg-{uuid.uuid4().hex[:8]}"
-        cls.port = free_port()
-        subprocess.run(["docker", "run", "-d", "--rm", "--name", cls.name, "-e", "POSTGRES_PASSWORD=test",
-                        "-p", f"127.0.0.1:{cls.port}:5432", "postgres:16-alpine"], check=True, capture_output=True)
-        cls.url = f"postgresql+psycopg2://postgres:test@127.0.0.1:{cls.port}/postgres"
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if subprocess.run(["docker", "exec", cls.name, "pg_isready", "-U", "postgres"], capture_output=True).returncode == 0:
-                try:
-                    create_engine(cls.url).connect().close()
-                    break
-                except Exception:
-                    pass
-            time.sleep(1)
-        migrated = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=ROOT,
-                                  env={**os.environ, "DATABASE_URL": cls.url}, capture_output=True, text=True)
-        if migrated.returncode != 0:
-            raise RuntimeError(migrated.stderr)
-        cls.engine = create_engine(cls.url)
+SMTP_ENV_KEYS = ("SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL",
+                 "SMTP_FROM_NAME", "SMTP_REPLY_TO")
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.engine.dispose()
-        subprocess.run(["docker", "rm", "-f", cls.name], capture_output=True)
 
+class SendCase:
     def setUp(self):
         self.smtp = FakeSmtpServer()
         self.addCleanup(self.smtp.close)
-        with self.engine.begin() as c:
-            c.execute(text("truncate email_open_events, emails, prospects, business_contacts, businesses, "
-                           "discovery_campaigns restart identity cascade"))
-            c.execute(text("insert into discovery_campaigns (id, name) values (1, 't')"))
+        self.campaign = make_campaign()
+
+    def smtp_env(self, **overrides):
+        return {"SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(self.smtp.port), "SMTP_SECURITY": "none",
+                "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret", "SMTP_FROM_EMAIL": "user@x.org",
+                "SMTP_FROM_NAME": "Sender Name", "SMTP_REPLY_TO": "", **overrides}
 
     def draft(self, recipient, body="Hi there", subject="Hello", status="approved", **prospect_cols):
         cols = {"email_status": "deliverable", "outreach_status": "ready", "do_not_contact": False, **prospect_cols}
-        with self.engine.begin() as c:
-            n = c.execute(text("select count(*) from businesses")).scalar() + 1
-            c.execute(text("insert into businesses (id, discovery_campaign_id, name) values (:i, 1, :n)"), {"i": n, "n": f"B{n}"})
-            c.execute(text("insert into business_contacts (id, business_id, name) values (:i, :i, 'P')"), {"i": n})
-            pid = c.execute(text("insert into prospects (business_id, contact_id, email, email_status, outreach_status, "
-                                 "do_not_contact) values (:i, :i, :e, :email_status, :outreach_status, :do_not_contact) "
-                                 "returning id"), {"i": n, "e": recipient, **cols}).scalar_one()
-            return c.execute(text("insert into emails (prospect_id, business_id, contact_id, recipient, subject, body_text, "
-                                  "body_html, tracking_token, status) values (:p, :i, :i, :r, :s, :b, :h, :t, :st) returning id"),
-                             {"p": pid, "i": n, "r": recipient, "s": subject, "b": body, "h": f"<p>{body}</p>",
-                              "t": uuid.uuid4().hex + uuid.uuid4().hex, "st": status}).scalar_one()
+        business = make_business(self.campaign, f"B {recipient}")
+        contact = make_contact(business, name="P")
+        prospect = Prospect.objects.create(business=business, contact=contact, email=recipient, **cols)
+        return Email.objects.create(prospect=prospect, business=business, contact=contact, recipient=recipient,
+                                    subject=subject, body_text=body, body_html=f"<p>{body}</p>",
+                                    tracking_token=uuid.uuid4().hex + uuid.uuid4().hex, status=status).pk
 
     def row(self, email_id):
-        with self.engine.connect() as c:
-            return dict(c.execute(text("select * from emails where id=:i"), {"i": email_id}).one()._mapping)
+        return Email.objects.filter(pk=email_id).values().get()
 
     def prospect_of(self, email_id):
-        with self.engine.connect() as c:
-            return dict(c.execute(text("select p.* from prospects p join emails e on e.prospect_id=p.id where e.id=:i"),
-                                  {"i": email_id}).one()._mapping)
+        return Prospect.objects.filter(emails__id=email_id).values().get()
 
+
+class SendEndToEndTests(SendCase, TestCase):
     def run_cli(self, *args, expect=None, **env_overrides):
-        env = {**os.environ, "DATABASE_URL": self.url, "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(self.smtp.port),
-               "SMTP_SECURITY": "none", "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret",
-               "SMTP_FROM_EMAIL": "user@x.org", "SMTP_FROM_NAME": "Sender Name", "SMTP_REPLY_TO": "", **env_overrides}
-        result = subprocess.run([sys.executable, str(SCRIPT), "--delay", "0", "--allow-placeholders", *args],
-                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+        result = run_command("send_emails", "--delay", "0", "--allow-placeholders", *args, env=self.smtp_env(**env_overrides))
         if expect is not None:
             self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
         return result
@@ -183,9 +145,9 @@ class SendEndToEndTests(unittest.TestCase):
     def test_sent_email_then_counts_opens(self):
         eid = self.draft("a@b.org")
         self.run_cli("--send", expect=0)
-        with self.engine.begin() as c:
-            recorded = c.execute(text("select record_email_open(tracking_token, 'Mail') from emails where id=:i"), {"i": eid}).scalar()
-        self.assertTrue(recorded)
+        with connection.cursor() as cursor:
+            cursor.execute("select record_email_open(tracking_token, 'Mail') from emails where id=%s", [eid])
+            self.assertTrue(cursor.fetchone()[0])
         self.assertEqual((self.row(eid)["status"], self.row(eid)["open_count"]), ("opened", 1))
 
     def test_a_rerun_never_sends_twice(self):
@@ -205,13 +167,12 @@ class SendEndToEndTests(unittest.TestCase):
         ids = {status: self.draft(f"{status}@b.org", status=status) for status in ("in_review", "rejected", "failed")}
         self.assertIn("No approved emails ready", self.run_cli("--send", expect=0).stdout)
         self.assertEqual(self.smtp.messages, [])
-        self.assertEqual({s: self.row(i)["status"] for s, i in ids.items()},
+        self.assertEqual({st: self.row(i)["status"] for st, i in ids.items()},
                          {"in_review": "in_review", "rejected": "rejected", "failed": "failed"})
 
     def test_recipient_must_still_match_the_prospect(self):
         eid = self.draft("a@b.org")
-        with self.engine.begin() as c:
-            c.execute(text("update prospects set email='changed@b.org'"))
+        Prospect.objects.update(email="changed@b.org")
         self.assertIn("No approved emails ready", self.run_cli("--send", expect=0).stdout)
         self.assertEqual(self.row(eid)["status"], "approved")
 
@@ -232,7 +193,7 @@ class SendEndToEndTests(unittest.TestCase):
         self.assertEqual(self.row(eid)["status"], "failed")
         self.assertIn("554", self.row(eid)["send_error"])
 
-    def test_temporary_failure_stops_and_returns_to_draft(self):
+    def test_temporary_failure_stops_and_returns_to_approved(self):
         first = self.draft("tempfail@b.org")
         second = self.draft("ok@b.org")
         result = self.run_cli("--send", expect=1)
@@ -255,7 +216,7 @@ class SendEndToEndTests(unittest.TestCase):
         self.assertEqual(self.row(eid)["status"], "approved")
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
-    def test_server_hanging_up_mid_send_returns_to_draft(self):
+    def test_server_hanging_up_mid_send_returns_to_approved(self):
         self.smtp.drop_on.add("drop")
         eid = self.draft("drop@b.org")
         result = self.run_cli("--send", expect=1)
@@ -264,8 +225,7 @@ class SendEndToEndTests(unittest.TestCase):
 
     def test_email_stuck_in_sending_is_reported_and_not_resent(self):
         eid = self.draft("a@b.org")
-        with self.engine.begin() as c:
-            c.execute(text("update emails set status='sending'"))
+        Email.objects.update(status="sending")
         out = self.run_cli("--send", expect=0).stdout
         self.assertIn("stuck in 'sending'", out)
         self.assertEqual(self.smtp.messages, [])
@@ -273,14 +233,11 @@ class SendEndToEndTests(unittest.TestCase):
 
     def test_placeholder_content_is_refused_without_the_flag(self):
         eid = self.draft("a@b.org", body="PLACEHOLDER COMPANY ADDRESS")
-        env = {**os.environ, "DATABASE_URL": self.url, "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(self.smtp.port),
-               "SMTP_SECURITY": "none", "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret", "SMTP_FROM_EMAIL": "user@x.org"}
-        result = subprocess.run([sys.executable, str(SCRIPT), "--send", "--delay", "0"], cwd=ROOT, env=env,
-                                capture_output=True, text=True, timeout=60)
+        env = self.smtp_env()
+        result = run_command("send_emails", "--send", "--delay", "0", env=env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)  # prompt/footer are real now...
         self.assertIn("contains placeholder text", result.stdout)  # ...but this draft still has placeholder text
-        preview = subprocess.run([sys.executable, str(SCRIPT), "--delay", "0"], cwd=ROOT, env=env,
-                                 capture_output=True, text=True, timeout=60)
+        preview = run_command("send_emails", "--delay", "0", env=env)
         self.assertIn("contains placeholder text", preview.stdout)
         self.assertEqual(self.row(eid)["status"], "approved")
         self.assertEqual(self.smtp.messages, [])
@@ -288,7 +245,7 @@ class SendEndToEndTests(unittest.TestCase):
     def test_missing_smtp_settings_are_refused(self):
         self.draft("a@b.org")
         result = self.run_cli("--send", SMTP_USERNAME="", SMTP_PASSWORD="", SMTP_FROM_EMAIL="")
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 1)
         for name in ("SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL"):
             self.assertIn(name, result.stderr)
 
@@ -296,7 +253,7 @@ class SendEndToEndTests(unittest.TestCase):
         first = self.draft("a@b.org")
         second = self.draft("b@b.org")
         third = self.draft("c@b.org")
-        self.run_cli("--send", "--email-id", str(second), expect=0)
+        self.run_cli("--send", "--email-id", second, expect=0)
         self.assertEqual([self.row(i)["status"] for i in (first, second, third)], ["approved", "sent", "approved"])
         self.run_cli("--send", "--limit", "1", expect=0)
         self.assertEqual([self.row(i)["status"] for i in (first, third)], ["sent", "approved"])
@@ -305,16 +262,8 @@ class SendEndToEndTests(unittest.TestCase):
         self.draft("a@b.org")
         self.draft("b@b.org")
         started = time.monotonic()
-        env = {"SMTP_HOST": "127.0.0.1"}
-        result = subprocess.run([sys.executable, str(SCRIPT), "--send", "--delay", "1.5", "--allow-placeholders"], cwd=ROOT,
-                                env={**os.environ, "DATABASE_URL": self.url, "SMTP_PORT": str(self.smtp.port),
-                                     "SMTP_SECURITY": "none", "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret",
-                                     "SMTP_FROM_EMAIL": "user@x.org", "SMTP_FROM_NAME": "", **env},
-                                capture_output=True, text=True, timeout=60)
+        result = run_command("send_emails", "--send", "--delay", "1.5", "--allow-placeholders",
+                             env=self.smtp_env(SMTP_FROM_NAME=""))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertGreaterEqual(time.monotonic() - started, 1.5)
         self.assertEqual(len(self.smtp.messages), 2)
-
-
-if __name__ == "__main__":
-    unittest.main()

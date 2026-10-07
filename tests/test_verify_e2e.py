@@ -1,25 +1,20 @@
-"""End-to-end: the real CLI (subprocess) against a throwaway local Postgres built with the real migrations.
-
-Needs Docker (skipped otherwise). Never touches the DATABASE_URL in .env: the subprocess gets its own.
-"""
+"""End-to-end: the verify_emails command against the test Postgres and a fake Reacher server."""
 import csv
-import json
-import os
-import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 import uuid
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from django.db import IntegrityError, connection, transaction
+from django.test import TestCase, TransactionTestCase
 
+from pipeline.models import BusinessContact, Prospect
+from pipeline.services import verification as v
+from pipeline.test_runner import free_port
 from tests.fakes import FakeReacher
-
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "verify_contact_emails.py"
+from tests.support import make_business, make_campaign, make_contact, run_command
 
 
 def docker_ok() -> bool:
@@ -29,100 +24,47 @@ def docker_ok() -> bool:
         return False
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-
-
-@unittest.skipUnless(docker_ok(), "Docker is not available")
-class EndToEndTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.name = f"emailtest-pg-{uuid.uuid4().hex[:8]}"
-        cls.port = free_port()
-        subprocess.run(["docker", "run", "-d", "--rm", "--name", cls.name, "-e", "POSTGRES_PASSWORD=test",
-                        "-p", f"127.0.0.1:{cls.port}:5432", "postgres:16-alpine"], check=True, capture_output=True)
-        cls.url = f"postgresql+psycopg2://postgres:test@127.0.0.1:{cls.port}/postgres"
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if subprocess.run(["docker", "exec", cls.name, "pg_isready", "-U", "postgres"], capture_output=True).returncode == 0:
-                try:
-                    create_engine(cls.url).connect().close()
-                    break
-                except Exception:
-                    pass
-            time.sleep(1)
-        else:
-            raise RuntimeError("test Postgres did not start")
-        migrated = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=ROOT,
-                                  env={**os.environ, "DATABASE_URL": cls.url}, capture_output=True, text=True)
-        if migrated.returncode != 0:
-            raise RuntimeError(migrated.stderr)
-        cls.engine = create_engine(cls.url)
-        with cls.engine.begin() as conn:
-            conn.execute(text("insert into discovery_campaigns (id, name) values (1, 'test')"))
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.engine.dispose()
-        subprocess.run(["docker", "rm", "-f", cls.name], capture_output=True)
-
+class VerifyCase:
     def setUp(self):
         self.fake = FakeReacher()
         self.addCleanup(self.fake.close)
-        with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects, business_contacts, business_website_profiles, businesses restart identity cascade"))
-            for i in range(1, 9):
-                conn.execute(text("insert into businesses (id, discovery_campaign_id, name) values (:i, 1, :n)"), {"i": i, "n": f"Business {i}"})
-            conn.execute(text("insert into business_website_profiles (business_id, status, qualification_score) values (1, 'completed', 78), (2, 'completed', 40)"))
+        campaign = make_campaign()
+        self.b = [None] + [make_business(campaign, f"Business {i}") for i in range(1, 9)]
+        from pipeline.models import BusinessWebsiteProfile
+        BusinessWebsiteProfile.objects.create(business=self.b[1], status="completed", qualification_score=78)
+        BusinessWebsiteProfile.objects.create(business=self.b[2], status="completed", qualification_score=40)
 
-    # ---------------------------------------------------------------- helpers
-
-    def contact(self, business_id, email, candidates=(), primary=True):
-        import json
-        with self.engine.begin() as conn:
-            return conn.execute(text(
-                """insert into business_contacts (business_id, name, email, email_source, is_primary, candidate_emails)
-                   values (:b, :n, :e, 'inferred', :p, cast(:c as jsonb)) returning id"""),
-                {"b": business_id, "n": f"Person {business_id}", "e": email, "p": primary,
-                 "c": json.dumps([{"email": c, "pattern": "x", "confidence": 0.1} for c in candidates])}).scalar_one()
+    def contact(self, business_index, email, candidates=(), primary=True):
+        return make_contact(self.b[business_index], email, candidates, primary=primary).pk
 
     def rows(self, **where):
-        clause = " and ".join(f"{k} = :{k}" for k in where) or "true"
-        with self.engine.connect() as conn:
-            return [dict(r._mapping) for r in conn.execute(text(f"select * from prospects where {clause} order by id"), where)]
+        return list(Prospect.objects.filter(**where).order_by("id").values())
 
     def by_email(self):
         return {r["email"]: r for r in self.rows()}
 
-    def run_cli(self, *args, reacher_url=None, expect=None):
-        env = {**os.environ, "DATABASE_URL": self.url, "REACHER_URL": reacher_url or self.fake.url,
-               "VERIFY_MAIL_FROM": "", "VERIFY_HELO": ""}
-        result = subprocess.run([sys.executable, str(SCRIPT), "--no-auto-start", "--delay", "0", *args],
-                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+    def run_cli(self, *args, reacher_url=None, expect=None, env=None):
+        env = {"REACHER_URL": reacher_url or self.fake.url, "VERIFY_MAIL_FROM": "", "VERIFY_HELO": "", **(env or {})}
+        result = run_command("verify_emails", "--no-auto-start", "--delay", "0", *args, env=env)
         if expect is not None:
             self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
         return result
 
-    # ---------------------------------------------------------------- tests
-
     def contact_row(self, cid):
-        with self.engine.connect() as conn:
-            return dict(conn.execute(text("select * from business_contacts where id=:i"), {"i": cid}).one()._mapping)
+        return BusinessContact.objects.filter(pk=cid).values().get()
 
     def checks(self, cid):
         return {c["email"]: c.get("check") for c in self.contact_row(cid)["candidate_emails"]}
 
+
+class EndToEndTests(VerifyCase, TestCase):
     def test_only_deliverable_addresses_become_prospects(self):
         cid = self.contact(1, "good@a.org", ["bad@b.org", "catchall@c.org", "full@d.org", "blocked@e.org", "good2@f.org"])
         out = self.run_cli(expect=0).stdout
         rows = self.by_email()
         self.assertEqual(set(rows), {"good@a.org", "good2@f.org"})  # nothing undeliverable/risky/unknown
         for r in rows.values():
-            self.assertEqual((r["business_id"], r["contact_id"]), (1, cid))
+            self.assertEqual((r["business_id"], r["contact_id"]), (self.b[1].pk, cid))
             self.assertEqual((r["email_status"], r["outreach_status"]), ("deliverable", "ready"))
             self.assertEqual(r["email_verification_provider"], "reacher")
             self.assertIsNotNone(r["email_verified_at"])
@@ -147,9 +89,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(all(c.get("checked_at") for c in row["candidate_emails"]))
 
     def test_contact_email_is_checked_even_if_not_in_candidates(self):
-        self.contact(1, "good@a.org")
-        with self.engine.begin() as conn:
-            conn.execute(text("update business_contacts set candidate_emails = cast('[{\"email\": \"good2@b.org\"}]' as jsonb)"))
+        cid = self.contact(1, "good@a.org")
+        BusinessContact.objects.filter(pk=cid).update(candidate_emails=[{"email": "good2@b.org"}])
         self.run_cli(expect=0)
         self.assertEqual(set(self.by_email()), {"good@a.org", "good2@b.org"})
 
@@ -204,11 +145,11 @@ class EndToEndTests(unittest.TestCase):
         self.contact(1, "good@a.org", ["good2@b.org", "good@c.org", "good@d.org"])
         self.run_cli(expect=0)
         self.assertEqual(len(self.rows()), 4)
-        with self.engine.begin() as conn:
-            conn.execute(text("""update prospects set outreach_priority='high', research_summary='nice', outreach_facts='["f1"]'::jsonb,
-                                 last_contacted_at=now() where email='good@a.org'"""))
-            conn.execute(text("update prospects set do_not_contact=true where email='good2@b.org'"))
-            conn.execute(text("update prospects set outreach_status='contacted' where email='good@c.org'"))
+        from django.utils import timezone
+        Prospect.objects.filter(email="good@a.org").update(outreach_priority="high", research_summary="nice",
+                                                           outreach_facts=["f1"], last_contacted_at=timezone.now())
+        Prospect.objects.filter(email="good2@b.org").update(do_not_contact=True)
+        Prospect.objects.filter(email="good@c.org").update(outreach_status="contacted")
         self.fake.sequence["good2"] = ["bad"]  # only this one stops being deliverable on the recheck
         self.run_cli("--recheck", expect=0)
         rows = self.by_email()
@@ -225,8 +166,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_do_not_contact_prospect_is_never_made_ready(self):
         cid = self.contact(1, "good@a.org")
-        with self.engine.begin() as conn:
-            conn.execute(text("insert into prospects (business_id, contact_id, email, do_not_contact) values (1, :c, 'good@a.org', true)"), {"c": cid})
+        Prospect.objects.create(business=self.b[1], contact_id=cid, email="good@a.org", do_not_contact=True)
         self.run_cli("--recheck", expect=0)
         row = self.rows()[0]
         self.assertEqual((row["email_status"], row["outreach_status"], row["do_not_contact"]), ("deliverable", "pending", True))
@@ -276,22 +216,29 @@ class EndToEndTests(unittest.TestCase):
 
     def test_filters(self):
         self.contact(1, "good@a.org", primary=True)
-        self.contact(1, "good2@a.org", primary=False)
+        second = self.contact(1, "good2@a.org", primary=False)
         self.contact(2, "good@b.org", primary=True)
         self.run_cli("--primary-only", expect=0)
         self.assertEqual(set(self.by_email()), {"good@a.org", "good@b.org"})
-        with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects restart identity cascade"))
-        self.run_cli("--business-id", "2", "--recheck", expect=0)
+        Prospect.objects.all().delete()
+        self.run_cli("--business-id", self.b[2].pk, "--recheck", expect=0)
         self.assertEqual(set(self.by_email()), {"good@b.org"})
-        with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects restart identity cascade"))
+        Prospect.objects.all().delete()
         self.run_cli("--min-score", "50", "--recheck", expect=0)
-        self.assertEqual({r["business_id"] for r in self.rows()}, {1})
-        with self.engine.begin() as conn:
-            conn.execute(text("truncate prospects restart identity cascade"))
+        self.assertEqual({r["business_id"] for r in self.rows()}, {self.b[1].pk})
+        Prospect.objects.all().delete()
         self.run_cli("--limit", "1", "--recheck", expect=0)
         self.assertEqual(len({r["contact_id"] for r in self.rows()}), 1)
+        Prospect.objects.all().delete()
+        self.run_cli("--contact-id", second, "--recheck", expect=0)
+        self.assertEqual(set(self.by_email()), {"good2@a.org"})
+
+    def test_several_businesses_in_one_run(self):
+        self.contact(1, "good@a.org")
+        self.contact(2, "good@b.org")
+        self.contact(3, "good@c.org")
+        self.run_cli("--business-id", self.b[1].pk, "--business-id", self.b[3].pk, expect=0)
+        self.assertEqual(set(self.by_email()), {"good@a.org", "good@c.org"})
 
     def test_max_candidates_caps_per_contact(self):
         self.contact(1, "good@a.org", ["good2@b.org", "good@c.org", "good@d.org"])
@@ -303,7 +250,8 @@ class EndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "r.csv"
             self.run_cli("--report", str(path), expect=0)
-            rows = {r["email"]: r for r in csv.DictReader(open(path))}
+            with open(path) as handle:
+                rows = {r["email"]: r for r in csv.DictReader(handle)}
         self.assertEqual(rows["catchall@c.org"]["probed"], "True")
         self.assertEqual(rows["catchall@c.org"]["catch_all"], "True")
         self.assertEqual(rows["bad@c.org"]["probed"], "False")
@@ -325,27 +273,14 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stdout + result.stderr)
         self.assertEqual(set(self.by_email()), {"good@a.org"})
 
-    def test_missing_table_gives_a_clear_message(self):
-        self.contact(1, "good@a.org")
-        with self.engine.begin() as conn:
-            conn.execute(text("alter table prospects rename to prospects_hidden"))
-        try:
-            result = self.run_cli(expect=1)
-            self.assertIn("alembic upgrade head", result.stdout)
-        finally:
-            with self.engine.begin() as conn:
-                conn.execute(text("alter table prospects_hidden rename to prospects"))
-
     def run_with_identity(self, mail_from, helo="mail.mine.org"):
-        env = {**os.environ, "DATABASE_URL": self.url, "REACHER_URL": self.fake.url,
-               "VERIFY_MAIL_FROM": mail_from, "VERIFY_HELO": helo}
-        return subprocess.run([sys.executable, str(SCRIPT), "--no-auto-start", "--delay", "0", "--dry-run"],
-                              cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+        return run_command("verify_emails", "--no-auto-start", "--delay", "0", "--dry-run",
+                           env={"REACHER_URL": self.fake.url, "VERIFY_MAIL_FROM": mail_from, "VERIFY_HELO": helo})
 
     def test_placeholder_sender_domain_is_refused(self):
         for sender in ("verify@example.org", "verify@host.invalid"):
             result = self.run_with_identity(sender)
-            self.assertEqual(result.returncode, 2, sender)
+            self.assertEqual(result.returncode, 1, sender)
             self.assertIn("reserved placeholder domain", result.stderr)
         self.assertEqual(self.fake.calls, [])
 
@@ -368,21 +303,20 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("is not local", result.stdout)
 
     def test_invalid_helo_is_rejected_up_front(self):
-        result = self.run_cli("--helo", "alpha")
-        self.assertEqual(result.returncode, 2)
+        result = self.run_cli("--helo", "alpha", expect=1)
         self.assertIn("fully-qualified", result.stderr)
 
     def test_missing_helo_is_refused_when_managing_the_container(self):
-        env = {**os.environ, "DATABASE_URL": self.url, "REACHER_URL": self.fake.url, "VERIFY_HELO": "", "VERIFY_MAIL_FROM": ""}
-        result = subprocess.run([sys.executable, str(SCRIPT), "--dry-run"], cwd=ROOT, env=env, capture_output=True,
-                                text=True, timeout=60)
-        self.assertEqual(result.returncode, 2)
+        result = run_command("verify_emails", "--dry-run",
+                             env={"REACHER_URL": self.fake.url, "VERIFY_HELO": "", "VERIFY_MAIL_FROM": ""})
+        self.assertEqual(result.returncode, 1)
         self.assertIn("VERIFY_HELO is not set", result.stderr)
         self.assertEqual(self.fake.calls, [])
 
     def test_bad_arguments(self):
-        for args in (["--max-candidates", "-1"], ["--reacher-timeout", "0"], ["--delay", "-1"]):
-            self.assertEqual(self.run_cli(*args).returncode, 2, args)
+        for args in (["--max-candidates", "-1"], ["--reacher-timeout", "0"], ["--delay", "-1"], ["--limit", "0"],
+                     ["--limit", "x"]):
+            self.assertEqual(self.run_cli(*args).returncode, 1, args)
 
     def test_no_contacts(self):
         self.assertIn("No contacts to process", self.run_cli(expect=0).stdout)
@@ -391,29 +325,44 @@ class EndToEndTests(unittest.TestCase):
         cid = self.contact(1, "good@a.org", ["good2@b.org"])
         self.run_cli(expect=0)
         self.assertEqual(len(self.rows()), 2)
-        with self.engine.begin() as conn:
-            conn.execute(text("delete from business_contacts where id=:i"), {"i": cid})
+        BusinessContact.objects.filter(pk=cid).delete()
         self.assertEqual(self.rows(), [])
 
     def test_database_enforces_one_row_per_contact_and_email(self):
         cid = self.contact(1, "good@a.org")
-        insert = text("insert into prospects (business_id, contact_id, email) values (1, :c, 'x@a.org')")
-        with self.engine.begin() as conn:
-            conn.execute(insert, {"c": cid})
-        with self.assertRaises(Exception):
-            with self.engine.begin() as conn:
-                conn.execute(insert, {"c": cid})
+        Prospect.objects.create(business=self.b[1], contact_id=cid, email="x@a.org")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Prospect.objects.create(business=self.b[1], contact_id=cid, email="x@a.org")
 
-    def test_table_defaults_and_updated_at_trigger(self):
+    def test_database_defaults_for_plain_sql_inserts(self):
         cid = self.contact(1, "good@a.org")
-        with self.engine.begin() as conn:
-            conn.execute(text("insert into prospects (business_id, contact_id, email) values (1, :c, 'x@a.org')"), {"c": cid})
+        with connection.cursor() as cursor:
+            cursor.execute("insert into prospects (business_id, contact_id, email) values (%s, %s, 'x@a.org')",
+                           [self.b[1].pk, cid])
         row = self.rows()[0]
         self.assertEqual((row["outreach_status"], row["do_not_contact"], row["outreach_facts"]), ("pending", False, []))
+        self.assertIsNotNone(row["created_at"])
+
+
+class UpdatedAtTriggerTests(VerifyCase, TransactionTestCase):
+    def test_updated_at_trigger(self):
+        cid = self.contact(1, "good@a.org")
+        Prospect.objects.create(business=self.b[1], contact_id=cid, email="x@a.org")
+        before = self.rows()[0]["updated_at"]
         time.sleep(1.1)
-        with self.engine.begin() as conn:
-            conn.execute(text("update prospects set outreach_priority='low'"))
-        self.assertGreater(self.rows()[0]["updated_at"], row["updated_at"])
+        Prospect.objects.update(outreach_priority="low")  # a queryset update: only the database trigger sets it
+        self.assertGreater(self.rows()[0]["updated_at"], before)
+
+    def test_missing_table_gives_a_clear_message(self):
+        self.contact(1, "good@a.org")
+        with connection.cursor() as cursor:
+            cursor.execute("alter table prospects rename to prospects_hidden")
+        try:
+            result = self.run_cli(expect=1)
+            self.assertIn("python manage.py migrate", result.stdout)
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute("alter table prospects_hidden rename to prospects")
 
 
 @unittest.skipUnless(docker_ok(), "Docker is not available")
@@ -421,9 +370,6 @@ class LiveReacherContainerTests(unittest.TestCase):
     """Starts the real reacherhq/backend image through ensure_reacher on a spare port."""
 
     def test_auto_start_configure_and_check(self):
-        sys.path.insert(0, str(ROOT / "scripts"))
-        import verify_contact_emails as v
-
         name = f"emailtest-reacher-{uuid.uuid4().hex[:8]}"
         port = free_port()
         client = v.ReacherClient(f"http://127.0.0.1:{port}", 60)
@@ -458,7 +404,3 @@ class LiveReacherContainerTests(unittest.TestCase):
         subprocess.run(["docker", "stop", name], capture_output=True)
         v.ensure_reacher(client, "other@example.org", "mail2.example.org", True, container=name)
         self.assertTrue(v.container_config(name)["running"])
-
-
-if __name__ == "__main__":
-    unittest.main()

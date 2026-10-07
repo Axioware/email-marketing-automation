@@ -56,7 +56,7 @@ export function clientIp(req: Request): string {
   return req.headers.get("x-forwarded-for")?.split(",")[0].trim() || req.headers.get("x-real-ip") || "unknown";
 }
 
-// Must match TOKEN_PATTERN in scripts/generate_emails.py.
+// Must match TOKEN_PATTERN in pipeline/services/generation.py.
 export const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
 const PATH_PATTERN = /\/footer\/([^/]+?)(?:\.(?:png|gif|jpe?g|webp))?\/?$/;
 
