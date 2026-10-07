@@ -17,9 +17,53 @@ alembic upgrade head                                # creates / updates every ta
 
 Also needed:
 
-- **Docker**: email verification (Module 4) runs Reacher in a container.
+- **Docker**: email verification (Module 4) runs Reacher in a container (see "Docker setup" below).
 - **Firefox and geckodriver**: contact discovery (Module 3).
 - **Supabase**: only for open tracking (Module 5). Deploy the edge function and upload the footer image once (see "Open tracking").
+
+### Docker setup (Reacher, for email verification)
+
+Email verification runs [Reacher](https://github.com/reacherhq/check-if-email-exists) in a local Docker container. You do not create it by hand: the script builds and configures it on its first run. You only need Docker working and a few `.env` values.
+
+1. **Install Docker** ([docs.docker.com/engine/install](https://docs.docker.com/engine/install/)) and check it works without `sudo`:
+
+   ```sh
+   docker run --rm hello-world
+   ```
+
+   On Linux, if you get "permission denied", add yourself to the `docker` group and log in again: `sudo usermod -aG docker $USER`.
+
+2. **Check that outbound port 25 is open.** Reacher talks to mail servers on port 25, and many home ISPs and cloud hosts block it (results then come back `unknown`):
+
+   ```sh
+   python -c "import socket; socket.create_connection(('gmail-smtp-in.l.google.com', 25), timeout=8); print('port 25 open')"
+   ```
+
+3. **Set the sender identity in `.env`.** Reacher announces these to the mail servers it checks; the first must be an address that can receive mail, and the second a name with a dot:
+
+   ```sh
+   VERIFY_MAIL_FROM=you@yourdomain.com
+   VERIFY_HELO=yourdomain.com
+   ```
+
+   With no domain of your own, see "No domain of your own?" in Module 4 below. Placeholder domains such as `example.org` are refused.
+
+4. **Run the verifier.** The first run downloads the image (`reacherhq/backend`) and starts a container named `reacher`, bound to `127.0.0.1:8080`, which restarts with Docker. It prints `Using Reacher <version>` when ready:
+
+   ```sh
+   python scripts/verify_contact_emails.py --limit 1 --dry-run
+   ```
+
+Managing the container:
+
+```sh
+docker ps --filter name=reacher     # is it running?
+docker logs reacher                 # what is it doing?
+docker stop reacher                 # stop it (the next run starts it again)
+docker rm -f reacher                # delete it (the next run recreates it from .env)
+```
+
+If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the container automatically. Port 8080 already in use? Set `REACHER_URL=http://127.0.0.1:8081` in `.env` and the script uses that port. Add `--no-auto-start` to manage the container yourself (command in Module 4 below).
 
 `.env` keys (`.env_example` lists every one):
 
