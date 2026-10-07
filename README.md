@@ -1,4 +1,71 @@
-# Email Marketing Automation Database
+# Email Marketing Automation
+
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email for each, lets you review and approve them in a dashboard, sends them, and tracks opens. Data lives in PostgreSQL (Supabase).
+
+## Run the project
+
+### One-time setup
+
+```sh
+cd email-marketing-automation
+python -m venv .venv && source .venv/bin/activate    # skip if .venv already exists
+python -m pip install -r requirements.txt
+python -m playwright install chromium               # Modules 1 and 2
+cp .env_example .env                                # then fill it in (see below)
+alembic upgrade head                                # creates / updates every table
+```
+
+Also needed:
+
+- **Docker**: email verification (Module 4) runs Reacher in a container.
+- **Firefox and geckodriver**: contact discovery (Module 3).
+- **Supabase**: only for open tracking (Module 5). Deploy the edge function and upload the footer image once (see "Open tracking").
+
+`.env` keys (`.env_example` lists every one):
+
+| Needed for | Keys |
+|---|---|
+| Everything | `DATABASE_URL` |
+| Research and email writing | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
+| Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
+| Sending | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` (host, port and security default to Hostinger) |
+
+### The pipeline
+
+Run the steps in order. Each one reads what the previous one stored, and each skips work it has already done, so it is safe to rerun.
+
+| Step | Command | What it does |
+|---|---|---|
+| 1. Campaign | `python scripts/create_discovery_campaign.py` | Prompts for a country, locations and search terms |
+| 2. Find businesses | `python scripts/fetch_campaign_businesses.py` | Scrapes Google Maps into `businesses` |
+| 3. Research and score | `python scripts/research_business_websites.py` | An AI agent reads each website and scores it 0-100 |
+| 4. Find owners | `python scripts/find_business_stakeholders.py --headed` | Finds the decision maker and guesses email addresses |
+| 5. Verify emails | `python scripts/verify_contact_emails.py` | Reacher checks each address; deliverable ones become `prospects` |
+| 6. Write emails | `python scripts/generate_emails.py` | One email per prospect, saved as `in_review` |
+| 7. Review | `python -m dashboard` | Open http://127.0.0.1:8001 to edit, approve or reject |
+| 8. Send | Dashboard Send button, or `python scripts/send_emails.py --send` | Sends only approved emails; opens are tracked |
+
+Every script has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
+
+```sh
+python scripts/verify_contact_emails.py --limit 2 --dry-run
+python scripts/generate_emails.py --limit 1 --dry-run
+python scripts/send_emails.py --limit 1          # preview only; add --send to actually send
+```
+
+Notes:
+
+- **Reacher starts itself.** The first run of step 5 creates and configures the Docker container. It needs outbound port 25.
+- **Step 4 opens Firefox.** Google may show a CAPTCHA; `--headed` lets you see the window. DuckDuckGo is the fallback.
+- **Opens are counted only after an email is sent**, through the deployed edge function.
+- The sections below describe each step in detail.
+
+### Run the tests
+
+```sh
+python -m unittest discover -s tests -t .
+npx deno test supabase/functions/email/handler_test.ts
+```
 
 ## Run migrations
 
