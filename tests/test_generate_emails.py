@@ -430,14 +430,37 @@ class GenerateEmailsEndToEndTests(unittest.TestCase):
         self.assertTrue(self.record(email["tracking_token"]))
         self.assertEqual(self.emails()[0]["status"], "failed")
 
-    def test_concurrent_opens_are_all_counted(self):
+    def test_concurrent_opens_are_counted_exactly_up_to_the_limit(self):
         email = self.make_email()
-        threads = [threading.Thread(target=self.record, args=(email["tracking_token"],)) for _ in range(20)]
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.record(email["tracking_token"]))) for _ in range(20)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual(self.emails()[0]["open_count"], 20)
+        self.assertEqual(self.emails()[0]["open_count"], 10)  # 10 per email per minute, enforced in the database
+        self.assertEqual(results.count(True), 10)
+        with self.engine.connect() as c:
+            self.assertEqual(c.execute(text("select count(*) from email_open_events")).scalar(), 10)
+
+    def test_rate_limit_window_moves_on(self):
+        email = self.make_email()
+        for _ in range(10):
+            self.assertTrue(self.record(email["tracking_token"]))
+        self.assertFalse(self.record(email["tracking_token"]))
+        self.sql("update email_open_events set opened_at = opened_at - interval '2 minutes'")  # a minute passes
+        self.assertTrue(self.record(email["tracking_token"]))
+        self.assertEqual(self.emails()[0]["open_count"], 11)
+
+    def test_rate_limit_is_per_email(self):
+        email = self.make_email()
+        for _ in range(10):
+            self.record(email["tracking_token"])
+        self.prospect(2, "a@b2.org")
+        self.run_cli("--business-id", "2", expect=0)
+        self.sql("update emails set status='sent', sent_at=now() where business_id=2")
+        other = [r for r in self.emails() if r["business_id"] == 2][0]
+        self.assertTrue(self.record(other["tracking_token"]))
 
     def test_user_agent_is_truncated_in_the_database(self):
         email = self.make_email()

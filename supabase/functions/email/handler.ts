@@ -13,9 +13,9 @@ export type Deps = {
   limiter?: RateLimiter;
 };
 
-// Fixed-window counters per key, held in memory by each function instance. It caps how fast one client or one
-// token can add opens (abuse, scanners hammering the URL); requests over the limit still get the image but are
-// not recorded. Each instance limits independently, so this is a guard, not an exact global quota.
+// Fixed-window counters per key, held in memory by each function instance. Requests over the limit still get the
+// image but are not recorded. Supabase spreads requests across many instances, so this is only a light extra
+// guard; the real per-email limit is enforced by the database function record_email_open.
 export class RateLimiter {
   private counts = new Map<string, { windowStart: number; count: number }>();
 

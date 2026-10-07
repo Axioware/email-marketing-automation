@@ -176,7 +176,7 @@ The tracking base URL is derived from a Supabase `DATABASE_URL`; set `EMAIL_TRAC
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided to the function by Supabase automatically.
 
-Requests are rate limited per client IP (60/min) and per token (10/min); over the limit the image is still returned but no open is recorded. Limits are kept in memory per function instance, so they guard against abuse rather than enforce an exact quota.
+Opens are rate limited in the database: at most 10 recorded opens per email per minute (`record_email_open` locks the email row, so concurrent requests are counted exactly). Over the limit the image is still returned but no open is recorded. The function also keeps a per-IP limit (60/min) in memory, but Supabase spreads requests across many function instances, so that one is only a light extra guard.
 
 **Limitations:** an open means the image was requested, not that a person read the email. Clients that block images miss opens, image proxies and caches can hide repeat opens, and security scanners can load the image before the recipient does. Treat it as an engagement signal.
 
