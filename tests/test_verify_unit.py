@@ -64,11 +64,16 @@ class PureLogicTests(unittest.TestCase):
 
     def test_prospect_values_owns_only_verification_columns(self):
         contact = {"id": 7, "business_id": 3, "qualification_score": 78}
-        values = v.prospect_values(contact, "a@x.pk", "deliverable", "NOW")
+        outcome = {"status": "risky", "reason": "catch_all", "note": "catch-all", "summary": {"is_catch_all": True}}
+        values = v.prospect_values(contact, "a@x.pk", outcome, "NOW")
         self.assertEqual(values, {
-            "business_id": 3, "contact_id": 7, "email": "a@x.pk", "email_status": "deliverable",
+            "business_id": 3, "contact_id": 7, "email": "a@x.pk", "email_status": "risky", "verdict": "catch_all",
+            "verification_note": "catch-all", "verification_details": {"is_catch_all": True, "probed": True},
             "email_verification_provider": "reacher", "email_verified_at": "NOW", "qualification_score": 78,
-            "outreach_status": "ready"})
+            "outreach_status": "needs_review"})
+        shortcut = {"status": "unknown", "reason": "smtp_unreachable", "note": "not checked", "summary": None}
+        values = v.prospect_values(contact, "b@x.pk", shortcut, "NOW", probed=False)
+        self.assertEqual((values["verification_details"], values["outreach_status"]), ({"probed": False}, "needs_review"))
         for later in ("outreach_priority", "outreach_facts", "research_summary", "do_not_contact", "last_contacted_at"):
             self.assertNotIn(later, values)
 
@@ -94,24 +99,33 @@ class PureLogicTests(unittest.TestCase):
         self.assertNotIn("email", values)
 
     def test_already_decided(self):
-        contact = {"email": "own@x.pk", "email_status": None, "candidate_emails": [
-            {"email": "no@x.pk", "check": "invalid"}, {"email": "rk@x.pk", "check": "risky"},
-            {"email": "ok@x.pk", "check": "safe"}, {"email": "uk@x.pk", "check": "unknown"}, {"email": "new@x.pk"}]}
-        self.assertTrue(v.already_decided(contact, "no@x.pk", None))
-        self.assertTrue(v.already_decided(contact, "rk@x.pk", None))
-        self.assertFalse(v.already_decided(contact, "uk@x.pk", None))  # unknown is checked again
-        self.assertFalse(v.already_decided(contact, "new@x.pk", None))
-        self.assertFalse(v.already_decided(contact, "ok@x.pk", None))  # a deliverable verdict counts only via prospects
-        self.assertTrue(v.already_decided(contact, "ok@x.pk", "deliverable"))
-        self.assertFalse(v.already_decided(contact, "own@x.pk", None))
-        self.assertTrue(v.already_decided({**contact, "email_status": "undeliverable"}, "own@x.pk", None))
-        self.assertFalse(v.already_decided({**contact, "email_status": "deliverable"}, "own@x.pk", None))
+        for status in ("deliverable", "undeliverable", "risky"):
+            self.assertTrue(v.already_decided(status), status)
+        for status in ("unknown", None):  # unknown, and addresses never stored, are checked (again)
+            self.assertFalse(v.already_decided(status), status)
+
+    def test_verdicts(self):
+        from tests.fakes import SCENARIOS
+        expected = {"good": "deliverable", "bad": "mailbox_not_found", "nomx": "no_mail_server", "disabled": "disabled",
+                    "catchall": "catch_all", "full": "full_inbox", "disposable": "disposable", "odd": "risky",
+                    "info": "deliverable", "blocked": "blocked", "grey": "temporary_failure",
+                    "nosmtp": "smtp_unreachable"}
+        for name, code in expected.items():
+            self.assertEqual(v.reacher_verdict(v.summarize_reacher(SCENARIOS[name]())), code, name)
+        self.assertEqual(v.reacher_verdict(None), "check_failed")
+        invalid_syntax = {**v.summarize_reacher(SCENARIOS["bad"]()), "valid_syntax": False}
+        self.assertEqual(v.reacher_verdict(invalid_syntax), "invalid_syntax")
+        from pipeline.models import Prospect
+        codes = {*expected.values(), "check_failed", "invalid_syntax", "unknown"}
+        self.assertLessEqual(codes, set(Prospect.Verdict.values))  # every code has a label in the admin
 
     def test_domain_shortcut(self):
         def outcome(status, summary, retryable=False):
             return {"status": status, "summary": summary, "retryable": retryable}
         self.assertEqual(v.domain_shortcut(outcome("unknown", None))[0], "unknown")
         self.assertEqual(v.domain_shortcut(outcome("risky", {"is_catch_all": True}))[0], "risky")
+        self.assertEqual(v.domain_shortcut(outcome("risky", {"is_catch_all": True}))[2], "catch_all")
+        self.assertEqual(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": False}))[2], "smtp_unreachable")
         self.assertEqual(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": False}))[0], "unknown")
         self.assertEqual(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": True}, retryable=False))[0], "unknown")
         self.assertIsNone(v.domain_shortcut(outcome("unknown", {"can_connect_smtp": True}, retryable=True)))  # greylisting

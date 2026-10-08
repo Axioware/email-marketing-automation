@@ -211,7 +211,7 @@ class BusinessContactInline(ReadOnlyInline):
 class ProspectInline(ReadOnlyInline):
     model = Prospect
     fk_name = "business"
-    fields = ["email", "contact", "email_status", "outreach_status", "do_not_contact", "last_contacted_at"]
+    fields = ["email", "contact", "email_status", "verdict", "outreach_status", "do_not_contact", "last_contacted_at"]
     readonly_fields = fields
 
 
@@ -478,18 +478,19 @@ class BusinessContactAdmin(PipelineAdmin):
 
 @admin.register(Prospect)
 class ProspectAdmin(PipelineAdmin):
-    list_display = ["email", "business", "contact", "status_badge", "outreach_badge", "do_not_contact",
+    list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge", "do_not_contact",
                     "qualification_score", "email_verified_at", "last_contacted_at"]
-    list_filter = ["outreach_status", "email_status", "do_not_contact", "email_verification_provider"]
+    list_filter = ["email_status", "verdict", "outreach_status", "do_not_contact", "email_verification_provider"]
     search_fields = ["email", "business__name", "contact__name"]
     list_select_related = ["business", "contact"]
     autocomplete_fields = ["business", "contact"]
     readonly_fields = ["email_verified_at", "email_verification_provider", "last_contacted_at", "created_at",
-                       "updated_at", "emails_link"]
+                       "updated_at", "emails_link", "verification_details_display"]
     fieldsets = [
         (None, {"fields": ["business", "contact", "email", "do_not_contact"]}),
-        ("Verification (Module 4)", {"fields": ["email_status", "email_verification_provider", "email_verified_at",
-                                                "qualification_score"]}),
+        ("Verification (Module 4)", {"fields": ["email_status", "verdict", "verification_note",
+                                                "verification_details_display", "email_verification_provider",
+                                                "email_verified_at", "qualification_score"]}),
         ("Outreach", {"fields": ["outreach_status", "outreach_priority", "outreach_facts", "research_summary",
                                  "last_contacted_at", "emails_link"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
@@ -499,6 +500,17 @@ class ProspectAdmin(PipelineAdmin):
     @admin.display(description="Email", ordering="email_status")
     def status_badge(self, obj):
         return badge(obj.email_status, obj.get_email_status_display() if obj.email_status else None)
+
+    @admin.display(description="Verdict", ordering="verdict")
+    def verdict_badge(self, obj):
+        if not obj.verdict:
+            return "-"
+        return format_html('<span class="pipeline-badge pipeline-{}" title="{}">{}</span>', obj.email_status or "none",
+                           obj.verification_note or "", obj.get_verdict_display())
+
+    @admin.display(description="Reacher findings")
+    def verification_details_display(self, obj):
+        return pretty_json(obj.verification_details)
 
     @admin.display(description="Outreach", ordering="outreach_status")
     def outreach_badge(self, obj):

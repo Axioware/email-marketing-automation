@@ -195,12 +195,28 @@ class BusinessContact(models.Model):
 
 
 class Prospect(models.Model):
-    """Module 4: a contact email that verification proved deliverable."""
+    """Module 4: a checked contact email with its verification result. Only deliverable ones are ready to email."""
 
     class EmailStatus(models.TextChoices):
         DELIVERABLE = "deliverable", "Deliverable"
         UNDELIVERABLE = "undeliverable", "Undeliverable"
         RISKY = "risky", "Risky"
+        UNKNOWN = "unknown", "Unknown"
+
+    class Verdict(models.TextChoices):
+        DELIVERABLE = "deliverable", "Deliverable"
+        CATCH_ALL = "catch_all", "Catch-all domain"
+        FULL_INBOX = "full_inbox", "Inbox full"
+        DISPOSABLE = "disposable", "Disposable address"
+        RISKY = "risky", "Risky"
+        MAILBOX_NOT_FOUND = "mailbox_not_found", "Mailbox not found"
+        DISABLED = "disabled", "Mailbox disabled"
+        NO_MAIL_SERVER = "no_mail_server", "Domain has no mail server"
+        INVALID_SYNTAX = "invalid_syntax", "Invalid address"
+        SMTP_UNREACHABLE = "smtp_unreachable", "Mail server unreachable"
+        BLOCKED = "blocked", "Mail server refused the check"
+        TEMPORARY_FAILURE = "temporary_failure", "Temporary failure (greylisting)"
+        CHECK_FAILED = "check_failed", "Check failed"
         UNKNOWN = "unknown", "Unknown"
 
     class OutreachStatus(models.TextChoices):
@@ -215,6 +231,10 @@ class Prospect(models.Model):
     contact = models.ForeignKey(BusinessContact, on_delete=models.CASCADE, related_name="prospects")
     email = models.CharField(max_length=320, db_index=True)
     email_status = models.CharField(max_length=32, choices=EmailStatus.choices, null=True, blank=True, db_index=True)
+    verdict = models.CharField(max_length=32, choices=Verdict.choices, null=True, blank=True, db_index=True,
+                               help_text="Why verification gave this status, e.g. catch_all or mailbox_not_found.")
+    verification_note = models.TextField(null=True, blank=True)
+    verification_details = models.JSONField(null=True, blank=True, help_text="Reacher's findings for this address.")
     email_verification_provider = models.CharField(max_length=64, null=True, blank=True)
     email_verified_at = models.DateTimeField(null=True, blank=True)
     qualification_score = models.IntegerField(null=True, blank=True)

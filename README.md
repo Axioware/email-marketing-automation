@@ -202,7 +202,7 @@ One command, `python manage.py verify_emails` (admin: select businesses or conta
 1. You run it.
 2. For each contact in `business_contacts` it takes the contact's own `email` plus every address in `candidate_emails`.
 3. Each address is checked with [Reacher](https://github.com/reacherhq/check-if-email-exists) (`reacherhq/backend`) running in **your own Docker**; no hosted service or API key is used, the command does no DNS or SMTP checking itself, and no email is sent.
-4. Addresses Reacher confirms as deliverable are stored in `prospects` (one row per contact and email). Every address's outcome (`safe`, `invalid`, `risky`, `unknown`) is also recorded on the contact in `candidate_emails`, so reruns skip addresses already checked.
+4. Every checked address is stored in `prospects` (one row per contact and email) with its status and a detailed verdict (e.g. `catch_all`). Only deliverable ones are `ready` to email. The outcome is also recorded on the contact's `candidate_emails`.
 
 Requirements: Docker, and **outbound port 25** open (Reacher opens the SMTP connections from its container, which normally shares your host's network path; many home ISPs and cloud providers block it, in which case results come back `unknown`).
 
@@ -233,20 +233,27 @@ python manage.py verify_emails --primary-only --limit 5 --dry-run
 
 ### What is stored
 
-Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky`, `unknown` -> `unknown`. Only `deliverable` addresses become `prospects` rows:
+Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `undeliverable`, `risky` -> `risky`, `unknown` -> `unknown`. Every checked address becomes a `prospects` row:
 
 | `prospects` column | Set by this step |
 |---|---|
 | `business_id`, `contact_id`, `email` | the contact and address |
-| `email_status` | `deliverable` |
-| `email_verification_provider` | `reacher` |
-| `email_verified_at` | when it was checked |
+| `email_status` | `deliverable`, `undeliverable`, `risky` or `unknown` |
+| `verdict` | why: see the table below |
+| `verification_note` | the reason in words, e.g. "domain accepts mail for any address (catch-all)" |
+| `verification_details` | Reacher's findings (catch-all, role account, SMTP error, ...) and `probed` (false when the address was not checked because its domain already gave the answer) |
+| `email_verification_provider`, `email_verified_at` | `reacher` and when it was checked |
 | `qualification_score` | copied from the business's website profile (Module 2) |
-| `outreach_status` | `ready` |
+| `outreach_status` | `ready` (deliverable), `needs_review` (risky, unknown) or `rejected` (undeliverable) |
 
-`outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact` and `last_contacted_at` belong to later stages and are never overwritten on a rerun. A rerun that finds a stored prospect is no longer deliverable updates that row (`email_status`, and `outreach_status` to `rejected` or `needs_review`) so it cannot stay `ready`; a prospect with `do_not_contact` set or one a later stage has moved on (e.g. `contacted`) keeps its `outreach_status`.
+| Status | Verdicts |
+|---|---|
+| `deliverable` | `deliverable` |
+| `undeliverable` | `mailbox_not_found`, `disabled`, `no_mail_server`, `invalid_syntax` |
+| `risky` | `catch_all`, `full_inbox`, `disposable`, `risky` |
+| `unknown` | `smtp_unreachable`, `blocked` (the server refused the check), `temporary_failure` (greylisting), `check_failed`, `unknown` |
 
-`risky` and `unknown` addresses are not prospects and must not be emailed automatically; their verdicts stay on the contact's `candidate_emails`. `unknown` (timeouts, greylisting, blocked) is checked again on the next run.
+Only `ready` prospects are ever emailed: generation and sending skip everything else. A rerun skips addresses already stored as deliverable, undeliverable or risky and checks `unknown` ones again; `--recheck` checks everything. Rechecking refreshes the verification columns; `outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact` and `last_contacted_at` belong to later stages and are never overwritten, and a prospect with `do_not_contact` set or one a later stage has moved on (e.g. `contacted`) keeps its `outreach_status`.
 
 If a domain is a catch-all, or its mail server cannot be reached, the remaining addresses on that domain are not probed (they would get the same answer) and are recorded with that outcome; `--probe-all` checks every address anyway. The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked); results so far are kept.
 

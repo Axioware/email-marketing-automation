@@ -36,7 +36,7 @@ The left sidebar lists the pages in pipeline order: **Campaigns > Businesses > W
 | 2. Find businesses | Google Maps is searched and each business is saved | Campaign > **Fetch businesses** |
 | 3. Research | An AI reads each business's website and scores it 0-100 | Businesses > **Research websites** |
 | 4. Find the decision maker | The owner or manager is found, and likely email addresses are guessed | Businesses > **Find decision makers** |
-| 5. Verify emails | Each guessed address is checked; only real ones become prospects | Businesses > **Verify contact emails** |
+| 5. Verify emails | Each guessed address is checked and saved with its result; only real ones are ready to email | Businesses > **Verify contact emails** |
 | 6. Write emails | The AI writes one email per prospect | Prospects > **Generate outreach emails** |
 | 7. Review | You read, edit, approve or reject each email | Emails |
 | 8. Send | Approved emails are sent from your email account | Email > **Send now** |
@@ -89,16 +89,18 @@ This opens Firefox in the background. It looks at the business's own pages first
 1. Sidebar > **Businesses** (or **Contacts**), tick the rows.
 2. Action **Verify contact emails (Module 4)** > **Go** > **Start run**.
 
-Each address is checked with the mail server, **without sending anything**. The results:
+Each address is checked with the mail server, **without sending anything**, and **every address is saved under Prospects** with its result and a **verdict** that says why:
 
-| Result | Meaning | What happens |
+| Result | Verdicts you may see | Outreach status |
 |---|---|---|
-| Deliverable | The mailbox exists | It becomes a **Prospect**, ready for an email |
-| Undeliverable | The mailbox does not exist | Ignored |
-| Risky | The server accepts any address (catch-all), or the mailbox is full | Not used; you can add it by hand if you are sure |
-| Unknown | The server did not answer | Checked again on the next run |
+| Deliverable | Deliverable: the mailbox exists | **Ready**: it gets an email in step 6 |
+| Undeliverable | Mailbox not found, Mailbox disabled, Domain has no mail server, Invalid address | **Rejected**: never emailed |
+| Risky | Catch-all domain (the server accepts any address, so nobody can tell if this one is real), Inbox full, Disposable address | **Needs review**: not emailed |
+| Unknown | Mail server unreachable, Mail server refused the check, Temporary failure (greylisting), Check failed | **Needs review**: checked again on the next run |
 
-You can see the result for every guessed address on the contact's page (**Candidate emails**).
+On the Prospects list, use the **By email status** and **By verdict** filters on the right, e.g. to see every catch-all address. Hover over a verdict to see the reason in words; open a prospect to see the details Reacher found. Only **Ready** prospects are ever emailed.
+
+> **Sure a risky address is real?** Open the prospect, set **Email status** to **Deliverable** and **Outreach status** to **Ready**, and save. It will then get an email like any other. (Running Verify with `--recheck` later would put it back to its checked result.)
 
 ### Step 6: Generate emails
 
@@ -177,7 +179,7 @@ Useful arguments:
 
 - **Do not contact:** on the Prospects list, tick them and choose **Mark do not contact**. They will never be emailed, and verification never changes them back. Use this when someone replies "unsubscribe". **Clear do not contact** undoes it.
 - **Add a contact by hand:** **Contacts > Add contact**, then run **Verify** for that contact. Hand-added contacts are kept when Find decision makers runs again.
-- **Status meanings:** Ready (can be emailed), Needs review (risky or unknown address), Rejected (no longer deliverable), Contacted (an email was sent).
+- **Status meanings:** Ready (can be emailed), Needs review (risky or unknown address), Rejected (undeliverable), Contacted (an email was sent). The **Verdict** column says exactly why an address is not ready.
 
 ## 7. Open tracking
 

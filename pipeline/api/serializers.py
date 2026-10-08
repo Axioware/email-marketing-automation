@@ -79,8 +79,8 @@ class ProspectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Prospect
         fields = "__all__"
-        read_only_fields = ["email_verification_provider", "email_verified_at", "last_contacted_at", "created_at",
-                            "updated_at"]
+        read_only_fields = ["email_verification_provider", "email_verified_at", "verdict", "verification_note",
+                            "verification_details", "last_contacted_at", "created_at", "updated_at"]
 
 
 class EmailOpenEventSerializer(serializers.ModelSerializer):

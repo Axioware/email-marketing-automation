@@ -58,23 +58,33 @@ class VerifyCase:
 
 
 class EndToEndTests(VerifyCase, TestCase):
-    def test_only_deliverable_addresses_become_prospects(self):
+    def test_every_address_is_stored_with_its_verdict_and_only_deliverable_is_ready(self):
         cid = self.contact(1, "good@a.org", ["bad@b.org", "catchall@c.org", "full@d.org", "blocked@e.org", "good2@f.org"])
         out = self.run_cli(expect=0).stdout
         rows = self.by_email()
-        self.assertEqual(set(rows), {"good@a.org", "good2@f.org"})  # nothing undeliverable/risky/unknown
+        expected = {
+            "good@a.org": ("deliverable", "deliverable", "ready"),
+            "good2@f.org": ("deliverable", "deliverable", "ready"),
+            "bad@b.org": ("undeliverable", "mailbox_not_found", "rejected"),
+            "catchall@c.org": ("risky", "catch_all", "needs_review"),
+            "full@d.org": ("risky", "full_inbox", "needs_review"),
+            "blocked@e.org": ("unknown", "blocked", "needs_review"),
+        }
+        self.assertEqual({email: (r["email_status"], r["verdict"], r["outreach_status"]) for email, r in rows.items()}, expected)
         for r in rows.values():
             self.assertEqual((r["business_id"], r["contact_id"]), (self.b[1].pk, cid))
-            self.assertEqual((r["email_status"], r["outreach_status"]), ("deliverable", "ready"))
             self.assertEqual(r["email_verification_provider"], "reacher")
             self.assertIsNotNone(r["email_verified_at"])
             self.assertEqual(r["qualification_score"], 78)
             self.assertFalse(r["do_not_contact"])
             self.assertEqual(r["outreach_facts"], [])
-            self.assertIsNone(r["outreach_priority"])
-            self.assertIsNone(r["research_summary"])
             self.assertIsNone(r["last_contacted_at"])
-        self.assertIn("2 added or updated as prospects", out)
+            self.assertTrue(r["verification_details"]["probed"])
+        self.assertTrue(rows["catchall@c.org"]["verification_details"]["is_catch_all"])
+        self.assertIn("catch-all", rows["catchall@c.org"]["verification_note"])
+        self.assertIsNone(rows["good@a.org"]["verification_note"])
+        self.assertIn("6 saved to prospects; 2 deliverable (ready to email)", out)
+        self.assertIn("[risky: catch_all] <catchall@c.org>", out)
         self.assertIn("3 address(es) need review", out)  # catch-all and full (risky) plus blocked (unknown)
 
     def test_every_outcome_is_recorded_on_the_contact(self):
@@ -107,16 +117,26 @@ class EndToEndTests(VerifyCase, TestCase):
         out = self.run_cli(expect=0).stdout
         self.assertEqual(self.fake.calls, ["blocked@c.org"])  # only the unknown one
         self.assertIn("2 skipped", out)
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 3)  # still one row per address
 
-    def test_unknown_can_become_a_prospect_on_rerun(self):
+    def test_addresses_checked_before_verdicts_were_stored_are_checked_once_more(self):
+        cid = self.contact(1, "good@a.org", ["bad@b.org"])
+        BusinessContact.objects.filter(pk=cid).update(  # an old run recorded the verdict only on the contact
+            candidate_emails=[{"email": "bad@b.org", "check": "invalid"}], email_status="deliverable")
+        self.run_cli(expect=0)
+        self.assertEqual(sorted(self.fake.calls), ["bad@b.org", "good@a.org"])
+        self.assertEqual(self.by_email()["bad@b.org"]["verdict"], "mailbox_not_found")
+
+    def test_unknown_becomes_ready_when_a_rerun_proves_it(self):
         cid = self.contact(1, "grey@a.org")
         self.run_cli(expect=0)
-        self.assertEqual(self.rows(), [])
+        row = self.rows()[0]
+        self.assertEqual((row["email_status"], row["verdict"], row["outreach_status"]), ("unknown", "temporary_failure", "needs_review"))
         self.assertEqual(self.contact_row(cid)["email_status"], "unknown")
         self.fake.sequence["grey"] = ["good"]
         self.run_cli(expect=0)
-        self.assertEqual([(r["email"], r["email_status"]) for r in self.rows()], [("grey@a.org", "deliverable")])
+        self.assertEqual([(r["email"], r["email_status"], r["verdict"], r["outreach_status"]) for r in self.rows()],
+                         [("grey@a.org", "deliverable", "deliverable", "ready")])
 
     def test_recheck_checks_everything_again(self):
         self.contact(1, "good@a.org", ["bad@b.org"])
@@ -135,11 +155,13 @@ class EndToEndTests(VerifyCase, TestCase):
         self.assertEqual((row["email_status"], row["outreach_status"]), ("undeliverable", "rejected"))
         self.assertEqual(len(self.rows()), 1)
 
-    def test_recheck_never_creates_prospects_for_bad_addresses(self):
+    def test_bad_addresses_are_stored_but_never_ready(self):
         self.contact(1, "bad@a.org", ["bad2@b.org"])
         self.run_cli(expect=0)
         self.run_cli("--recheck", expect=0)
-        self.assertEqual(self.rows(), [])
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({(r["email_status"], r["outreach_status"]) for r in rows}, {("undeliverable", "rejected")})
 
     def test_reruns_never_overwrite_downstream_columns(self):
         self.contact(1, "good@a.org", ["good2@b.org", "good@c.org", "good@d.org"])
@@ -171,11 +193,17 @@ class EndToEndTests(VerifyCase, TestCase):
         row = self.rows()[0]
         self.assertEqual((row["email_status"], row["outreach_status"], row["do_not_contact"]), ("deliverable", "pending", True))
 
-    def test_catch_all_domain_is_checked_once_and_nothing_becomes_a_prospect(self):
+    def test_catch_all_domain_is_checked_once_and_nothing_is_ready(self):
         cid = self.contact(1, "catchall@c.org", ["bad@c.org", "bad2@c.org", "good@c.org"])
         out = self.run_cli(expect=0).stdout
         self.assertEqual(self.fake.calls, ["catchall@c.org"])
-        self.assertEqual(self.rows(), [])
+        rows = self.by_email()
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({(r["email_status"], r["verdict"], r["outreach_status"]) for r in rows.values()},
+                         {("risky", "catch_all", "needs_review")})
+        self.assertTrue(rows["catchall@c.org"]["verification_details"]["probed"])
+        self.assertEqual(rows["good@c.org"]["verification_details"], {"probed": False})  # not checked: same domain
+        self.assertIn("not checked", rows["good@c.org"]["verification_note"])
         self.assertEqual(set(self.checks(cid).values()), {"risky"})
         self.assertIn("not checked", out)
 
@@ -183,21 +211,23 @@ class EndToEndTests(VerifyCase, TestCase):
         cid = self.contact(1, "catchall@c.org", ["bad@c.org", "bad2@c.org", "good@c.org"])
         self.run_cli("--probe-all", expect=0)
         self.assertEqual(len(self.fake.calls), 4)
-        self.assertEqual(set(self.by_email()), {"good@c.org"})
+        self.assertEqual({e for e, r in self.by_email().items() if r["outreach_status"] == "ready"}, {"good@c.org"})
         self.assertEqual(self.checks(cid), {"bad@c.org": "invalid", "bad2@c.org": "invalid", "good@c.org": "safe"})
 
     def test_unreachable_domain_is_checked_once(self):
         cid = self.contact(1, "nosmtp@d.org", ["good@d.org", "good2@d.org"])
         self.run_cli(expect=0)
         self.assertEqual(self.fake.calls, ["nosmtp@d.org"])
-        self.assertEqual(self.rows(), [])
+        self.assertEqual({(r["email_status"], r["verdict"]) for r in self.rows()}, {("unknown", "smtp_unreachable")})
+        self.assertFalse(Prospect.objects.filter(outreach_status="ready").exists())
         self.assertEqual(set(self.checks(cid).values()), {"unknown"})
 
     def test_greylisting_does_not_trigger_the_domain_shortcut(self):
         self.contact(1, "grey@d.org", ["good@d.org"])
         self.run_cli(expect=0)
         self.assertEqual(self.fake.calls, ["grey@d.org", "good@d.org"])
-        self.assertEqual(set(self.by_email()), {"good@d.org"})
+        self.assertEqual({e: r["verdict"] for e, r in self.by_email().items()},
+                         {"grey@d.org": "temporary_failure", "good@d.org": "deliverable"})
 
     def test_port_25_blocked_streak_stops_the_run_keeping_saved_results(self):
         cids = [self.contact(i, f"nosmtp@d{i}.org") for i in range(1, 6)]
@@ -209,7 +239,8 @@ class EndToEndTests(VerifyCase, TestCase):
     def test_dry_run_writes_nothing(self):
         cid = self.contact(1, "good@a.org", ["bad@b.org"])
         out = self.run_cli("--dry-run", expect=0).stdout
-        self.assertIn("[deliverable]", out)
+        self.assertIn("[deliverable: deliverable]", out)
+        self.assertIn("nothing saved (dry run)", out)
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.checks(cid), {"bad@b.org": None})
         self.assertIsNone(self.contact_row(cid)["email_checked_at"])
@@ -296,7 +327,7 @@ class EndToEndTests(VerifyCase, TestCase):
         result = self.run_with_identity("good@mine.org")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.fake.calls, ["good@mine.org", "good@a.org"])
-        self.assertIn("[deliverable]", result.stdout)
+        self.assertIn("[deliverable: deliverable]", result.stdout)
 
     def test_remote_reacher_url_is_refused(self):
         result = self.run_cli(reacher_url="https://api.reacher.email", expect=1)

@@ -84,7 +84,7 @@ class BusinessContactViewSet(viewsets.ModelViewSet):
 class ProspectViewSet(viewsets.ModelViewSet):
     queryset = Prospect.objects.all()
     serializer_class = s.ProspectSerializer
-    filterset_fields = ["business", "contact", "email_status", "outreach_status", "do_not_contact"]
+    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "do_not_contact"]
     search_fields = ["email", "business__name", "contact__name"]
     ordering_fields = ["id", "qualification_score", "email_verified_at", "last_contacted_at"]
 
