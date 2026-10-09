@@ -53,9 +53,10 @@ Each step only processes what still needs it, so it is always safe to run a step
    - **Target country**: one country, e.g. Pakistan.
    - **Target locations**: cities or areas, separated by commas, e.g. `Lahore, DHA, Gulberg`.
    - **Search terms**: what you would type into Google Maps, separated by commas, e.g. `dental clinic, dentist`.
+   - **Campaign prompt** (under Emails): the instructions the AI follows when writing this campaign's emails. Pick one from the list, or click **+** to write a new one. Each prompt belongs to one campaign. Leave it empty to use the built-in Axioware prompt. See [Prompts](#prompts).
 3. Click **Save**.
 
-Every search term is searched in every location, so 2 terms and 3 locations means 6 searches.
+Every search term is searched in every location, so 2 terms and 3 locations means 6 searches. The campaign's **Status** (Pending, Running, Completed, Failed) is set automatically when businesses are fetched; you cannot edit it.
 
 ### Step 2: Fetch businesses
 
@@ -65,6 +66,10 @@ Every search term is searched in every location, so 2 terms and 3 locations mean
 
 The campaign's status changes to **Completed** when it finishes. The businesses appear under **Businesses**.
 
+### Finding businesses: filters
+
+On **Businesses**, the **Filter** panel on the right narrows the list, and filters combine: by campaign, website, website research (not researched, researched, failed), qualification score (80+, 50-79, below 50), decision-maker search, contacts, prospects (ready, needs review, contacted, none), emails (in review, approved, sent, opened, none), Google rating, number of Google reviews, category, country and city. Select the filtered rows and run any action on them, e.g. "score 80 and above" + "Not searched yet" → **Find decision makers**.
+
 ### Step 3: Research websites
 
 1. Sidebar > **Businesses**. Tick the businesses to research. To select all of them, tick the box in the table header, then click "Select all".
@@ -73,7 +78,7 @@ The campaign's status changes to **Completed** when it finishes. The businesses 
 
 For each business the AI reads up to 5 pages of its website and gives a score with reasons. The score and status show in the Businesses list; click a business and then its **Website research** link to see what the AI read and why it scored it that way.
 
-Businesses without a website are skipped. If research fails for one (the site was down, for example), run it again later; **Retry failed** on the dashboard does this.
+Businesses you select are researched even if they were researched before (the new score replaces the old one). The **Research websites** button on the dashboard only does businesses that have not been researched yet. Businesses without a website are skipped. If research fails for one (the site was down, for example), run it again later; **Retry failed** on the dashboard does this.
 
 ### Step 4: Find decision makers
 
@@ -104,10 +109,28 @@ On the Prospects list, use the **By email status** and **By verdict** filters on
 
 ### Step 6: Generate emails
 
-1. Sidebar > **Prospects**, tick the prospects (or use **Generate emails** on the dashboard for all of them).
-2. Action **Generate outreach emails (Module 5)** > **Go** > **Start run**.
+1. Sidebar > **Prospects** (or **Businesses**), tick the rows, choose **Generate outreach emails (Module 5)** and click **Go**. To write emails for every ready prospect, click **Generate emails** on the dashboard instead.
+2. The **Generate emails** page opens:
+   - **Email prompt**: which instructions to use. Leave it on "Each campaign's default email prompt", or pick one (e.g. a follow-up). Click **+** to write a new email prompt or the pencil to edit the selected one, without leaving the page.
+   - **Rewrite emails that are in review or rejected**: tick to replace those drafts. Approved and sent emails are never changed.
+   - **Limit** and **Dry run** work like everywhere else.
+3. Click **Start generating**.
 
-The AI writes one short email per prospect, based only on what was found about the business. Every new email starts as **In review**. Nothing is sent.
+The AI writes one short email per prospect, based only on what was found about the business. Every new email starts as **In review**, and records which email prompt wrote it. Nothing is sent.
+
+### Prompts
+
+The AI's instructions come in two parts, both edited in the admin:
+
+- **Campaign prompts** (sidebar): the standing instructions for a campaign: who we are, what we offer, how to read the facts about each business, the rules every email must follow, and the output format. Each campaign uses one campaign prompt.
+- **Email prompts** (sidebar, or inside a campaign prompt's page): how to write one kind of email, e.g. "First-touch email" or "Follow-up". A campaign prompt can have many; the one marked **Default** is used unless you choose another.
+
+When an email is written, the AI receives the campaign prompt followed by the email prompt. Open an email prompt and expand **What the model receives** to see the combined text.
+
+- A new campaign prompt starts with the built-in Axioware text; if you save it without an email prompt, the built-in "First-touch email" is added to it.
+- Your first campaign already uses **Axioware - dental clinics** with its **First-touch email**.
+- A campaign without a prompt uses the built-in Axioware prompt.
+- Keep the **OUTPUT** section (subject and body as JSON) in every campaign prompt; the app needs it to read the AI's answer.
 
 ### Step 7: Review emails
 
@@ -125,7 +148,7 @@ What you can do:
 |---|---|
 | **Approve** | Marks the email ready to send and jumps to the next email in review |
 | **Reject** | Puts it aside; add a reason so you remember why |
-| **Regenerate with AI** | Writes a new version (it stays in review) |
+| **Regenerate with AI** | Writes a new version (it stays in review). The menu next to it lets you pick a different email prompt; by default it uses the same one |
 | **Back to review** | Undoes Approve or Reject |
 | **Save** | Saves your edits to the subject or body |
 
@@ -168,6 +191,7 @@ Useful arguments:
 | `--limit 5` | all steps | Process at most 5 items |
 | `--headed` | Fetch, Research, Find decision makers | Show the browser window |
 | `--retry-failed` | Research | Also retry businesses whose research failed |
+| `--redo` | Research | Research again businesses that were already researched |
 | `--redo` | Find decision makers | Search again for businesses already done |
 | `--min-score 60` | Find decision makers, Verify | Only businesses scoring 60 or more |
 | `--recheck` | Verify | Check addresses that were already checked |

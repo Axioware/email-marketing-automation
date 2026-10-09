@@ -5,6 +5,8 @@ from pipeline.api import views
 
 router = DefaultRouter()
 router.register("campaigns", views.DiscoveryCampaignViewSet)
+router.register("campaign-prompts", views.CampaignPromptViewSet)
+router.register("email-prompts", views.EmailPromptViewSet)
 router.register("businesses", views.BusinessViewSet)
 router.register("business-sources", views.BusinessSourceViewSet)
 router.register("website-profiles", views.BusinessWebsiteProfileViewSet)

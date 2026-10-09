@@ -22,12 +22,20 @@ from playwright.sync_api import sync_playwright
 
 from pipeline.models import Business, BusinessWebsiteProfile
 from pipeline.services.llm import make_llm_client
+from pipeline.services.dbthread import outside_event_loop
 
 MAX_PAGES_PER_BUSINESS = 5
 MAX_AGENT_RETRIES = 3
 MAX_CONTENT_CHARS = 16000
 MAX_RESEARCH_LINKS = 200
 MAX_PAGE_LINKS = 100
+# What one agent request may contain. Free LLM tiers limit tokens per minute (Groq: 8,000), so the request carries
+# only what the agent needs: a capped page text and the unvisited links it can choose from.
+MAX_PROMPT_CONTENT_CHARS = 6000
+MAX_PROMPT_LINKS = 50
+MAX_COMPLETION_TOKENS = 2500  # the decision is short; Groq counts this budget against the per-minute limit
+MAX_PROMPT_LINK_TEXT = 80
+PRIVATE_CONTEXT_KEYS = {"visited_identities", "current_page_links", "previously_discovered_links"}  # validation only
 JINA_REQUESTS_PER_MINUTE = 20
 JINA_RATE_WINDOW_SECONDS = 60
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -256,6 +264,17 @@ def guard_navigation(route, homepage_url: str) -> None:
     route.continue_()
 
 
+def prompt_context(context: dict) -> dict:
+    """The part of the research context sent to the model: no internal bookkeeping, no duplicate link lists."""
+    payload = {key: value for key, value in context.items() if key not in PRIVATE_CONTEXT_KEYS}
+    payload["cleaned_page_content"] = (context.get("cleaned_page_content") or "")[:MAX_PROMPT_CONTENT_CHARS]
+    payload["available_links"] = [
+        {"url": link["url"], "text": (link.get("text") or "")[:MAX_PROMPT_LINK_TEXT]}
+        for link in context.get("available_links", [])[:MAX_PROMPT_LINKS]
+    ]
+    return payload
+
+
 def validate_agent_response(client: OpenAI, model: str, context: dict, must_score: bool) -> dict:
     feedback = None
     response_format = {
@@ -267,10 +286,11 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
         },
     }
     for _ in range(MAX_AGENT_RETRIES):
-        request_data = {**context, "must_score": must_score, "validation_feedback": feedback}
+        request_data = {**prompt_context(context), "must_score": must_score, "validation_feedback": feedback}
         response = client.chat.completions.create(
             model=model,
             temperature=0.2,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
             response_format=response_format,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -350,7 +370,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                 continue
             available_identities = {
                 url_identity(link["url"])
-                for link in context["available_links"]
+                for link in context["available_links"][:MAX_PROMPT_LINKS]
                 if link["same_site"]
             }
             if (
@@ -493,6 +513,7 @@ def research_business(
     raise ResearchError("Research stopped without SCORE/EXIT at the five-page limit.")
 
 
+@outside_event_loop
 def start_profile(business_id: int) -> int:
     profile, _ = BusinessWebsiteProfile.objects.update_or_create(
         business_id=business_id,
@@ -511,6 +532,7 @@ def start_profile(business_id: int) -> int:
     return profile.pk
 
 
+@outside_event_loop
 def save_progress(profile_id: int, pages: list[dict], emails: set[str], discovered_links: list[dict]) -> None:
     BusinessWebsiteProfile.objects.filter(pk=profile_id).update(
         pages_scraped=len(pages),
@@ -527,13 +549,14 @@ BUSINESS_FIELDS = (
 )
 
 
-def load_businesses(limit: int | None, business_ids: list[int] | None, retry_failed: bool = False) -> list[dict]:
+def load_businesses(limit: int | None, business_ids: list[int] | None, retry_failed: bool = False,
+                    redo: bool = False) -> list[dict]:
     eligible_statuses = ("pending", "failed") if retry_failed else ("pending",)
-    queryset = (
-        Business.objects.filter(website_url__isnull=False)
-        .filter(Q(website_profile__isnull=True) | Q(website_profile__status__in=eligible_statuses))
-        .order_by("id")
-    )
+    queryset = Business.objects.filter(website_url__isnull=False).exclude(website_url="").order_by("id")
+    if not redo:
+        queryset = queryset.filter(Q(website_profile__isnull=True) | Q(website_profile__status__in=eligible_statuses))
+    else:  # everything except a research that is running right now
+        queryset = queryset.exclude(website_profile__status="running")
     if business_ids:
         queryset = queryset.filter(id__in=business_ids)
     if limit is not None:
@@ -541,6 +564,7 @@ def load_businesses(limit: int | None, business_ids: list[int] | None, retry_fai
     return list(queryset.values(*BUSINESS_FIELDS))
 
 
+@outside_event_loop
 def finalize_profile(profile_id: int, result: dict) -> None:
     BusinessWebsiteProfile.objects.filter(pk=profile_id).update(
         status="completed",
@@ -555,6 +579,7 @@ def finalize_profile(profile_id: int, result: dict) -> None:
     )
 
 
+@outside_event_loop
 def fail_profile(profile_id: int, error: Exception) -> None:
     BusinessWebsiteProfile.objects.filter(pk=profile_id).update(
         status="failed", agent_reasoning=f"{type(error).__name__}: {error}"[:12000]
@@ -569,6 +594,11 @@ def add_arguments(parser) -> None:
         "--retry-failed",
         action="store_true",
         help="Include businesses whose previous website research failed.",
+    )
+    parser.add_argument(
+        "--redo",
+        action="store_true",
+        help="Research again businesses that were already researched (replaces their score and findings).",
     )
     parser.add_argument(
         "--local-only",
@@ -587,9 +617,11 @@ def run(options: dict) -> int:
     print(f"Using {provider} model {model}.")
     jina_reader = None if options["local_only"] else JinaReader()
 
-    queue = load_businesses(options["limit"], options["business_id"], retry_failed=options["retry_failed"])
+    queue = load_businesses(options["limit"], options["business_id"], retry_failed=options["retry_failed"],
+                            redo=options["redo"])
     if not queue:
-        print("No businesses with websites need research.")
+        print("No businesses with websites need research. Businesses already researched are skipped; add --redo to "
+              "research them again (--retry-failed retries only failed ones).")
         return 0
 
     print(f"Researching {len(queue)} businesses; maximum {MAX_PAGES_PER_BUSINESS} pages each.")

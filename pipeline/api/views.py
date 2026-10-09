@@ -16,6 +16,8 @@ from pipeline import jobs, review
 from pipeline.api import serializers as s
 from pipeline.models import (
     Business,
+    CampaignPrompt,
+    EmailPrompt,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -44,6 +46,21 @@ class DiscoveryCampaignViewSet(viewsets.ModelViewSet):
         options = {"campaign_id": campaign.pk, **{k: v for k, v in params.validated_data.items() if v is not None}}
         run = jobs.start_run("fetch_businesses", jobs.build_arguments("fetch_businesses", options), request.user)
         return Response(s.PipelineRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
+
+
+class CampaignPromptViewSet(viewsets.ModelViewSet):
+    """Campaign prompts, each with its email prompts. A new one starts with the built-in first-touch email prompt."""
+
+    queryset = CampaignPrompt.objects.prefetch_related("email_prompts").select_related("campaign")
+    serializer_class = s.CampaignPromptSerializer
+    search_fields = ["name", "prompt"]
+
+
+class EmailPromptViewSet(viewsets.ModelViewSet):
+    queryset = EmailPrompt.objects.select_related("campaign_prompt")
+    serializer_class = s.EmailPromptSerializer
+    filterset_fields = ["campaign_prompt", "is_default"]
+    search_fields = ["name", "prompt"]
 
 
 class BusinessViewSet(viewsets.ModelViewSet):
@@ -95,7 +112,7 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
 
     queryset = Email.objects.select_related("prospect").all()
     serializer_class = s.EmailSerializer
-    filterset_fields = ["status", "business", "prospect", "contact", "sequence_step", "generation_provider"]
+    filterset_fields = ["status", "business", "prospect", "contact", "sequence_step", "generation_provider", "email_prompt"]
     search_fields = ["business__name", "recipient", "subject"]
     ordering_fields = ["id", "generated_at", "sent_at", "open_count"]
 
@@ -125,10 +142,12 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
     def reopen(self, request, pk=None):
         return self._act(request, review.reopen)
 
-    @extend_schema(request=None)
+    @extend_schema(request=s.RegenerateSerializer)
     @action(detail=True, methods=["post"])
     def regenerate(self, request, pk=None):
-        return self._act(request, review.regenerate)
+        params = s.RegenerateSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        return self._act(request, review.regenerate, params.validated_data.get("email_prompt"))
 
     @extend_schema(request=s.SendSerializer)
     @action(detail=True, methods=["post"])

@@ -22,11 +22,14 @@ from django.db.models import F, FilteredRelation, Q
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from pipeline.models import Email, Prospect
+from pipeline.models import CampaignPrompt, Email, EmailPrompt, Prospect
 from pipeline.services.llm import make_llm_client
 
 # The model receives the JSON built by `prospect_context` as the user message.
-SYSTEM_PROMPT = """You write first-touch cold emails for Axioware, sent one at a time to a single named person at a local business. Each email must read like a short, thoughtful note from one person to another, never like a campaign.
+# The model's instructions = a campaign prompt (who we are, the input, the rules) followed by an email prompt (how to
+# write this particular email). Both are edited in the admin (Campaign prompts, Email prompts); these built-in
+# defaults are used when a campaign has no prompt of its own, and seeded the first prompts in the database.
+DEFAULT_CAMPAIGN_PROMPT = """You write first-touch cold emails for Axioware, sent one at a time to a single named person at a local business. Each email must read like a short, thoughtful note from one person to another, never like a campaign.
 
 ABOUT AXIOWARE (the only facts you may state about us)
 - Axioware is a software and AI company based in Karachi, Pakistan (axioware.tech). It builds AI voice agents, AI chatbots, machine learning solutions, websites and mobile apps.
@@ -42,18 +45,6 @@ You receive JSON describing one prospect:
 - qualification.reasons, outreach_facts and research_summary: more notes from our research.
 - validation_feedback: if present, your previous answer was rejected; fix exactly what it says.
 
-HOW TO WRITE IT
-1. Open with one specific, accurate observation about their business taken from the input (for example their opening hours, that patients book by phone, a service they offer, their branches, or their rating). Never open with "I hope this finds you well", "My name is" or praise that could apply to anyone.
-2. Connect it to one problem Ava (or the fitting service) solves: calls missed while the front desk is with patients, calls after hours or on days the clinic is closed, patients left on hold, no-shows and double bookings, or reception workload. Pick the one the facts support best, and present it as a likely possibility, not a claim about their clinic.
-3. Describe Ava, or the fitting service, in one or two plain sentences focused on what changes for them.
-4. End with one low-pressure call to action: invite them to hear Ava on the live demo at axioware.tech/dental-agent, or ask whether a 15-minute call next week would be useful. One call to action only.
-5. Sign off with the sender's name from sender.name and "Axioware" on the next line. If sender.name is empty, sign off as "The Axioware team".
-
-STYLE
-- 60 to 120 words in the body, in short paragraphs separated by blank lines. Plain text only: no markdown, bullet points, emojis, bold text or exclamation marks.
-- English, warm, professional and direct. Simple words; no jargon such as "leverage", "synergy", "revolutionize", "cutting-edge" or "game-changer".
-- Subject: 3 to 7 words, specific to them, in sentence case, mentioning the business name or a detail about it. No "Re:" or "Fwd:", no questions designed to trick, no all caps, no "free", "guaranteed" or "urgent".
-
 RULES YOU MUST NOT BREAK
 - Use only facts present in the input or in the ABOUT AXIOWARE section. Never invent numbers, statistics, results, client names, testimonials, prices, discounts or deadlines, and never claim we have spoken before or that they asked to be contacted.
 - Never mention how we found them, our research, scraping, scores, qualification or AI tools used to write the email.
@@ -63,6 +54,25 @@ RULES YOU MUST NOT BREAK
 
 OUTPUT
 Return only the JSON object with "subject" and "body". The body starts with the greeting ("Hi <first_name>,") and ends with the sign-off."""
+
+DEFAULT_EMAIL_PROMPT = """HOW TO WRITE IT
+1. Open with one specific, accurate observation about their business taken from the input (for example their opening hours, that patients book by phone, a service they offer, their branches, or their rating). Never open with "I hope this finds you well", "My name is" or praise that could apply to anyone.
+2. Connect it to one problem Ava (or the fitting service) solves: calls missed while the front desk is with patients, calls after hours or on days the clinic is closed, patients left on hold, no-shows and double bookings, or reception workload. Pick the one the facts support best, and present it as a likely possibility, not a claim about their clinic.
+3. Describe Ava, or the fitting service, in one or two plain sentences focused on what changes for them.
+4. End with one low-pressure call to action: invite them to hear Ava on the live demo at axioware.tech/dental-agent, or ask whether a 15-minute call next week would be useful. One call to action only.
+5. Sign off with the sender's name from sender.name and "Axioware" on the next line. If sender.name is empty, sign off as "The Axioware team".
+
+STYLE
+- 60 to 120 words in the body, in short paragraphs separated by blank lines. Plain text only: no markdown, bullet points, emojis, bold text or exclamation marks.
+- English, warm, professional and direct. Simple words; no jargon such as "leverage", "synergy", "revolutionize", "cutting-edge" or "game-changer".
+- Subject: 3 to 7 words, specific to them, in sentence case, mentioning the business name or a detail about it. No "Re:" or "Fwd:", no questions designed to trick, no all caps, no "free", "guaranteed" or "urgent"."""
+
+
+def compose_prompt(campaign_prompt: str, email_prompt: str) -> str:
+    return f"{campaign_prompt.strip()}\n\n{email_prompt.strip()}"
+
+
+SYSTEM_PROMPT = compose_prompt(DEFAULT_CAMPAIGN_PROMPT, DEFAULT_EMAIL_PROMPT)
 PROMPT_IS_PLACEHOLDER = False
 SENDER_NAME_ENV = "SMTP_FROM_NAME"  # name used in the sign-off; empty -> "The Axioware team"
 MAX_WEBSITE_FINDINGS = 12
@@ -79,6 +89,7 @@ FOOTER_LINK = "https://axioware.tech"
 REGENERATABLE_STATUSES = ("in_review", "rejected")
 SEQUENCE_STEP = 1  # first email of the sequence; follow-ups would use later steps
 MAX_ATTEMPTS = 3
+MAX_COMPLETION_TOKENS = 2500  # a short email; Groq counts this budget against its per-minute token limit
 MAX_SUBJECT_CHARS = 200
 MAX_BODY_CHARS = 5000
 FOOTER_ALT = "Axioware"
@@ -238,7 +249,26 @@ def prospect_context(row: dict) -> dict:
     }
 
 
-def generate_draft(client: OpenAI, model: str, context: dict) -> EmailDraft:
+def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None) -> tuple[str, int | None]:
+    """(system prompt, email prompt id) for one prospect: the chosen email prompt (with its campaign prompt), else the
+    default email prompt of the prospect's campaign prompt, else the built-in prompt."""
+    if chosen is not None:
+        return chosen.full_prompt, chosen.pk
+    cache = {} if cache is None else cache
+    campaign_id = row.get("campaign_id")
+    if campaign_id not in cache:
+        campaign_prompt = CampaignPrompt.objects.filter(campaign__id=campaign_id).first() if campaign_id else None
+        email_prompt = campaign_prompt.default_email_prompt() if campaign_prompt else None
+        if email_prompt is not None:
+            cache[campaign_id] = (email_prompt.full_prompt, email_prompt.pk)
+        elif campaign_prompt is not None:
+            cache[campaign_id] = (compose_prompt(campaign_prompt.prompt, DEFAULT_EMAIL_PROMPT), None)
+        else:
+            cache[campaign_id] = (SYSTEM_PROMPT, None)
+    return cache[campaign_id]
+
+
+def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str = SYSTEM_PROMPT) -> EmailDraft:
     response_format = {
         "type": "json_schema",
         "json_schema": {"name": "outreach_email", "strict": True, "schema": EmailDraft.model_json_schema()},
@@ -249,9 +279,10 @@ def generate_draft(client: OpenAI, model: str, context: dict) -> EmailDraft:
         response = client.chat.completions.create(
             model=model,
             temperature=0.7,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
             response_format=response_format,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         )
@@ -277,6 +308,7 @@ def generate_draft(client: OpenAI, model: str, context: dict) -> EmailDraft:
 
 PROSPECT_COLUMNS = ("business_id", "contact_id", "qualification_score", "outreach_facts", "research_summary")
 PROSPECT_FIELDS = {
+    "campaign_id": F("business__discovery_campaign_id"),
     "prospect_id": F("id"),
     "recipient": F("email"),
     "business_name": F("business__name"),
@@ -320,7 +352,7 @@ def load_prospects(options: dict) -> list[dict]:
 
 
 def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provider: str, model: str,
-               now: datetime) -> bool:
+               now: datetime, email_prompt_id: int | None = None) -> bool:
     """Insert the email for review, or replace an existing one that is in review or rejected (it goes back to
     review). Approved, sent and failed emails are never modified. Returns whether anything was written."""
     content = {
@@ -329,6 +361,7 @@ def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provide
         "body_html": body_html,
         "generation_provider": provider,
         "generation_model": model,
+        "email_prompt_id": email_prompt_id,
         "generated_at": now,
     }
     with transaction.atomic():
@@ -371,6 +404,8 @@ def add_arguments(parser) -> None:
     parser.add_argument("--limit", type=int, help="Maximum number of prospects in this run.")
     parser.add_argument("--regenerate", action="store_true",
                         help="Rewrite emails that are in review or rejected (approved and sent emails are never touched).")
+    parser.add_argument("--email-prompt-id", type=int,
+                        help="Write every email with this email prompt (default: each campaign's default prompt).")
     parser.add_argument("--dry-run", action="store_true", help="Generate and print without writing to the database.")
 
 
@@ -384,6 +419,12 @@ def run(options: dict) -> int:
     if llm is None:
         raise CommandError("Set GROQ_API_KEY (or GROK_API_KEY) or OPENAI_API_KEY in the environment or project .env file")
     client, model, provider = llm
+    chosen = None
+    if options.get("email_prompt_id") is not None:
+        chosen = EmailPrompt.objects.select_related("campaign_prompt").filter(pk=options["email_prompt_id"]).first()
+        if chosen is None:
+            raise CommandError(f"Email prompt {options['email_prompt_id']} does not exist.")
+        print(f"Using email prompt: {chosen}")
     if PROMPT_IS_PLACEHOLDER:
         print("Warning: the email prompt is still a placeholder (SYSTEM_PROMPT in pipeline/services/generation.py).")
     if FOOTER_IS_PLACEHOLDER:
@@ -398,10 +439,12 @@ def run(options: dict) -> int:
 
         print(f"Generating emails for {len(queue)} prospect(s).")
         created = failed = 0
+        prompts: dict = {}
         for row in queue:
             token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
+            system_prompt, email_prompt_id = resolve_prompt(row, chosen, prompts)
             try:
-                draft = generate_draft(client, model, prospect_context(row))
+                draft = generate_draft(client, model, prospect_context(row), system_prompt)
             except Exception as error:  # one bad prospect (bad output, API error) must not stop the run
                 failed += 1
                 print(f"  Prospect {row['prospect_id']} <{row['recipient']}> failed ({type(error).__name__}): {error}")
@@ -411,7 +454,7 @@ def run(options: dict) -> int:
             if options["dry_run"]:
                 print("    " + draft.body.replace("\n", "\n    "))
             else:
-                save_draft(row, draft, body_html, token, provider, model, datetime.now(timezone.utc))
+                save_draft(row, draft, body_html, token, provider, model, datetime.now(timezone.utc), email_prompt_id)
             created += 1
         verb = "generated (dry run, not saved)" if options["dry_run"] else "saved for review"
         print(f"Done: {created} email(s) {verb}, {failed} failed.")

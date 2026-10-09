@@ -73,3 +73,21 @@ class AgentCallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptSizeTests(unittest.TestCase):
+    def test_agent_request_fits_the_groq_free_tier(self):
+        import json
+
+        links = [{"url": f"https://x.pk/page-{i}", "text": "Long link text " * 20, "same_site": True} for i in range(200)]
+        context = {"business": {"name": "Clinic"}, "current_page_url": "https://x.pk/", "cleaned_page_content": "word " * 4000,
+                   "current_page_links": links[:100], "previously_scraped_pages": [], "previously_discovered_emails": [],
+                   "previously_discovered_links": links, "available_links": links, "pages_scraped": 1,
+                   "pages_remaining": 4, "visited_urls": ["https://x.pk/"], "visited_identities": [["x.pk", "/", ""]]}
+        payload = research_business_websites.prompt_context(context)
+        for private in ("visited_identities", "current_page_links", "previously_discovered_links"):
+            self.assertNotIn(private, payload)
+        self.assertEqual(len(payload["available_links"]), research_business_websites.MAX_PROMPT_LINKS)
+        self.assertEqual(set(payload["available_links"][0]), {"url", "text"})
+        size = len(json.dumps(payload)) + len(research_business_websites.SYSTEM_PROMPT)
+        self.assertLess(size / 3.5, 7000)  # tokens, with margin under Groq's 8,000 per minute

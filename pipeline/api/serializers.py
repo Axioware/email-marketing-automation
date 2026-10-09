@@ -3,6 +3,8 @@ from rest_framework import serializers
 from pipeline import jobs, review
 from pipeline.models import (
     Business,
+    CampaignPrompt,
+    EmailPrompt,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -29,8 +31,8 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DiscoveryCampaign
-        fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "business_count",
-                  "created_at", "updated_at", "started_at", "completed_at"]
+        fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "campaign_prompt",
+                  "business_count", "created_at", "updated_at", "started_at", "completed_at"]
         read_only_fields = ["status", "created_at", "updated_at", "started_at", "completed_at"]
 
     def validate_target_locations(self, value):
@@ -43,6 +45,30 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
         if value and "," in value:
             raise serializers.ValidationError("Enter one country only.")
         return value or None
+
+
+class EmailPromptSerializer(serializers.ModelSerializer):
+    full_prompt = serializers.CharField(read_only=True, help_text="Campaign prompt + this prompt, as the model receives it.")
+
+    class Meta:
+        model = EmailPrompt
+        fields = ["id", "campaign_prompt", "name", "prompt", "is_default", "full_prompt", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class CampaignPromptSerializer(serializers.ModelSerializer):
+    campaign = serializers.PrimaryKeyRelatedField(read_only=True)
+    email_prompts = EmailPromptSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CampaignPrompt
+        fields = ["id", "name", "prompt", "campaign", "email_prompts", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def create(self, validated_data):
+        campaign_prompt = super().create(validated_data)
+        campaign_prompt.ensure_email_prompt()  # starts with the built-in first-touch email prompt
+        return campaign_prompt
 
 
 class BusinessSerializer(serializers.ModelSerializer):
@@ -99,6 +125,7 @@ class EmailSerializer(serializers.ModelSerializer):
         model = Email
         fields = ["id", "prospect", "business", "contact", "sequence_step", "recipient", "subject", "body",
                   "body_text", "body_html", "status", "prospect_ready", "generation_provider", "generation_model",
+                  "email_prompt",
                   "generated_at", "reviewed_at", "review_note", "edited_at", "sent_at", "sent_from", "message_id",
                   "send_error", "open_count", "first_opened_at", "last_opened_at", "tracking_token", "created_at",
                   "updated_at"]
@@ -122,6 +149,11 @@ class EmailSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"detail": str(error)}) from error
         instance.refresh_from_db()
         return instance
+
+
+class RegenerateSerializer(serializers.Serializer):
+    email_prompt = serializers.PrimaryKeyRelatedField(queryset=EmailPrompt.objects.all(), required=False, allow_null=True,
+                                                      help_text="Default: the prompt the email was written with.")
 
 
 class RejectSerializer(serializers.Serializer):

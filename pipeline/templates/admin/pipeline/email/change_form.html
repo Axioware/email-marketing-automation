@@ -34,7 +34,12 @@
         <form method="post" action="{{ reopen_url }}">{% csrf_token %}<input type="submit" value="Back to review"></form>
       {% endif %}
       {% if email.status == "in_review" or email.status == "rejected" %}
-        <form method="post" action="{{ regenerate_url }}">{% csrf_token %}<input type="submit" value="Regenerate with AI"></form>
+        <form method="post" action="{{ regenerate_url }}">{% csrf_token %}
+          <select name="email_prompt" aria-label="Email prompt">
+            <option value="">{% if email.email_prompt %}Same prompt ({{ email.email_prompt.name }}){% else %}Campaign default prompt{% endif %}</option>
+            {% for prompt in email_prompts %}<option value="{{ prompt.pk }}">{{ prompt }}</option>{% endfor %}
+          </select>
+          <input type="submit" value="Regenerate with AI"></form>
       {% endif %}
     </div>
 

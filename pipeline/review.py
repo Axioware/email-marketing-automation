@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from django.db.models import Count, Q
 
-from pipeline.models import Email
+from pipeline.models import Email, EmailPrompt
 from pipeline.services import generation, sending
 
 EDITABLE = ("in_review", "approved", "rejected")
@@ -106,8 +106,9 @@ def reopen(email: Email) -> str:
     return "Back in review."
 
 
-def regenerate(email: Email) -> str:
-    """Rewrite the email with the LLM (same tracking token); it goes back to review."""
+def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
+    """Rewrite the email with the LLM (same tracking token); it goes back to review. Uses the given email prompt,
+    else the one the email was written with, else its campaign's default."""
     if email.status not in generation.REGENERATABLE_STATUSES:
         raise ReviewError("Only emails in review or rejected can be regenerated.")
     llm = generation.make_llm_client()
@@ -119,12 +120,13 @@ def regenerate(email: Email) -> str:
     if not rows:
         raise ReviewError("The prospect is no longer ready for outreach (check its status).")
     row = rows[0]
+    system_prompt, email_prompt_id = generation.resolve_prompt(row, email_prompt or email.email_prompt)
     try:
-        draft = generation.generate_draft(client, model, generation.prospect_context(row))
+        draft = generation.generate_draft(client, model, generation.prospect_context(row), system_prompt)
     except Exception as error:  # noqa: BLE001 - show any model/API failure to the reviewer
         raise ReviewError(f"Regeneration failed ({type(error).__name__}): {error}"[:300]) from error
     body_html = generation.render_html(draft.body, generation.tracking_url(base_url, row["tracking_token"]))
-    if not generation.save_draft(row, draft, body_html, row["tracking_token"], provider, model, _now()):
+    if not generation.save_draft(row, draft, body_html, row["tracking_token"], provider, model, _now(), email_prompt_id):
         raise ReviewError("The email changed while it was being regenerated; nothing was saved.")
     return f"Regenerated with {provider} ({model})."
 

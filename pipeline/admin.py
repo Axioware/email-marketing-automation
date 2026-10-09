@@ -10,10 +10,12 @@ from urllib.parse import urlencode, urlsplit
 
 from django import forms
 from django.contrib import admin, messages
+from django.contrib.admin.widgets import RelatedFieldWidgetWrapper
 from django.db import transaction
-from django.db.models import Count, F
+from django.db.models import Count, F, Q
 from django.http import HttpResponseNotAllowed, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
+from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils.html import format_html, format_html_join
 from django.utils.text import Truncator
@@ -21,6 +23,8 @@ from django.utils.text import Truncator
 from pipeline import jobs, review
 from pipeline.models import (
     Business,
+    CampaignPrompt,
+    EmailPrompt,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -87,6 +91,16 @@ def ids_arguments(flag: str, ids) -> list[str]:
     return [item for pk in sorted(set(ids)) for item in (flag, str(pk))]
 
 
+def generate_url(scope: str | None = None, ids=(), regenerate: bool = False) -> str:
+    """The "Generate emails" page (choose an email prompt), optionally for selected businesses or prospects."""
+    query = {}
+    if scope:
+        query.update(scope=scope, ids=",".join(str(pk) for pk in sorted(set(ids))))
+    if regenerate:
+        query["regenerate"] = "1"
+    return reverse("admin:pipeline_prospect_generate") + (f"?{urlencode(query)}" if query else "")
+
+
 def run_step(command: str, arguments: list):
     """Admin action helper: open the run form pre-filled, so the run is reviewed and confirmed before it starts."""
     return HttpResponseRedirect(run_form_url(command, arguments))
@@ -117,10 +131,17 @@ class DiscoveryCampaignForm(forms.ModelForm):
 
     class Meta:
         model = DiscoveryCampaign
-        fields = ["name", "target_country", "target_locations", "search_terms", "status"]
+        fields = ["name", "target_country", "target_locations", "search_terms", "campaign_prompt"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if "campaign_prompt" in self.fields:  # a prompt belongs to one campaign: offer free ones and this one's own
+            used = DiscoveryCampaign.objects.exclude(pk=self.instance.pk).exclude(campaign_prompt=None)
+            self.fields["campaign_prompt"].queryset = CampaignPrompt.objects.exclude(
+                pk__in=used.values("campaign_prompt"))
+            self.fields["campaign_prompt"].help_text = ("Instructions for writing this campaign's emails. Pick a free "
+                                                        "prompt or create one with +. Without one, the built-in "
+                                                        "Axioware prompt is used.")
         for field in ("target_locations", "search_terms"):
             value = getattr(self.instance, field, None)
             if isinstance(value, list):
@@ -148,9 +169,10 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
     list_display = ["name", "target_country", "locations", "terms", "status_badge", "business_count", "created_at"]
     list_filter = ["status", "target_country"]
     search_fields = ["name"]
-    readonly_fields = ["created_at", "updated_at", "started_at", "completed_at", "businesses_link"]
+    readonly_fields = ["status", "created_at", "updated_at", "started_at", "completed_at", "businesses_link"]
     fieldsets = [
         (None, {"fields": ["name", "target_country", "target_locations", "search_terms"]}),
+        ("Emails", {"fields": ["campaign_prompt"]}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
     actions = ["fetch_businesses"]
@@ -195,6 +217,100 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
         return super().render_change_form(request, context, *args, **kwargs)
 
 
+class EmailPromptInline(admin.StackedInline):
+    model = EmailPrompt
+    extra = 0
+    fields = ["name", "is_default", "prompt"]
+    show_change_link = True
+
+
+class CampaignPromptForm(forms.ModelForm):
+    class Meta:
+        model = CampaignPrompt
+        fields = ["name", "prompt"]
+        widgets = {"prompt": forms.Textarea(attrs={"rows": 24, "class": "vLargeTextField"})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.instance.pk:
+            self.initial.setdefault("prompt", generation.DEFAULT_CAMPAIGN_PROMPT)
+
+
+@admin.register(CampaignPrompt)
+class CampaignPromptAdmin(PipelineAdmin):
+    form = CampaignPromptForm
+    list_display = ["name", "campaign_link", "email_prompt_count", "updated_at"]
+    search_fields = ["name", "prompt"]
+    readonly_fields = ["campaign_link", "created_at", "updated_at"]
+    fieldsets = [
+        (None, {"fields": ["name", "campaign_link", "prompt"],
+                "description": "The standing instructions for a campaign. When an email is written, the chosen email "
+                               "prompt below is added after this text. New prompts start from the built-in Axioware "
+                               "prompt."}),
+        ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
+    ]
+    inlines = [EmailPromptInline]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("campaign").annotate(email_prompt_total=Count("email_prompts"))
+
+    @admin.display(description="Campaign")
+    def campaign_link(self, obj):
+        campaign = getattr(obj, "campaign", None) if obj.pk else None
+        try:
+            return admin_link(campaign) if campaign else "Not used by a campaign yet"
+        except DiscoveryCampaign.DoesNotExist:
+            return "Not used by a campaign yet"
+
+    @admin.display(description="Email prompts", ordering="email_prompt_total")
+    def email_prompt_count(self, obj):
+        return changelist_link(EmailPrompt, obj.email_prompt_total, campaign_prompt__id__exact=obj.pk)
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        if form.instance.ensure_email_prompt():
+            self.message_user(request, "Added the built-in first-touch email prompt to it; edit it below.")
+
+
+class EmailPromptForm(forms.ModelForm):
+    class Meta:
+        model = EmailPrompt
+        fields = ["campaign_prompt", "name", "is_default", "prompt"]
+        widgets = {"prompt": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.instance.pk:
+            self.initial.setdefault("prompt", generation.DEFAULT_EMAIL_PROMPT)
+
+
+@admin.register(EmailPrompt)
+class EmailPromptAdmin(PipelineAdmin):
+    form = EmailPromptForm
+    list_display = ["name", "campaign_prompt", "is_default", "email_count", "updated_at"]
+    list_filter = ["campaign_prompt", "is_default"]
+    search_fields = ["name", "prompt", "campaign_prompt__name"]
+    readonly_fields = ["created_at", "updated_at", "full_prompt_display"]
+    fieldsets = [
+        (None, {"fields": ["campaign_prompt", "name", "is_default", "prompt"],
+                "description": "How to write one kind of email. The model receives the campaign prompt followed by "
+                               "this text."}),
+        ("What the model receives", {"fields": ["full_prompt_display"], "classes": ["collapse"]}),
+        ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
+    ]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("campaign_prompt").annotate(email_total=Count("emails"))
+
+    @admin.display(description="Emails written", ordering="email_total")
+    def email_count(self, obj):
+        return changelist_link(Email, obj.email_total, email_prompt__id__exact=obj.pk)
+
+    @admin.display(description="Full prompt")
+    def full_prompt_display(self, obj):
+        return format_html('<pre class="pipeline-pre">{}</pre>', obj.full_prompt) if obj.pk else "-"
+
+
 class BusinessSourceInline(ReadOnlyInline):
     model = BusinessSource
     fields = ["source", "source_business_id", "source_url", "discovered_at"]
@@ -237,12 +353,111 @@ class HasWebsiteFilter(admin.SimpleListFilter):
         return queryset
 
 
+class ChoiceFilter(admin.SimpleListFilter):
+    """A list filter defined by (value, label, Q) options."""
+
+    options: list = []
+
+    def lookups(self, request, model_admin):
+        return [(value, label) for value, label, _ in self.options]
+
+    def queryset(self, request, queryset):
+        for value, _, condition in self.options:
+            if self.value() == value:
+                return queryset.filter(condition).distinct()
+        return queryset
+
+
+class ResearchStatusFilter(ChoiceFilter):
+    title = "website research"
+    parameter_name = "research"
+    options = [
+        ("none", "Not researched", Q(website_profile__isnull=True) | Q(website_profile__status="pending")),
+        ("running", "Running", Q(website_profile__status="running")),
+        ("completed", "Researched", Q(website_profile__status="completed")),
+        ("failed", "Failed", Q(website_profile__status="failed")),
+    ]
+
+
+class ScoreFilter(ChoiceFilter):
+    title = "qualification score"
+    parameter_name = "score"
+    options = [
+        ("80", "80 and above", Q(website_profile__qualification_score__gte=80)),
+        ("50", "50 to 79 (qualified)", Q(website_profile__qualification_score__gte=50, website_profile__qualification_score__lt=80)),
+        ("low", "Below 50", Q(website_profile__qualification_score__lt=50)),
+        ("none", "Not scored", Q(website_profile__qualification_score__isnull=True)),
+    ]
+
+
+class ContactSearchFilter(ChoiceFilter):
+    title = "decision-maker search"
+    parameter_name = "discovery"
+    options = [
+        ("todo", "Not searched yet", Q(website_profile__contact_discovery_status__isnull=True)),
+        ("found", "Contacts found", Q(website_profile__contact_discovery_status="completed")),
+        ("none", "No contacts found", Q(website_profile__contact_discovery_status="no_contacts")),
+    ]
+
+
+class ContactsFilter(ChoiceFilter):
+    title = "contacts"
+    parameter_name = "contacts"
+    options = [("yes", "Has contacts", Q(contacts__isnull=False)), ("no", "No contacts", Q(contacts__isnull=True))]
+
+
+class ProspectsFilter(ChoiceFilter):
+    title = "prospects"
+    parameter_name = "prospects"
+    options = [
+        ("ready", "Has a ready prospect", Q(prospects__outreach_status="ready", prospects__do_not_contact=False)),
+        ("review", "Has prospects needing review", Q(prospects__outreach_status="needs_review")),
+        ("contacted", "Contacted", Q(prospects__outreach_status="contacted")),
+        ("none", "No prospects", Q(prospects__isnull=True)),
+    ]
+
+
+class EmailsFilter(ChoiceFilter):
+    title = "emails"
+    parameter_name = "emails"
+    options = [
+        ("review", "Email in review", Q(emails__status="in_review")),
+        ("approved", "Email approved", Q(emails__status="approved")),
+        ("sent", "Email sent", Q(emails__status__in=["sent", "opened"])),
+        ("opened", "Email opened", Q(emails__status="opened")),
+        ("none", "No email yet", Q(emails__isnull=True)),
+    ]
+
+
+class RatingFilter(ChoiceFilter):
+    title = "Google rating"
+    parameter_name = "rating"
+    options = [
+        ("45", "4.5 and above", Q(google_rating__gte=4.5)),
+        ("40", "4.0 to 4.4", Q(google_rating__gte=4.0, google_rating__lt=4.5)),
+        ("low", "Below 4.0", Q(google_rating__lt=4.0)),
+        ("none", "No rating", Q(google_rating__isnull=True)),
+    ]
+
+
+class ReviewCountFilter(ChoiceFilter):
+    title = "Google reviews"
+    parameter_name = "reviews"
+    options = [
+        ("100", "100 or more", Q(google_review_count__gte=100)),
+        ("20", "20 to 99", Q(google_review_count__gte=20, google_review_count__lt=100)),
+        ("few", "Fewer than 20", Q(google_review_count__lt=20)),
+        ("none", "None", Q(google_review_count__isnull=True) | Q(google_review_count=0)),
+    ]
+
+
 @admin.register(Business)
 class BusinessAdmin(PipelineAdmin):
     list_display = ["name", "category", "city", "google_rating", "google_review_count", "website",
                     "research_status", "score", "discovery", "contact_count", "prospect_count"]
-    list_filter = ["discovery_campaign", HasWebsiteFilter, "website_profile__status",
-                   "website_profile__contact_discovery_status", "country", "city"]
+    list_filter = ["discovery_campaign", HasWebsiteFilter, ResearchStatusFilter, ScoreFilter, ContactSearchFilter,
+                   ContactsFilter, ProspectsFilter, EmailsFilter, RatingFilter, ReviewCountFilter, "category",
+                   "country", "city"]
     search_fields = ["name", "domain", "phone", "address", "website_url"]
     readonly_fields = ["created_at", "updated_at", "first_discovered_at", "last_discovered_at", "profile_link",
                        "opening_hours_display"]
@@ -312,7 +527,8 @@ class BusinessAdmin(PipelineAdmin):
 
     @admin.action(description="Research websites (Module 2)")
     def research_websites(self, request, queryset):
-        return run_step("research_websites", ["--retry-failed", *ids_arguments("--business-id", queryset.values_list("pk", flat=True))])
+        # Selected explicitly, so research them even if they were researched before.
+        return run_step("research_websites", ["--redo", *ids_arguments("--business-id", queryset.values_list("pk", flat=True))])
 
     @admin.action(description="Find decision makers (Module 3)")
     def find_stakeholders(self, request, queryset):
@@ -324,7 +540,7 @@ class BusinessAdmin(PipelineAdmin):
 
     @admin.action(description="Generate outreach emails (Module 5)")
     def generate_emails(self, request, queryset):
-        return run_step("generate_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
+        return HttpResponseRedirect(generate_url("business", queryset.values_list("pk", flat=True)))
 
 
 @admin.register(BusinessSource)
@@ -403,7 +619,7 @@ class BusinessWebsiteProfileAdmin(PipelineAdmin):
 
     @admin.action(description="Research again (Module 2)")
     def research_again(self, request, queryset):
-        return run_step("research_websites", ["--retry-failed", *ids_arguments(
+        return run_step("research_websites", ["--redo", *ids_arguments(
             "--business-id", queryset.values_list("business_id", flat=True))])
 
     @admin.action(description="Find decision makers again (Module 3)")
@@ -476,6 +692,23 @@ class BusinessContactAdmin(PipelineAdmin):
 # ---------------------------------------------------------------- Module 4: prospects
 
 
+GENERATE_SCOPES = {"business": ("--business-id", Business, "business(es)"),
+                   "prospect": ("--prospect-id", Prospect, "prospect(s)")}
+
+
+class GenerateEmailsForm(forms.Form):
+    email_prompt = forms.ModelChoiceField(
+        EmailPrompt.objects.select_related("campaign_prompt"), required=False,
+        empty_label="Each campaign's default email prompt",
+        help_text="Leave empty to use each campaign's default. Use + to write a new prompt, the pencil to edit one.",
+    )
+    regenerate = forms.BooleanField(required=False, label="Rewrite emails that are in review or rejected",
+                                    help_text="Approved and sent emails are never changed.")
+    limit = forms.IntegerField(required=False, min_value=1, help_text="At most this many prospects (optional).")
+    dry_run = forms.BooleanField(required=False, label="Dry run",
+                                 help_text="Show the emails in the run output without saving them.")
+
+
 @admin.register(Prospect)
 class ProspectAdmin(PipelineAdmin):
     list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge", "do_not_contact",
@@ -522,11 +755,59 @@ class ProspectAdmin(PipelineAdmin):
 
     @admin.action(description="Generate outreach emails (Module 5)")
     def generate_emails(self, request, queryset):
-        return run_step("generate_emails", ids_arguments("--prospect-id", queryset.values_list("pk", flat=True)))
+        return HttpResponseRedirect(generate_url("prospect", queryset.values_list("pk", flat=True)))
 
     @admin.action(description="Regenerate emails still in review or rejected (Module 5)")
     def regenerate_emails(self, request, queryset):
-        return run_step("generate_emails", ["--regenerate", *ids_arguments("--prospect-id", queryset.values_list("pk", flat=True))])
+        return HttpResponseRedirect(generate_url("prospect", queryset.values_list("pk", flat=True), regenerate=True))
+
+    # ------------------------------------------------------------ "Generate emails" page
+
+    def get_urls(self):
+        return [path("generate/", self.admin_site.admin_view(self.generate_view), name="pipeline_prospect_generate")] \
+            + super().get_urls()
+
+    def generate_view(self, request):
+        source = request.POST if request.method == "POST" else request.GET
+        scope = source.get("scope") if source.get("scope") in GENERATE_SCOPES else None
+        ids = [int(pk) for pk in (source.get("ids") or "").split(",") if pk.strip().isdigit()] if scope else []
+        form = GenerateEmailsForm(request.POST or None, initial={"regenerate": request.GET.get("regenerate") == "1"})
+        form.fields["email_prompt"].widget = RelatedFieldWidgetWrapper(
+            form.fields["email_prompt"].widget, Email._meta.get_field("email_prompt").remote_field, self.admin_site,
+            can_add_related=True, can_change_related=True, can_view_related=True,
+        )
+        if request.method == "POST" and form.is_valid():
+            data = form.cleaned_data
+            arguments = ids_arguments(GENERATE_SCOPES[scope][0], ids) if scope else []
+            if data["email_prompt"]:
+                arguments += ["--email-prompt-id", str(data["email_prompt"].pk)]
+            if data["regenerate"]:
+                arguments.append("--regenerate")
+            if data["limit"]:
+                arguments += ["--limit", str(data["limit"])]
+            if data["dry_run"]:
+                arguments.append("--dry-run")
+            run = jobs.start_run("generate_emails", arguments, request.user)
+            self.message_user(request, f"Started: {run.command_line}", messages.SUCCESS)
+            return HttpResponseRedirect(admin_url(run))
+        if scope:
+            model, label = GENERATE_SCOPES[scope][1], GENERATE_SCOPES[scope][2]
+            names = [str(obj) for obj in model.objects.filter(pk__in=ids)[:10]]
+            target = f"{len(ids)} selected {label}: " + ", ".join(names) + ("..." if len(ids) > 10 else "")
+        else:
+            target = "every ready prospect that has no email yet"
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Generate emails",
+            "form": form,
+            "media": self.media + form.media,
+            "target": target,
+            "scope": scope or "",
+            "ids": ",".join(map(str, ids)),
+            "opts": self.model._meta,
+            "prompts": EmailPrompt.objects.select_related("campaign_prompt"),
+        }
+        return TemplateResponse(request, "admin/pipeline/generate_emails.html", context)
 
     @admin.action(description="Mark do not contact")
     def mark_do_not_contact(self, request, queryset):
@@ -581,14 +862,14 @@ class EmailAdmin(PipelineAdmin):
     list_display = ["id", "business", "recipient", "subject_short", "status_badge", "generated_at", "sent_at",
                     "open_count", "edited"]
     list_display_links = ["id", "subject_short"]
-    list_filter = ["status", "generation_provider", "sequence_step"]
+    list_filter = ["status", "email_prompt", "generation_provider", "sequence_step"]
     search_fields = ["business__name", "recipient", "subject"]
     list_select_related = ["business"]
     actions = ["approve_selected", "reject_selected", "send_selected"]
     inlines = [OpenEventInline]
     change_form_template = "admin/pipeline/email/change_form.html"
     change_list_template = "admin/pipeline/email/change_list.html"
-    details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by",
+    details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by", "email_prompt",
                "generated_at", "reviewed_at", "review_note", "edited_at"]
     delivery = ["sent_at", "sent_from", "message_id", "send_error", "open_count", "first_opened_at", "last_opened_at",
                 "tracking_token"]
@@ -733,6 +1014,7 @@ class EmailAdmin(PipelineAdmin):
                 "sender": smtp["from_email"],
                 "in_review_count": Email.objects.filter(status="in_review").count(),
                 "next_review": review.next_in_review(email.pk),
+                "email_prompts": EmailPrompt.objects.select_related("campaign_prompt"),
             }
         return super().change_view(request, object_id, form_url, extra_context)
 
@@ -764,7 +1046,9 @@ class EmailAdmin(PipelineAdmin):
         return self._review_action(request, object_id, review.reopen)
 
     def regenerate_view(self, request, object_id):
-        return self._review_action(request, object_id, review.regenerate)
+        prompt_id = request.POST.get("email_prompt") or ""
+        prompt = EmailPrompt.objects.filter(pk=prompt_id).first() if prompt_id.isdigit() else None
+        return self._review_action(request, object_id, lambda e: review.regenerate(e, prompt))
 
     def send_view(self, request, object_id):
         return self._review_action(request, object_id, lambda e: review.send(e, request.POST.get("confirm", "")))
@@ -822,6 +1106,9 @@ class PipelineRunAdmin(PipelineAdmin):
     change_form_template = "admin/pipeline/pipelinerun/change_form.html"
     readonly = ["command_line", "status_badge", "exit_code", "created_by", "created_at", "started_at",
                 "finished_at", "duration", "output_display"]
+
+    def has_change_permission(self, request, obj=None):
+        return False  # a run is a record of what happened: view it, stop it, run it again or delete it
 
     def get_fields(self, request, obj=None):
         return ["command", "arguments_text"] if obj is None else self.readonly

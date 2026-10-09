@@ -1,0 +1,46 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'admin/css/forms.css' %}">{% endblock %}
+{% block extrahead %}{{ block.super }}{{ media }}{% endblock %}
+{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">Home</a> › <a href="{% url 'admin:pipeline_prospect_changelist' %}">Prospects</a> › Generate emails</div>{% endblock %}
+{% block content %}
+<div id="content-main">
+  <p>Writes one email per ready prospect (deliverable, not do-not-contact) for <b>{{ target }}</b>. Every email starts <b>In review</b>; nothing is sent.</p>
+  <form method="post" novalidate>{% csrf_token %}
+    <input type="hidden" name="scope" value="{{ scope }}">
+    <input type="hidden" name="ids" value="{{ ids }}">
+    {% if form.non_field_errors %}<p class="errornote">{{ form.non_field_errors|join:" " }}</p>{% endif %}
+    <fieldset class="module aligned">
+      <h2>Options</h2>
+      {% for field in form %}
+        <div class="form-row field-{{ field.name }}{% if field.errors %} errors{% endif %}">
+          {{ field.errors }}
+          <div>
+            {% if field.field.widget.input_type == "checkbox" %}
+              <div class="flex-container checkbox-row">{{ field }}<label class="vCheckboxLabel" for="{{ field.id_for_label }}">{{ field.label }}</label></div>
+            {% else %}
+              <div class="flex-container"><label for="{{ field.id_for_label }}">{{ field.label }}:</label>{{ field }}</div>
+            {% endif %}
+            {% if field.help_text %}<div class="help"><div>{{ field.help_text }}</div></div>{% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </fieldset>
+    <div class="submit-row">
+      <input type="submit" class="default" value="Start generating">
+      <a href="{% url 'admin:pipeline_prospect_changelist' %}" class="closelink">Cancel</a>
+    </div>
+  </form>
+  {% if prompts %}
+  <div class="module pipeline-help">
+    <h2>Email prompts</h2>
+    <table>
+      <thead><tr><th>Email prompt</th><th>Campaign prompt</th><th>Default</th></tr></thead>
+      <tbody>{% for prompt in prompts %}
+        <tr><td><a href="{% url 'admin:pipeline_emailprompt_change' prompt.pk %}">{{ prompt.name }}</a></td><td>{{ prompt.campaign_prompt.name }}</td><td>{% if prompt.is_default %}Yes{% endif %}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

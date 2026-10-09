@@ -10,6 +10,71 @@ from django.db.models.functions import Now
 from django.utils import timezone
 
 
+class CampaignPrompt(models.Model):
+    """The model's standing instructions for a campaign: who we are, what we offer, how to read the input, the rules."""
+
+    name = models.CharField(max_length=255, unique=True)
+    prompt = models.TextField(help_text="Who we are, what we offer, the rules every email must follow and the output "
+                                        "format. The chosen email prompt is added after it.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "campaign_prompts"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    def default_email_prompt(self):
+        return self.email_prompts.order_by("-is_default", "id").first()
+
+    def ensure_email_prompt(self) -> bool:
+        """Give a campaign prompt without email prompts the built-in first-touch one. Returns whether one was added."""
+        if self.email_prompts.exists():
+            return False
+        from pipeline.services.generation import DEFAULT_EMAIL_PROMPT
+
+        EmailPrompt.objects.create(campaign_prompt=self, name="First-touch email", is_default=True,
+                                   prompt=DEFAULT_EMAIL_PROMPT)
+        return True
+
+
+class EmailPrompt(models.Model):
+    """Instructions for one kind of email in a campaign (e.g. first touch, follow-up)."""
+
+    campaign_prompt = models.ForeignKey(CampaignPrompt, on_delete=models.CASCADE, related_name="email_prompts")
+    name = models.CharField(max_length=255)
+    prompt = models.TextField(help_text="How to write this email: structure, call to action, length and style.")
+    is_default = models.BooleanField(default=False, help_text="Used when no email prompt is chosen.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "email_prompts"
+        ordering = ["campaign_prompt__name", "-is_default", "name"]
+        constraints = [
+            models.UniqueConstraint(fields=["campaign_prompt", "name"], name="uq_email_prompts_name"),
+            models.UniqueConstraint(fields=["campaign_prompt"], condition=models.Q(is_default=True),
+                                    name="uq_email_prompts_one_default"),
+        ]
+
+    def __str__(self):
+        return f"{self.campaign_prompt.name} / {self.name}"
+
+    def save(self, *args, **kwargs):
+        if self.is_default:  # only one default per campaign prompt
+            EmailPrompt.objects.filter(campaign_prompt_id=self.campaign_prompt_id, is_default=True).exclude(
+                pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+    @property
+    def full_prompt(self) -> str:
+        from pipeline.services.generation import compose_prompt
+
+        return compose_prompt(self.campaign_prompt.prompt, self.prompt)
+
+
 class DiscoveryCampaign(models.Model):
     """Module 1: what to search Google Maps for."""
 
@@ -25,6 +90,10 @@ class DiscoveryCampaign(models.Model):
     target_locations = models.JSONField(null=True, blank=True, default=list, help_text='List of places, e.g. ["Lahore", "Karachi"].')
     search_terms = models.JSONField(null=True, blank=True, default=list, help_text='List of searches, e.g. ["dental clinic"].')
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    campaign_prompt = models.OneToOneField(
+        CampaignPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="campaign",
+        help_text="Instructions used to write this campaign's emails. Each prompt belongs to one campaign.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -285,6 +354,8 @@ class Email(models.Model):
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.IN_REVIEW, db_index=True)
     generation_provider = models.CharField(max_length=32, null=True, blank=True)
     generation_model = models.CharField(max_length=128, null=True, blank=True)
+    email_prompt = models.ForeignKey(EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="emails",
+                                     help_text="The email prompt this email was written with.")
     generated_at = models.DateTimeField(null=True, blank=True)
     reviewed_at = models.DateTimeField(null=True, blank=True)
     review_note = models.TextField(null=True, blank=True)

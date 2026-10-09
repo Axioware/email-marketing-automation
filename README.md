@@ -94,7 +94,7 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 3. Research and score | Businesses > action **Research websites** | `python manage.py research_websites` |
 | 4. Find owners | Businesses > action **Find decision makers** | `python manage.py find_stakeholders --headed` |
 | 5. Verify emails | Businesses or Contacts > action **Verify emails** | `python manage.py verify_emails` |
-| 6. Write emails | Prospects or Businesses > action **Generate outreach emails** | `python manage.py generate_emails` |
+| 6. Write emails | Prospects or Businesses > action **Generate outreach emails** (choose an email prompt) | `python manage.py generate_emails [--email-prompt-id N]` |
 | 7. Review | Emails: edit, Approve, Reject, Regenerate | - |
 | 8. Send | Email > **Send now**, or Emails > action **Send selected** | `python manage.py send_emails --send` |
 
@@ -125,6 +125,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | Endpoint | What |
 |---|---|
 | `/api/campaigns/` | list, create, edit, delete; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20}` |
+| `/api/campaign-prompts/`, `/api/email-prompts/` | the prompts emails are written with; a campaign links to one campaign prompt (`campaign_prompt`), which has many email prompts |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
 | `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |
 | `/api/emails/` | list, view, `PATCH` `subject`/`body` (goes back to review), delete |
@@ -269,13 +270,13 @@ Options: `--business-id`, `--contact-id` (both repeatable), `--limit` (contacts)
 
 `python manage.py generate_emails` (admin: select prospects or businesses, action **Generate outreach emails**) writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`pipeline/services/llm.py`).
 
-The prompt (`SYSTEM_PROMPT` in `pipeline/services/generation.py`) writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SMTP_FROM_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
+The model's instructions are the campaign's **campaign prompt** followed by an **email prompt** (tables `campaign_prompts` and `email_prompts`, edited in the admin; a campaign has one campaign prompt, which has many email prompts). The built-in default (`DEFAULT_CAMPAIGN_PROMPT` + `DEFAULT_EMAIL_PROMPT` in `pipeline/services/generation.py`, saved as the first prompts) writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SMTP_FROM_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
 
 ```sh
 python manage.py generate_emails --limit 1 --dry-run
 ```
 
-Options: `--prospect-id`, `--business-id` (both repeatable), `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
+Options: `--prospect-id`, `--business-id` (both repeatable), `--email-prompt-id` (default: each campaign's default email prompt), `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
 
 ### Open tracking
 

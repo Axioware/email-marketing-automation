@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from unittest import mock
 
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
 from pipeline.models import Business, BusinessContact, BusinessSource, BusinessWebsiteProfile, DiscoveryCampaign
 from pipeline.services import maps, research, stakeholders
@@ -75,6 +75,10 @@ class ResearchTests(TestCase):
         self.assertEqual([b["id"] for b in research.load_businesses(None, None)], [pending.pk])
         self.assertEqual([b["id"] for b in research.load_businesses(None, None, retry_failed=True)], [pending.pk, failed.pk])
         self.assertEqual(research.load_businesses(None, [done.pk]), [])
+        self.assertEqual([b["id"] for b in research.load_businesses(None, [done.pk], redo=True)], [done.pk])
+        self.assertEqual(len(research.load_businesses(None, None, redo=True)), 3)  # every business with a website
+        BusinessWebsiteProfile.objects.filter(business=done).update(status="running")
+        self.assertEqual(research.load_businesses(None, [done.pk], redo=True), [])  # never one being researched now
 
         profile_id = research.start_profile(pending.pk)
         research.save_progress(profile_id, [{"url": "https://a.pk/"}], {"x@a.pk"}, [{"url": "https://a.pk/about"}])
@@ -87,6 +91,15 @@ class ResearchTests(TestCase):
         self.assertEqual((profile.status, profile.qualification_score), ("completed", 66))
         research.fail_profile(research.start_profile(failed.pk), ValueError("bad"))
         self.assertEqual(BusinessWebsiteProfile.objects.get(business=failed).agent_reasoning, "ValueError: bad")
+
+    def test_already_researched_business_explains_redo(self):
+        business = make_business(make_campaign(), "Done", website_url="https://done.pk", score=70)
+        with mock.patch.object(research, "make_llm_client", return_value=(mock.Mock(), "m", "groq")), \
+                mock.patch.object(research, "sync_playwright") as playwright:
+            result = run_command("research_websites", "--business-id", business.pk)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("add --redo", result.stdout)
+        playwright.assert_not_called()
 
     def test_needs_an_llm_key(self):
         result = run_command("research_websites", env={"GROQ_API_KEY": "", "GROK_API_KEY": "", "OPENAI_API_KEY": ""})
@@ -156,3 +169,29 @@ class CrawlSafetyTests(TestCase):
                 mock.patch.object(stakeholders, "is_public_http_url", side_effect=lambda u: "169.254" not in u):
             self.assertEqual(stakeholders.crawl_site(driver, business, evidence, roles, 2), 0)
         driver.find_element.assert_not_called()
+
+
+class PlaywrightDatabaseTests(TransactionTestCase):
+    """Database calls made while a real Playwright session is open (its event loop used to make Django refuse them)."""
+
+    def tearDown(self):
+        from pipeline.services.dbthread import close_worker_connection
+
+        close_worker_connection()
+
+    def test_research_and_maps_can_save_while_the_browser_is_open(self):
+        from playwright.sync_api import sync_playwright
+
+        campaign = make_campaign()
+        business = make_business(campaign, "Clinic", website_url="https://clinic.pk", google_place_id="ChIJx")
+        with sync_playwright():
+            profile_id = research.start_profile(business.pk)
+            research.save_progress(profile_id, [{"url": "https://clinic.pk/"}], {"a@clinic.pk"}, [])
+            research.finalize_profile(profile_id, {"pages_scraped": 1, "scraped_urls": [], "scraped_pages": [],
+                                                   "discovered_links": [], "emails": [], "qualification_score": 61,
+                                                   "qualification_reasons": [], "agent_reasoning": "ok"})
+            maps.update_campaign_status(campaign.pk, "running")
+            seen = maps.existing_businesses(campaign.pk)
+        self.assertEqual(BusinessWebsiteProfile.objects.get(pk=profile_id).qualification_score, 61)
+        self.assertEqual(seen[0]["google_place_id"], "ChIJx")
+        self.assertEqual(DiscoveryCampaign.objects.get(pk=campaign.pk).status, "running")

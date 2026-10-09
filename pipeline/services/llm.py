@@ -20,7 +20,8 @@ def make_llm_client() -> tuple[OpenAI, str, str] | None:
     groq_key = (os.environ.get("GROQ_API_KEY", "") or os.environ.get("GROK_API_KEY", "")).strip()
     if groq_key:
         model = os.environ.get("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
-        return OpenAI(api_key=groq_key, base_url=GROQ_BASE_URL), model, "groq"
+        # More retries: the free tier answers 429 when the per-minute token budget is spent; the SDK waits and retries.
+        return OpenAI(api_key=groq_key, base_url=GROQ_BASE_URL, max_retries=6), model, "groq"
     openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if openai_key:
         model = os.environ.get("OPENAI_MODEL", "").strip() or DEFAULT_OPENAI_MODEL

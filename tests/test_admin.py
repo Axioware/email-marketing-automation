@@ -119,10 +119,9 @@ class PipelineActionTests(AdminCase):
     def test_business_actions_open_the_run_form_with_the_selected_businesses(self):
         campaign = make_campaign()
         a, b = make_business(campaign, "A"), make_business(campaign, "B")
-        for action, command, flags in (("research_websites", "research_websites", "--retry-failed"),
+        for action, command, flags in (("research_websites", "research_websites", "--redo"),
                                        ("find_stakeholders", "find_stakeholders", "--redo"),
-                                       ("verify_emails", "verify_emails", ""),
-                                       ("generate_emails", "generate_emails", "")):
+                                       ("verify_emails", "verify_emails", "")):
             response = self.changelist_action("business", action, [a.pk, b.pk])
             self.assertEqual(response.status_code, 302, action)
             form = self.client.get(response["Location"])
@@ -177,8 +176,8 @@ class PipelineActionTests(AdminCase):
         self.assertEqual(response.status_code, 302)
         self.assertTrue(Prospect.objects.get().do_not_contact)
         response = self.changelist_action("prospect", "regenerate_emails", [email.prospect_id])
-        self.assertIn("generate_emails", response["Location"])
-        self.assertIn(f"--prospect-id+{email.prospect_id}", response["Location"])
+        self.assertEqual(response["Location"], f"{reverse('admin:pipeline_prospect_generate')}?scope=prospect"
+                                               f"&ids={email.prospect_id}&regenerate=1")
 
     def test_send_selected_only_takes_approved_emails(self):
         approved, in_review = self.email("approved"), self.email()
@@ -409,8 +408,8 @@ class DashboardTests(AdminCase):
         apps = self.client.get(reverse("admin:index")).context["app_list"]
         self.assertEqual(apps[0]["app_label"], "pipeline")
         names = [m["object_name"] for m in apps[0]["models"]]
-        self.assertEqual(names[:6], ["DiscoveryCampaign", "Business", "BusinessWebsiteProfile", "BusinessContact",
-                                     "Prospect", "Email"])
+        self.assertEqual(names[:8], ["DiscoveryCampaign", "CampaignPrompt", "EmailPrompt", "Business",
+                                     "BusinessWebsiteProfile", "BusinessContact", "Prospect", "Email"])
 
     def test_guide(self):
         page = self.client.get(reverse("admin:guide")).content.decode()
@@ -450,3 +449,19 @@ class ExternalLinkTests(AdminCase):
             self.assertNotRegex(page.lower(), r'href="\s*javascript:', url)
         profile = self.client.get(pages[1]).content.decode()
         self.assertIn('href="https://ok.pk/"', profile)
+
+
+class RunPageTests(AdminCase):
+    def test_finished_run_is_read_only(self):
+        run = PipelineRun.objects.create(command="research_websites", arguments=["--business-id", "1"],
+                                         status="succeeded", output="done")
+        url = reverse("admin:pipeline_pipelinerun_change", args=[run.pk])
+        page = self.client.get(url).content.decode()
+        self.assertNotIn('name="_save"', page)
+        self.assertNotIn("Please correct the error", page)
+        self.assertIn("Run again", page)
+        self.assertIn("Delete", page)
+        response = self.client.post(url, {"command": "send_emails"})
+        self.assertEqual(response.status_code, 403)
+        run.refresh_from_db()
+        self.assertEqual(run.command, "research_websites")

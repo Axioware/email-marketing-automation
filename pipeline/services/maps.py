@@ -16,6 +16,7 @@ from playwright.sync_api import sync_playwright
 
 from pipeline.models import Business, BusinessSource, DiscoveryCampaign
 from pipeline.services.console import interactive, wait_for_person
+from pipeline.services.dbthread import outside_event_loop
 
 
 def normalize_text(value: str | None) -> str | None:
@@ -117,6 +118,7 @@ def parse_comma_separated_values(value: str | list[str] | None) -> list[str]:
     return [str(item).strip() for item in values if item is not None and str(item).strip()]
 
 
+@outside_event_loop
 def update_campaign_status(campaign_id: int, status: str) -> None:
     values = {"status": status}
     if status == "running":
@@ -419,6 +421,7 @@ def same_business(first: dict, second: dict) -> bool:
     return bool(first_domain and first_domain == second_domain)
 
 
+@outside_event_loop
 def existing_businesses(campaign_id: int) -> list[dict]:
     return list(
         Business.objects.filter(discovery_campaign_id=campaign_id).values(
@@ -475,6 +478,7 @@ def scrape_campaign(
     return records
 
 
+@outside_event_loop
 def save_records(records: list[dict]) -> None:
     with transaction.atomic():
         for record in records:

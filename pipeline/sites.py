@@ -14,7 +14,7 @@ GUIDE_PATH = Path(settings.BASE_DIR) / "docs" / "USER_GUIDE.md"
 QUALIFIED_SCORE = 50  # find_stakeholders' default --min-score
 
 # Sidebar order: the pipeline's own order, then the supporting tables.
-MODEL_ORDER = ["discoverycampaign", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
+MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
                "pipelinerun", "emailopenevent", "businesssource"]
 
 
@@ -127,7 +127,7 @@ class PipelineAdminSite(admin.AdminSite):
                           run_url("send_emails", "--send")))
         if ready_without_email:
             steps.append((f"{ready_without_email} verified prospect(s) have no email yet.", "Generate emails",
-                          run_url("generate_emails")))
+                          reverse("admin:pipeline_prospect_generate")))
         if unchecked_contacts:
             steps.append((f"{unchecked_contacts} contact(s) have emails that are not verified yet.", "Verify emails",
                           run_url("verify_emails")))
