@@ -62,6 +62,8 @@ Email verification runs [Reacher](https://github.com/reacherhq/check-if-email-ex
    python manage.py verify_emails --limit 1 --dry-run
    ```
 
+   Starting verification from the admin (Businesses or Contacts > **Verify contact emails**, or **Run full pipeline**) does the same: the container is created or started automatically.
+
 Managing the container:
 
 ```sh
