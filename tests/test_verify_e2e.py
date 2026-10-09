@@ -207,6 +207,23 @@ class EndToEndTests(VerifyCase, TestCase):
         self.assertEqual(set(self.checks(cid).values()), {"risky"})
         self.assertIn("not checked", out)
 
+    def test_catch_all_domain_is_remembered_across_runs(self):
+        self.contact(1, "catchall@c.org", ["other@c.org"])
+        self.run_cli(expect=0)
+        self.assertEqual(self.fake.calls, ["catchall@c.org"])
+        self.fake.calls.clear()
+        later = self.contact(2, "newperson@c.org", ["np@c.org", "good@d.org"])  # a new contact on the same domain
+        out = self.run_cli(expect=0).stdout
+        self.assertIn("1 domain(s) already known to be catch-all", out)
+        self.assertEqual(self.fake.calls, ["good@d.org"])  # nothing on c.org is probed again
+        rows = {r["email"]: r for r in self.rows(contact_id=later)}
+        self.assertEqual({rows[e]["verdict"] for e in ("newperson@c.org", "np@c.org")}, {"catch_all"})
+        self.assertEqual(rows["np@c.org"]["verification_details"], {"probed": False})
+        self.assertIn("found in an earlier run", rows["np@c.org"]["verification_note"])
+        self.fake.calls.clear()
+        self.run_cli("--recheck", "--business-id", self.b[2].pk, expect=0)  # --recheck probes it again
+        self.assertIn("newperson@c.org", self.fake.calls)
+
     def test_probe_all_checks_every_address(self):
         cid = self.contact(1, "catchall@c.org", ["bad@c.org", "bad2@c.org", "good@c.org"])
         self.run_cli("--probe-all", expect=0)

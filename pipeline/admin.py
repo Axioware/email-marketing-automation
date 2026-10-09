@@ -175,7 +175,7 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
         ("Emails", {"fields": ["campaign_prompt"]}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
-    actions = ["fetch_businesses"]
+    actions = ["run_pipeline", "fetch_businesses"]
     change_form_template = "admin/pipeline/discoverycampaign/change_form.html"
 
     def get_queryset(self, request):
@@ -203,6 +203,13 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
             return "-"
         return changelist_link(Business, f"{obj.businesses.count()} businesses", discovery_campaign__id__exact=obj.pk)
 
+    @admin.action(description="Run the full pipeline (fetch → research → decision makers → verify → write emails)")
+    def run_pipeline(self, request, queryset):
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one campaign.", messages.WARNING)
+            return None
+        return run_step("run_pipeline", ["--campaign-id", str(queryset.first().pk), "--fetch-limit", "20"])
+
     @admin.action(description="Fetch businesses from Google Maps (Module 1)")
     def fetch_businesses(self, request, queryset):
         if queryset.count() != 1:
@@ -214,6 +221,7 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
         obj = context.get("original")
         if obj is not None:
             context["fetch_url"] = run_form_url("fetch_businesses", ["--campaign-id", str(obj.pk), "--limit", "20"])
+            context["pipeline_url"] = run_form_url("run_pipeline", ["--campaign-id", str(obj.pk), "--fetch-limit", "20"])
         return super().render_change_form(request, context, *args, **kwargs)
 
 
@@ -384,7 +392,8 @@ class ScoreFilter(ChoiceFilter):
     parameter_name = "score"
     options = [
         ("80", "80 and above", Q(website_profile__qualification_score__gte=80)),
-        ("50", "50 to 79 (qualified)", Q(website_profile__qualification_score__gte=50, website_profile__qualification_score__lt=80)),
+        ("50up", "50 and above (qualified)", Q(website_profile__qualification_score__gte=50)),
+        ("50", "50 to 79", Q(website_profile__qualification_score__gte=50, website_profile__qualification_score__lt=80)),
         ("low", "Below 50", Q(website_profile__qualification_score__lt=50)),
         ("none", "Not scored", Q(website_profile__qualification_score__isnull=True)),
     ]
@@ -458,7 +467,8 @@ class BusinessAdmin(PipelineAdmin):
     list_filter = ["discovery_campaign", HasWebsiteFilter, ResearchStatusFilter, ScoreFilter, ContactSearchFilter,
                    ContactsFilter, ProspectsFilter, EmailsFilter, RatingFilter, ReviewCountFilter, "category",
                    "country", "city"]
-    search_fields = ["name", "domain", "phone", "address", "website_url"]
+    search_fields = ["name", "category", "city", "state", "address", "domain", "phone", "website_url"]
+    change_list_template = "admin/pipeline/business/change_list.html"
     readonly_fields = ["created_at", "updated_at", "first_discovered_at", "last_discovered_at", "profile_link",
                        "opening_hours_display"]
     fieldsets = [
@@ -470,7 +480,7 @@ class BusinessAdmin(PipelineAdmin):
                         "classes": ["collapse"]}),
     ]
     inlines = [BusinessContactInline, ProspectInline, EmailInline, BusinessSourceInline]
-    actions = ["research_websites", "find_stakeholders", "verify_emails", "generate_emails"]
+    actions = ["refresh_details", "research_websites", "find_stakeholders", "verify_emails", "generate_emails"]
     list_select_related = ["website_profile"]
 
     def get_queryset(self, request):
@@ -478,6 +488,26 @@ class BusinessAdmin(PipelineAdmin):
             contact_total=Count("contacts", distinct=True), prospect_total=Count("prospects", distinct=True),
             profile_score=F("website_profile__qualification_score"),
         )
+
+    # (label, query string, condition) for the quick-filter boxes above the list
+    QUICK_FILTERS = [
+        ("All businesses", "", Q()),
+        ("Not researched", "research=none", ResearchStatusFilter.options[0][2]),
+        ("Qualified (score 50+)", "score=50up", Q(website_profile__qualification_score__gte=50)),
+        ("Score 80+", "score=80", ScoreFilter.options[0][2]),
+        ("100+ reviews", "reviews=100", ReviewCountFilter.options[0][2]),
+        ("Rated 4.5+", "rating=45", RatingFilter.options[0][2]),
+        ("No contacts yet", "contacts=no", ContactsFilter.options[1][2]),
+        ("Ready to email", "prospects=ready", ProspectsFilter.options[0][2]),
+        ("Email sent", "emails=sent", EmailsFilter.options[2][2]),
+    ]
+
+    def changelist_view(self, request, extra_context=None):
+        current = request.GET.urlencode()
+        chips = [{"label": label, "query": query, "active": query == current,
+                  "count": Business.objects.filter(condition).distinct().count()}
+                 for label, query, condition in self.QUICK_FILTERS]
+        return super().changelist_view(request, {**(extra_context or {}), "quick_filters": chips})
 
     @admin.display(description="Website")
     def website(self, obj):
@@ -524,6 +554,10 @@ class BusinessAdmin(PipelineAdmin):
     @admin.display(description="Opening hours")
     def opening_hours_display(self, obj):
         return pretty_json(obj.opening_hours)
+
+    @admin.action(description="Refresh Google Maps details (category, reviews, city)")
+    def refresh_details(self, request, queryset):
+        return run_step("refresh_businesses", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
 
     @admin.action(description="Research websites (Module 2)")
     def research_websites(self, request, queryset):

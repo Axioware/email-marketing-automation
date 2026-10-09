@@ -1,0 +1,10 @@
+{% extends "admin/change_list.html" %}
+{% block content_title %}
+  {{ block.super }}
+  <div class="pipeline-chips">
+    {% for chip in quick_filters %}
+      <a href="?{{ chip.query }}" class="{% if chip.active %}active{% endif %}"><b>{{ chip.count }}</b><span>{{ chip.label }}</span></a>
+    {% endfor %}
+  </div>
+  <p class="help">Click a box for a quick filter. Combine more filters in the <b>Filter</b> panel on the right; search matches name, category, city, address, phone and website.</p>
+{% endblock %}

@@ -240,8 +240,8 @@ class RunApiTests(ApiCase):
 
     def test_commands_lists_options(self):
         commands = {c["command"]: c for c in self.api.get("/api/runs/commands/").json()}
-        self.assertEqual(set(commands), {"fetch_businesses", "research_websites", "find_stakeholders", "verify_emails",
-                                         "generate_emails", "send_emails"})
+        self.assertEqual(set(commands), {"run_pipeline", "fetch_businesses", "refresh_businesses", "research_websites", "find_stakeholders",
+                                         "verify_emails", "generate_emails", "send_emails"})
         options = {o["name"]: o for o in commands["verify_emails"]["options"]}
         self.assertEqual(options["business_id"]["type"], "list")
         self.assertEqual(options["dry_run"]["type"], "flag")

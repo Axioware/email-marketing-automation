@@ -87,10 +87,13 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 
 Run the steps in order. Each one reads what the previous one stored, and each skips work it has already done, so it is safe to rerun. Every step can be started three ways: from the admin, through the API, or as a command.
 
+**All at once:** open a campaign and click **Run full pipeline** (or `python manage.py run_pipeline --campaign-id 1 --fetch-limit 20`, or `POST /api/campaigns/1/run-pipeline/`). It runs steps 2-6 for that campaign's businesses, continues past partial failures, stops if a step cannot run, and never sends: emails wait for review.
+
 | Step | Admin | Command |
 |---|---|---|
 | 1. Campaign | Discovery campaigns > Add | `python manage.py create_campaign` |
 | 2. Find businesses | Campaign > **Fetch businesses** | `python manage.py fetch_businesses --campaign-id 1 --limit 20` |
+| 2b. Fill missing details | Businesses > action **Refresh Google Maps details** | `python manage.py refresh_businesses` |
 | 3. Research and score | Businesses > action **Research websites** | `python manage.py research_websites` |
 | 4. Find owners | Businesses > action **Find decision makers** | `python manage.py find_stakeholders --headed` |
 | 5. Verify emails | Businesses or Contacts > action **Verify emails** | `python manage.py verify_emails` |
@@ -256,7 +259,7 @@ Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `un
 
 Only `ready` prospects are ever emailed: generation and sending skip everything else. A rerun skips addresses already stored as deliverable, undeliverable or risky and checks `unknown` ones again; `--recheck` checks everything. Rechecking refreshes the verification columns; `outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact` and `last_contacted_at` belong to later stages and are never overwritten, and a prospect with `do_not_contact` set or one a later stage has moved on (e.g. `contacted`) keeps its `outreach_status`.
 
-If a domain is a catch-all, or its mail server cannot be reached, the remaining addresses on that domain are not probed (they would get the same answer) and are recorded with that outcome; `--probe-all` checks every address anyway. The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked); results so far are kept.
+If a domain is a catch-all, or its mail server cannot be reached, the remaining addresses on that domain are not probed (they would get the same answer) and are recorded with that outcome (verdict `catch_all`, `probed: false`). Catch-all domains are remembered across runs, so new addresses on them are recorded the same way without a probe; `--probe-all` checks every address anyway. The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked); results so far are kept.
 
 ```sh
 python manage.py verify_emails --limit 5 --dry-run --report out.csv

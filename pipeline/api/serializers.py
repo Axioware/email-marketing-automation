@@ -169,6 +169,15 @@ class BulkReviewSerializer(serializers.Serializer):
     ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=1000)
 
 
+class RunPipelineSerializer(serializers.Serializer):
+    fetch_limit = serializers.IntegerField(min_value=0, default=20, help_text="New businesses to fetch (0 skips fetching).")
+    skip = serializers.ListField(child=serializers.ChoiceField(choices=["fetch", "research", "stakeholders", "verify",
+                                                                         "generate"]), required=False)
+    min_score = serializers.IntegerField(min_value=0, max_value=100, required=False)
+    email_prompt_id = serializers.IntegerField(required=False)
+    headed = serializers.BooleanField(default=False)
+
+
 class FetchBusinessesSerializer(serializers.Serializer):
     limit = serializers.IntegerField(min_value=1, default=20)
     delay = serializers.FloatField(min_value=0, required=False)

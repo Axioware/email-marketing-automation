@@ -27,7 +27,9 @@ from django.utils import timezone
 from pipeline.models import PipelineRun
 
 COMMANDS = {
+    "run_pipeline": "Full pipeline - fetch, research, decision makers, verify, write emails (never sends)",
     "fetch_businesses": "Module 1 - fetch businesses from Google Maps",
+    "refresh_businesses": "Module 1 - refresh Google Maps details (category, reviews, city)",
     "research_websites": "Module 2 - research and score business websites",
     "find_stakeholders": "Module 3 - find decision makers and candidate emails",
     "verify_emails": "Module 4 - verify emails with Reacher (creates prospects)",

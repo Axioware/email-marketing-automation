@@ -516,6 +516,16 @@ def load_contacts(options: dict) -> list[dict]:
     )
 
 
+CATCH_ALL_FROM_EARLIER = ("risky", "the domain accepts mail for any address (catch-all, found in an earlier run)",
+                          "catch_all")
+
+
+def known_catch_all_domains() -> set[str]:
+    """Domains an earlier run probed and found catch-all. Any address there gets the same answer, so none is probed."""
+    emails = Prospect.objects.filter(verdict="catch_all", verification_details__probed=True).values_list("email", flat=True)
+    return {email.rpartition("@")[2].casefold() for email in emails if "@" in email}
+
+
 def existing_statuses(contact_ids: list[int]) -> dict[tuple[int, str], str | None]:
     if not contact_ids:
         return {}
@@ -567,6 +577,12 @@ def run(options: dict) -> int:
         print(f"Checking candidate emails for {len(queue)} contact(s).")
         last_call: dict[str, float] = {}
         domain_state: dict[str, tuple[str, str, str]] = {}
+        if not (options["recheck"] or options["probe_all"]):
+            known_catch_all = known_catch_all_domains()
+            domain_state.update({domain: CATCH_ALL_FROM_EARLIER for domain in known_catch_all})
+            if known_catch_all:
+                print(f"{len(known_catch_all)} domain(s) already known to be catch-all; their addresses are not probed "
+                      "again (--recheck or --probe-all to check them).")
         counts: dict[str, int] = {}
         report: list[dict] = []
         skipped = streak = deliverable_count = stored_count = 0

@@ -1,5 +1,6 @@
 {% extends "admin/change_form.html" %}
 {% block object-tools-items %}
+  {% if pipeline_url %}<li><a href="{{ pipeline_url }}">Run full pipeline</a></li>{% endif %}
   {% if fetch_url %}<li><a href="{{ fetch_url }}">Fetch businesses</a></li>{% endif %}
   {{ block.super }}
 {% endblock %}

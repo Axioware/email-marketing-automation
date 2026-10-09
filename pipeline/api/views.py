@@ -36,6 +36,22 @@ class DiscoveryCampaignViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
     ordering_fields = ["created_at", "name", "status"]
 
+    @extend_schema(request=s.RunPipelineSerializer, responses={202: s.PipelineRunSerializer})
+    @action(detail=True, methods=["post"], url_path="run-pipeline")
+    def run_pipeline(self, request, pk=None):
+        """Start the full pipeline for this campaign (fetch, research, decision makers, verify, write emails). Never
+        sends; the emails wait for review."""
+        campaign = self.get_object()
+        params = s.RunPipelineSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        options = {"campaign_id": campaign.pk, **{k: v for k, v in params.validated_data.items() if v not in (None, [])}}
+        try:
+            arguments = jobs.build_arguments("run_pipeline", options)
+        except ValueError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        run = jobs.start_run("run_pipeline", arguments, request.user)
+        return Response(s.PipelineRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
+
     @extend_schema(request=s.FetchBusinessesSerializer, responses={202: s.PipelineRunSerializer})
     @action(detail=True, methods=["post"], url_path="fetch-businesses")
     def fetch_businesses(self, request, pk=None):

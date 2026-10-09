@@ -26,7 +26,7 @@ The home page shows the whole pipeline at a glance:
 - **Recent pipeline runs** shows the jobs you started and whether they finished.
 - **Yellow warnings** at the top mean something in the settings is missing (for example the email account for sending). See [Settings](#9-settings).
 
-The left sidebar lists the pages in pipeline order: **Campaigns > Businesses > Website research > Contacts > Prospects > Emails**, then **Pipeline runs**, **Email opens** and **Google Maps listings**.
+The left sidebar lists the pages in pipeline order (its **Jump to a page** box only narrows this list of pages, it does not filter records): **Campaigns > Businesses > Website research > Contacts > Prospects > Emails**, then **Pipeline runs**, **Email opens** and **Google Maps listings**.
 
 ## 3. How the pipeline works
 
@@ -42,6 +42,17 @@ The left sidebar lists the pages in pipeline order: **Campaigns > Businesses > W
 | 8. Send | Approved emails are sent from your email account | Email > **Send now** |
 
 Each step only processes what still needs it, so it is always safe to run a step again.
+
+### Run the whole pipeline at once
+
+Open a campaign and click **Run full pipeline** (top right), or tick it on the Campaigns list and use the action **Run the full pipeline**. The run form opens with `--campaign-id N --fetch-limit 20`; change the number of businesses to fetch and click **Start run**.
+
+It runs steps 2 to 6 one after another for that campaign's businesses: find businesses, research websites, find decision makers, verify emails, write emails. You can follow every step on the run page. It **never sends anything**: the new emails wait in **Emails > In review** for you to approve (steps 7 and 8).
+
+- Each step only does what is still needed, so running the pipeline again continues where it left off.
+- If a few items fail (one website is down, for example), the pipeline carries on with the next step.
+- If a step cannot run at all (no LLM key, Docker/Reacher not running, Google CAPTCHA), the pipeline stops and tells you why. Everything done so far is kept; fix the problem and run it again.
+- Options: `--fetch-limit 0` skips fetching new businesses, `--skip verify` skips a step (fetch, research, stakeholders, verify, generate), `--min-score 60`, `--email-prompt-id N`, `--headed`.
 
 ## 4. Step by step
 
@@ -66,9 +77,13 @@ Every search term is searched in every location, so 2 terms and 3 locations mean
 
 The campaign's status changes to **Completed** when it finishes. The businesses appear under **Businesses**.
 
+Each business gets its category, Google rating, number of reviews, opening hours, phone, website and address, and its city, state/province and postal code are worked out from the address (no AI is used for any of this).
+
+**Missing a category or review count?** Google sometimes shows a reduced page without them, especially after many pages in a row. On **Businesses**, tick the businesses (or none, for all that are missing something), choose **Refresh Google Maps details (category, reviews, city)** and start the run. It revisits each business's Google Maps page, retries pages Google reduced, and fills in what was missing; it never changes a business's website. The dashboard shows a **Refresh Google Maps details** button while any business has no review count. A business with no reviews on Google keeps an empty review count.
+
 ### Finding businesses: filters
 
-On **Businesses**, the **Filter** panel on the right narrows the list, and filters combine: by campaign, website, website research (not researched, researched, failed), qualification score (80+, 50-79, below 50), decision-maker search, contacts, prospects (ready, needs review, contacted, none), emails (in review, approved, sent, opened, none), Google rating, number of Google reviews, category, country and city. Select the filtered rows and run any action on them, e.g. "score 80 and above" + "Not searched yet" → **Find decision makers**.
+On **Businesses**, click one of the **quick filter boxes** above the list (Not researched, Qualified, Score 80+, 100+ reviews, Rated 4.5+, No contacts yet, Ready to email, Email sent), or type in the **search box**: it matches name, category, city, address, phone and website. The **Filter** panel on the right narrows the list further, and filters combine: by campaign, website, website research (not researched, researched, failed), qualification score (80+, 50-79, below 50), decision-maker search, contacts, prospects (ready, needs review, contacted, none), emails (in review, approved, sent, opened, none), Google rating, number of Google reviews, category, country and city. Select the filtered rows and run any action on them, e.g. "score 80 and above" + "Not searched yet" → **Find decision makers**.
 
 ### Step 3: Research websites
 
@@ -101,6 +116,8 @@ Each address is checked with the mail server, **without sending anything**, and 
 | Deliverable | Deliverable: the mailbox exists | **Ready**: it gets an email in step 6 |
 | Undeliverable | Mailbox not found, Mailbox disabled, Domain has no mail server, Invalid address | **Rejected**: never emailed |
 | Risky | Catch-all domain (the server accepts any address, so nobody can tell if this one is real), Inbox full, Disposable address | **Needs review**: not emailed |
+
+**Catch-all domains:** when one address on a domain turns out to be catch-all, the other addresses on that domain are not checked at all; they are all saved as **Catch-all domain** (their details say "not checked"). The domain is remembered, so addresses on it found later are marked the same way without checking. Add `--recheck` to check them again.
 | Unknown | Mail server unreachable, Mail server refused the check, Temporary failure (greylisting), Check failed | **Needs review**: checked again on the next run |
 
 On the Prospects list, use the **By email status** and **By verdict** filters on the right, e.g. to see every catch-all address. Hover over a verdict to see the reason in words; open a prospect to see the details Reacher found. Only **Ready** prospects are ever emailed.
@@ -190,6 +207,8 @@ Useful arguments:
 | `--dry-run` | most steps | Show what would happen, save nothing |
 | `--limit 5` | all steps | Process at most 5 items |
 | `--headed` | Fetch, Research, Find decision makers | Show the browser window |
+| `--all` | Refresh Google Maps details | Refresh every business, not only those missing details |
+| `--address-only` | Refresh Google Maps details | Only fill city, state and postal code from the address (no browser) |
 | `--retry-failed` | Research | Also retry businesses whose research failed |
 | `--redo` | Research | Research again businesses that were already researched |
 | `--redo` | Find decision makers | Search again for businesses already done |

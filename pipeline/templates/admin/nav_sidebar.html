@@ -1,0 +1,7 @@
+{% load i18n %}
+<button class="sticky toggle-nav-sidebar" id="toggle-nav-sidebar" aria-label="{% translate 'Toggle navigation' %}"></button>
+<nav class="sticky" id="nav-sidebar" aria-label="{% translate 'Sidebar' %}">
+  {# Django's box only narrows this list of pages; it is labelled so nobody mistakes it for a record filter. #}
+  <input type="search" id="nav-filter" placeholder="Jump to a page…" aria-label="Find a page in this menu">
+  {% include 'admin/app_list.html' with app_list=available_apps show_changelinks=False %}
+</nav>

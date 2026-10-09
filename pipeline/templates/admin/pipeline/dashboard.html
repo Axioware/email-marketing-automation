@@ -47,7 +47,7 @@
       {% else %}
         <p class="pipeline-empty">No runs yet. Every step you start from here appears in this list.</p>
       {% endif %}
-      <p class="pipeline-empty"><a href="{% url 'admin:pipeline_pipelinerun_add' %}">Run a pipeline step</a> · <a href="{% url 'admin:pipeline_pipelinerun_changelist' %}">All runs</a> · <a href="{% url 'admin:guide' %}">How to use this</a></p>
+      <p class="pipeline-empty"><a href="{% url 'admin:pipeline_pipelinerun_add' %}?command=run_pipeline">Run the full pipeline</a> · <a href="{% url 'admin:pipeline_pipelinerun_add' %}">Run a pipeline step</a> · <a href="{% url 'admin:pipeline_pipelinerun_changelist' %}">All runs</a> · <a href="{% url 'admin:guide' %}">How to use this</a></p>
     </div>
   </div>
   {% include "admin/app_list.html" with app_list=app_list show_changelinks=True %}

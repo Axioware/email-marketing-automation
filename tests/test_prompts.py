@@ -289,3 +289,32 @@ class PromptApiTests(PromptCase):
             run = self.api.post("/api/runs/", {"command": "generate_emails", "options": {"email_prompt_id": follow.pk}},
                                 format="json")
         self.assertEqual(run.json()["arguments"], ["--email-prompt-id", str(follow.pk)])
+
+
+class BusinessQuickFilterTests(PromptCase):
+    def test_quick_filters_search_and_nav_box(self):
+        campaign = make_campaign()
+        make_business(campaign, "Top", score=85, google_review_count=150, city="Karachi", category="Dental clinic")
+        make_business(campaign, "Ok", score=55, google_review_count=10, city="Lahore", category="Dentist")
+        make_business(campaign, "New", city="Lahore")
+        url = reverse("admin:pipeline_business_changelist")
+        page = self.client.get(url)
+        chips = {chip["label"]: chip for chip in page.context["quick_filters"]}
+        self.assertEqual(chips["All businesses"]["count"], 3)
+        self.assertEqual(chips["Qualified (score 50+)"]["count"], 2)
+        self.assertEqual(chips["Score 80+"]["count"], 1)
+        self.assertEqual(chips["100+ reviews"]["count"], 1)
+        self.assertEqual(chips["Not researched"]["count"], 1)
+        self.assertTrue(chips["All businesses"]["active"])
+        content = page.content.decode()
+        self.assertIn("Jump to a page", content)
+        self.assertNotIn("Start typing to filter", content)
+
+        def names(**params):
+            return {b.name for b in self.client.get(url, params).context["cl"].result_list}
+
+        self.assertEqual(names(score="50up"), {"Top", "Ok"})
+        self.assertTrue(self.client.get(url, {"score": "50up"}).context["quick_filters"][2]["active"])
+        self.assertEqual(names(q="lahore"), {"Ok", "New"})
+        self.assertEqual(names(q="dental clinic"), {"Top"})
+        self.assertEqual(names(q="dentist", city="Lahore"), {"Ok"})

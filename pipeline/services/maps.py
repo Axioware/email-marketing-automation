@@ -2,6 +2,7 @@
 import re
 import time
 import unicodedata
+from decimal import Decimal
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -24,7 +25,7 @@ def normalize_text(value: str | None) -> str | None:
         return None
     normalized = unicodedata.normalize("NFKC", value)
     normalized = "".join(
-        character for character in normalized if unicodedata.category(character) != "Cf"
+        character for character in normalized if unicodedata.category(character) not in ("Cf", "Co")  # format, icons
     )
     return " ".join(normalized.split()) or None
 
@@ -275,6 +276,66 @@ def collect_result_cards(
     return list(cards_by_url.values())[:requested]
 
 
+NUMERIC_POSTAL_CODE = re.compile(r"^\d[\d -]{2,9}$")
+UK_POSTCODE = r"[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}"
+NAME_AND_POSTAL = re.compile(rf"^(?P<name>[^\d,]*[^\d\s,])\s+(?P<postal>\d[\d -]{{2,9}}|{UK_POSTCODE})$", re.IGNORECASE)
+
+
+def parse_address(address: str | None, country: str | None = None) -> dict[str, str | None]:
+    """City, state/province and postal code from a Google Maps address, without any AI.
+
+    "..., Block 3 Gulshan-e-Iqbal, Karachi, 75300, Pakistan" -> Karachi, 75300;
+    "..., Lahore, Punjab 54000, Pakistan" -> Lahore, Punjab, 54000; "..., Austin, TX 78701, USA" -> Austin, TX, 78701;
+    "..., London SW1A 2AA, UK" -> London, SW1A 2AA.
+    """
+    result = {"city": None, "state": None, "postal_code": None}
+    parts = [part.strip() for part in (normalize_text(address) or "").split(",") if part.strip()]
+    if len(parts) < 2:
+        return result
+    if country_region(parts[-1]) or (country and parts[-1].casefold() == country.strip().casefold()):
+        parts.pop()  # the country
+    if len(parts) > 1 and (NUMERIC_POSTAL_CODE.match(parts[-1]) or re.fullmatch(UK_POSTCODE, parts[-1], re.I)):
+        result["postal_code"] = parts.pop()
+    elif len(parts) > 1 and (match := NAME_AND_POSTAL.match(parts[-1])):
+        name, result["postal_code"] = match.group("name").strip(), match.group("postal").strip()
+        if re.fullmatch(UK_POSTCODE, result["postal_code"], re.I):
+            parts[-1] = name  # "London SW1A 2AA": the name is the city
+        else:
+            result["state"] = name  # "Punjab 54000", "TX 78701": the name is the state or province
+            parts.pop()
+    if len(parts) > 1 and re.search(r"[^\W\d_]", parts[-1]) and not re.search(r"\d", parts[-1]):
+        result["city"] = parts[-1][:120]
+    return result
+
+
+def parse_review_count(*texts: str | None) -> int | None:
+    """"4.7\n(1,275)" or "1,275 reviews" -> 1275."""
+    for text in texts:
+        if not text:
+            continue
+        match = re.search(r"\(([\d,.\s]+)\)", text) or re.search(r"([\d,.]+)\s+reviews?\b", text, re.IGNORECASE)
+        if match:
+            digits = re.sub(r"\D", "", match.group(1))
+            if digits:
+                return int(digits)
+    return None
+
+
+def new_maps_page(browser):
+    """A page Google Maps treats as a normal browser.
+
+    Headless Chromium announces itself as "HeadlessChrome", and Google then serves a limited Maps view without review
+    counts. The same browser with its ordinary name gets the full page.
+    """
+    probe = browser.new_page()
+    user_agent = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
+    probe.close()
+    context = browser.new_context(locale="en-US", user_agent=user_agent, viewport={"width": 1400, "height": 900})
+    page = context.new_page()
+    page.set_default_timeout(10000)
+    return page
+
+
 def locator_value(page, selector: str) -> str | None:
     locator = page.locator(selector).first
     try:
@@ -304,7 +365,8 @@ def extract_business_details(
 
     address = locator_value(page, 'button[data-item-id="address"]')
     phone = locator_value(page, 'button[data-item-id^="phone:tel:"]')
-    category = locator_value(page, 'button[jsaction*="pane.rating.category"]')
+    category = (locator_value(page, 'button[jsaction*="category"]')
+                or locator_value(page, "button.DkEaL"))
 
     website_locator = page.locator('a[data-item-id="authority"]').first
     try:
@@ -314,20 +376,24 @@ def extract_business_details(
 
     rating_text = locator_value(page, "div.F7nice") or ""
     rating_match = re.search(r"(?<!\d)([0-5](?:\.\d)?)", rating_text)
-    review_match = re.search(r"\(([\d,.]+)\)", rating_text)
-    if not review_match:
-        review_match = re.search(r"([\d,]+)\s+reviews?", rating_text, re.IGNORECASE)
+    try:  # the count also appears as an accessible label, e.g. "275 reviews"
+        review_labels = page.locator('[aria-label$=" reviews" i], [aria-label$=" review" i]').evaluate_all(
+            "elements => elements.map(element => element.getAttribute('aria-label'))", )
+    except PlaywrightError:
+        review_labels = []
+    review_labels = [label for label in review_labels if re.fullmatch(r"[\d,.]+ reviews?", label.strip(), re.I)]
 
     google_rating = float(rating_match.group(1)) if rating_match else None
-    google_review_count = (
-        int(review_match.group(1).replace(",", "").replace(".", ""))
-        if review_match
-        else None
-    )
+    google_review_count = parse_review_count(rating_text, *review_labels)
 
     try:
+        page.locator("table.eK4R0e").first.wait_for(state="attached", timeout=4000)  # may render after the rest
+    except PlaywrightError:
+        pass
+    try:
         opening_hours = page.locator("table.eK4R0e").first.evaluate(
-            "table => Array.from(table.rows, row => row.innerText.trim()).filter(Boolean)",
+            "table => Array.from(table.rows, row => Array.from(row.cells, cell => cell.textContent.trim())"
+            ".filter(Boolean).join(' ')).filter(Boolean)",
             timeout=1500,
         )
         if not opening_hours:
@@ -345,6 +411,7 @@ def extract_business_details(
         "phone": phone,
         "address": address,
         "rating": rating_text,
+        "review_labels": review_labels,
         "opening_hours": opening_hours,
         "google_maps_url": page.url,
         "google_place_id": place_id_match.group(0) if place_id_match else None,
@@ -357,6 +424,7 @@ def extract_business_details(
     phone = normalize_phone(phone, target_country)
     address = normalize_text(address)
     target_country = normalize_text(target_country)
+    location = parse_address(address, target_country)
     if opening_hours:
         opening_hours = [normalize_text(hour) for hour in opening_hours]
         opening_hours = [hour for hour in opening_hours if hour]
@@ -371,6 +439,9 @@ def extract_business_details(
             "domain": domain.removeprefix("www.") if domain else None,
             "phone": phone,
             "address": address,
+            "city": location["city"],
+            "state": location["state"],
+            "postal_code": location["postal_code"],
             "country": target_country,
             "latitude": float(coordinates_match.group(1)) if coordinates_match else None,
             "longitude": float(coordinates_match.group(2)) if coordinates_match else None,
@@ -541,8 +612,7 @@ def run(options: dict) -> int:
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(headless=not options["headed"])
                 try:
-                    page = browser.new_page()
-                    page.set_default_timeout(10000)
+                    page = new_maps_page(browser)
                     records = scrape_campaign(
                         page,
                         campaign,
@@ -583,3 +653,149 @@ def run(options: dict) -> int:
         print(f"Database operation failed ({type(error).__name__}).")
         print("Check DATABASE_URL and run `python manage.py migrate` first.")
         return 1
+
+
+# ---------------------------------------------------------------- refreshing stored businesses
+
+
+REFRESHED_FIELDS = ("category", "google_rating", "google_review_count", "opening_hours")
+LIMITED_VIEW_PAUSE = 30.0  # seconds to wait before retrying a page Google served in its limited view
+
+
+def limited_view(details: dict) -> bool:
+    """Google's reduced page for suspected automation: a rating without its review count."""
+    return details.get("google_rating") is not None and details.get("google_review_count") is None
+
+
+def missing_details():
+    from django.db.models import Q
+
+    return (Q(category__isnull=True) | Q(category="") | Q(google_review_count__isnull=True) | Q(city__isnull=True)
+            | Q(city=""))
+
+
+@outside_event_loop
+def apply_details(business_id: int, details: dict | None, location: dict) -> list[str]:
+    """Save what was read for a stored business: Maps details when found, and city/state/postal code from the
+    address where those are empty. Returns the fields that changed."""
+    business = Business.objects.get(pk=business_id)
+    changed = []
+    for field in REFRESHED_FIELDS:
+        value = (details or {}).get(field)
+        if field == "google_rating" and value is not None:
+            value = Decimal(str(value))  # the column is a decimal; compare like with like
+        if field == "opening_hours" and value and len(value) < len(business.opening_hours or []):
+            continue  # a partial list (only today's row) never replaces a full week
+        if value not in (None, "", []) and getattr(business, field) != value:
+            setattr(business, field, value)
+            changed.append(field)
+    for field in ("phone", "website_url", "domain"):  # fill in, never replace: later steps rely on them
+        value = (details or {}).get(field)
+        if value and not getattr(business, field):
+            setattr(business, field, value)
+            changed.append(field)
+    for field, value in location.items():
+        if value and not getattr(business, field):
+            setattr(business, field, value)
+            changed.append(field)
+    if details:
+        business.last_discovered_at = datetime.now(timezone.utc)
+        changed.append("last_discovered_at")
+    if changed:
+        business.save(update_fields=[*changed, "updated_at"])
+    return changed
+
+
+def add_refresh_arguments(parser) -> None:
+    parser.add_argument("--business-id", type=int, action="append", help="Refresh this business only (repeatable).")
+    parser.add_argument("--campaign-id", type=int, help="Refresh this campaign's businesses only.")
+    parser.add_argument("--limit", type=int, help="Maximum number of businesses in this run.")
+    parser.add_argument("--all", action="store_true",
+                        help="Refresh every business, not only those missing a category, review count or city.")
+    parser.add_argument("--address-only", action="store_true",
+                        help="Only fill city, state and postal code from the stored address; no browser.")
+    parser.add_argument("--headed", action="store_true", help="Show Chromium.")
+    parser.add_argument("--delay", type=float, default=2.0, help="Seconds between Google Maps pages (default: 2).")
+
+
+def run_refresh(options: dict) -> int:
+    if options["delay"] < 0:
+        raise CommandError("--delay cannot be negative")
+    if options["limit"] is not None and options["limit"] < 1:
+        raise CommandError("--limit must be a positive integer")
+    queryset = Business.objects.order_by("id")
+    if options["business_id"]:
+        queryset = queryset.filter(id__in=options["business_id"])
+    if options["campaign_id"] is not None:
+        queryset = queryset.filter(discovery_campaign_id=options["campaign_id"])
+    if not options["all"] and not options["business_id"]:
+        queryset = queryset.filter(missing_details())
+    if options["limit"] is not None:
+        queryset = queryset[: options["limit"]]
+    queue = list(queryset.values("id", "name", "address", "country", "google_maps_url"))
+    if not queue:
+        print("No businesses need refreshing (use --all to refresh every business).")
+        return 0
+
+    print(f"Refreshing {len(queue)} business(es)" + (" from their addresses." if options["address_only"] else
+                                                      " from Google Maps."))
+    updated = failed = 0
+
+    state = {"page": None, "browser": None}
+
+    def read(business):
+        card = {"url": business["google_maps_url"], "name": business["name"]}
+        details = extract_business_details(state["page"], card, business["country"], options["headed"])["business"]
+        if limited_view(details):
+            print(f"  Business {business['id']}: Google showed its limited view; retrying in {LIMITED_VIEW_PAUSE:.0f}s "
+                  "with a fresh browser session.")
+            time.sleep(LIMITED_VIEW_PAUSE)
+            state["page"].context.close()
+            state["page"] = new_maps_page(state["browser"])
+            details = extract_business_details(state["page"], card, business["country"], options["headed"])["business"]
+            if limited_view(details):
+                print(f"  Business {business['id']}: still limited; the review count is left as it was. Try again later.")
+        return details
+
+    def refresh(business, use_browser=False):
+        nonlocal updated, failed
+        location = parse_address(business["address"], business["country"])
+        details = None
+        if use_browser and business["google_maps_url"]:
+            try:
+                details = read(business)
+            except RuntimeError:
+                raise
+            except PlaywrightError as error:
+                failed += 1
+                print(f"  Business {business['id']}: could not read Google Maps ({type(error).__name__}).")
+        changed = apply_details(business["id"], details, location)
+        updated += bool(changed)
+        found = ", ".join(f"{field}={(details or {}).get(field, location.get(field))!r}" for field in changed
+                          if field != "last_discovered_at")
+        print(f"  Business {business['id']} {business['name']}: {found or 'nothing new'}")
+
+    try:
+        if options["address_only"]:
+            for business in queue:
+                refresh(business)
+        else:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=not options["headed"])
+                try:
+                    state.update(browser=browser, page=new_maps_page(browser))
+                    for index, business in enumerate(queue):
+                        if index:
+                            time.sleep(options["delay"])
+                        refresh(business, use_browser=True)
+                finally:
+                    browser.close()
+    except RuntimeError as error:  # consent page or CAPTCHA: stop, keep what was saved
+        print(f"Stopped: {error}")
+        return 1
+    except PlaywrightError as error:
+        print(f"Browser failed ({type(error).__name__}): {error}")
+        print("Install the browser with `python -m playwright install chromium`.")
+        return 1
+    print(f"Done: {updated} business(es) updated, {failed} could not be read.")
+    return 1 if failed else 0

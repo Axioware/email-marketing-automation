@@ -195,3 +195,68 @@ class PlaywrightDatabaseTests(TransactionTestCase):
         self.assertEqual(BusinessWebsiteProfile.objects.get(pk=profile_id).qualification_score, 61)
         self.assertEqual(seen[0]["google_place_id"], "ChIJx")
         self.assertEqual(DiscoveryCampaign.objects.get(pk=campaign.pk).status, "running")
+
+
+class MapsDetailsTests(TestCase):
+    def test_parse_address(self):
+        cases = {
+            "Building, Room # 10-14, Block 3 Gulshan-e-Iqbal, Karachi, 75300, Pakistan": ("Karachi", None, "75300"),
+            "Shop 2, Main Blvd, Gulberg III, Lahore, Punjab 54000, Pakistan": ("Lahore", "Punjab", "54000"),
+            "100 Congress Ave, Austin, TX 78701, United States": ("Austin", "TX", "78701"),
+            "10 Downing St, London SW1A 2AA, UK": ("London", None, "SW1A 2AA"),
+            "Plot 5, F-7 Markaz, Islamabad, Pakistan": ("Islamabad", None, None),
+            "B-256 karachi": (None, None, None),
+            "": (None, None, None),
+        }
+        for address, expected in cases.items():
+            parsed = maps.parse_address(address, "Pakistan")
+            self.assertEqual((parsed["city"], parsed["state"], parsed["postal_code"]), expected, address)
+
+    def test_parse_review_count(self):
+        self.assertEqual(maps.parse_review_count("4.7\n(275)"), 275)
+        self.assertEqual(maps.parse_review_count("4.2(1,234)"), 1234)
+        self.assertEqual(maps.parse_review_count(None, "1,275 reviews"), 1275)
+        self.assertIsNone(maps.parse_review_count("4.7", None))
+        self.assertTrue(maps.limited_view({"google_rating": 4.7, "google_review_count": None}))
+        self.assertFalse(maps.limited_view({"google_rating": 4.7, "google_review_count": 12}))
+        self.assertFalse(maps.limited_view({"google_rating": None, "google_review_count": None}))  # no reviews at all
+
+    def test_icons_are_removed_from_text(self):
+        self.assertEqual(maps.normalize_text("Friday 10 AM"), "Friday 10 AM")
+
+    def test_apply_details_updates_maps_fields_but_only_fills_the_rest(self):
+        week = [f"Day{i} 9-5" for i in range(7)]
+        business = make_business(make_campaign(), "Clinic", website_url="https://keep.pk", opening_hours=week,
+                                 address="X, Karachi, 75300, Pakistan")
+        changed = maps.apply_details(business.pk, {
+            "category": "Dental clinic", "google_rating": 4.7, "google_review_count": 275,
+            "opening_hours": ["Friday 2-9 PM"],  # partial: must not replace the full week
+            "website_url": "https://other.pk", "phone": "+923001234567"},
+            maps.parse_address(business.address, "Pakistan"))
+        business.refresh_from_db()
+        self.assertEqual((business.category, business.google_review_count, str(business.google_rating)),
+                         ("Dental clinic", 275, "4.7"))
+        self.assertEqual(business.opening_hours, week)
+        self.assertEqual(business.website_url, "https://keep.pk")  # never replaced
+        self.assertEqual(business.phone, "+923001234567")  # filled in
+        self.assertEqual((business.city, business.postal_code), ("Karachi", "75300"))
+        self.assertIn("google_review_count", changed)
+        self.assertEqual(maps.apply_details(business.pk, {"google_rating": 4.7, "google_review_count": 275},
+                                            maps.parse_address(business.address, "Pakistan")), ["last_discovered_at"])
+
+    def test_refresh_from_addresses_without_a_browser(self):
+        campaign = make_campaign()
+        karachi = make_business(campaign, "A", address="Shop 1, Karachi, 75300, Pakistan", country="Pakistan")
+        make_business(campaign, "B", address="Lahore, Punjab 54000, Pakistan", country="Pakistan", city="Lahore",
+                      category="Dentist", google_review_count=5)  # complete: skipped without --all
+        with mock.patch.object(maps, "sync_playwright") as playwright:
+            result = run_command("refresh_businesses", "--address-only")
+        playwright.assert_not_called()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Refreshing 1 business(es) from their addresses", result.stdout)
+        karachi.refresh_from_db()
+        self.assertEqual((karachi.city, karachi.postal_code), ("Karachi", "75300"))
+
+    def test_fetched_businesses_get_city_and_state(self):
+        details = {"name": "X", "address": "Shop 2, Lahore, Punjab 54000, Pakistan"}
+        self.assertEqual(maps.parse_address(details["address"])["state"], "Punjab")

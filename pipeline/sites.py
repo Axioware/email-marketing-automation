@@ -134,6 +134,10 @@ class PipelineAdminSite(admin.AdminSite):
         if profiles["to_discover"]:
             steps.append((f"{profiles['to_discover']} qualified business(es) still need a decision maker.",
                           "Find decision makers", run_url("find_stakeholders")))
+        missing = Business.objects.filter(google_review_count__isnull=True).count()
+        if missing:
+            steps.append((f"{missing} business(es) have no Google review count or category yet.",
+                          "Refresh Google Maps details", run_url("refresh_businesses")))
         if to_research:
             steps.append((f"{to_research} business(es) with a website have not been researched.", "Research websites",
                           run_url("research_websites")))
