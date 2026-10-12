@@ -4,18 +4,23 @@ Table and column names are the ones the database already uses (they were created
 `manage.py migrate --fake-initial` adopts an existing database without changing it. The Supabase open-tracking edge
 function writes to `emails` and `email_open_events` through the `record_email_open` database function.
 """
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Now
 from django.utils import timezone
 
 
 class CampaignPrompt(models.Model):
-    """The model's standing instructions for a campaign: who we are, what we offer, how to read the input, the rules."""
+    """How a campaign qualifies businesses: what the research agent looks for on each website and how it scores it.
+    Its email prompts (one to many) write the campaign's emails."""
 
     name = models.CharField(max_length=255, unique=True)
-    prompt = models.TextField(help_text="Who we are, what we offer, the rules every email must follow and the output "
-                                        "format. The chosen email prompt is added after it.")
+    prompt = models.TextField(help_text="Qualification criteria: what makes a business a good prospect for this "
+                                        "campaign, what to look for on its website and what each score range "
+                                        "(0-100) means. Businesses scoring 50+ go on to finding decision makers.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -29,15 +34,12 @@ class CampaignPrompt(models.Model):
     def default_email_prompt(self, sequence: int = 0):
         return self.email_prompts.filter(sequence=sequence).order_by("-is_default", "id").first()
 
-    def ensure_email_prompt(self) -> bool:
-        """Give a campaign prompt without email prompts the built-in first-touch one. Returns whether one was added."""
-        if self.email_prompts.exists():
-            return False
-        from pipeline.services.generation import DEFAULT_EMAIL_PROMPT
+    @property
+    def full_prompt(self) -> str:
+        """What the research agent receives: its browsing instructions followed by this prompt."""
+        from pipeline.services.research import research_prompt
 
-        EmailPrompt.objects.create(campaign_prompt=self, name="First-touch email", is_default=True,
-                                   prompt=DEFAULT_EMAIL_PROMPT)
-        return True
+        return research_prompt(self.prompt)
 
 
 VARIATIONS = [("a", "A"), ("b", "B"), ("c", "C")]
@@ -55,7 +57,9 @@ class EmailPrompt(models.Model):
     opened = models.BooleanField(null=True, blank=True,
                                  help_text="Follow-ups only: use this prompt when the previous email was opened (Yes), "
                                            "not opened (No), or either (Unknown/any).")
-    prompt = models.TextField(help_text="How to write this email: structure, call to action, length and style.")
+    prompt = models.TextField(help_text="Everything the model needs to write this email: who we are and what we "
+                                        "offer, the rules, structure, call to action, length and style. The model "
+                                        "receives exactly this text, with the prospect's details as input.")
     is_default = models.BooleanField(default=False, help_text="Used for this step when no variation matches.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -80,11 +84,27 @@ class EmailPrompt(models.Model):
                                        is_default=True).exclude(pk=self.pk).update(is_default=False)
         super().save(*args, **kwargs)
 
-    @property
-    def full_prompt(self) -> str:
-        from pipeline.services.generation import compose_prompt
 
-        return compose_prompt(self.campaign_prompt.prompt, self.prompt)
+DEFAULT_SEND_TIMEZONE = "Asia/Karachi"
+
+
+def send_window_constraint(table: str) -> models.CheckConstraint:
+    """A send window is both times (start before end, same day) or neither."""
+    return models.CheckConstraint(
+        condition=models.Q(send_window_start__isnull=True, send_window_end__isnull=True)
+        | models.Q(send_window_start__isnull=False, send_window_end__isnull=False,
+                   send_window_start__lt=models.F("send_window_end")),
+        name=f"ck_{table}_send_window",
+    )
+
+
+def check_send_window(obj) -> None:
+    start, end = obj.send_window_start, obj.send_window_end
+    if (start is None) != (end is None):
+        raise ValidationError({"send_window_end" if start else "send_window_start":
+                               "Set both the start and the end of the send window, or neither."})
+    if start is not None and start >= end:
+        raise ValidationError({"send_window_end": "The end must be later than the start (same day, e.g. 09:00 - 20:00)."})
 
 
 class FollowUp(models.Model):
@@ -93,6 +113,9 @@ class FollowUp(models.Model):
     campaign = models.ForeignKey("DiscoveryCampaign", on_delete=models.CASCADE, related_name="follow_ups")
     sequence = models.PositiveIntegerField(help_text="1 = the first follow-up (the first email is 0).")
     days_after_previous = models.PositiveIntegerField(default=3, help_text="Days after the previous email was sent.")
+    send_window_start = models.TimeField(null=True, blank=True, help_text="Send this follow-up between these times "
+                                                                          "(campaign time zone). Empty: the campaign's window.")
+    send_window_end = models.TimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -104,10 +127,14 @@ class FollowUp(models.Model):
             models.UniqueConstraint(fields=["campaign", "sequence"], name="uq_follow_ups_campaign_sequence"),
             models.CheckConstraint(condition=models.Q(sequence__gte=1), name="ck_follow_ups_sequence"),
             models.CheckConstraint(condition=models.Q(days_after_previous__gte=1), name="ck_follow_ups_days"),
+            send_window_constraint("follow_ups"),
         ]
 
     def __str__(self):
         return f"Follow-up {self.sequence} ({self.days_after_previous} days later)"
+
+    def clean(self):
+        check_send_window(self)
 
 
 class DiscoveryCampaign(models.Model):
@@ -127,10 +154,18 @@ class DiscoveryCampaign(models.Model):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     campaign_prompt = models.OneToOneField(
         CampaignPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="campaign",
-        help_text="Instructions used to write this campaign's emails. Each prompt belongs to one campaign.",
+        help_text="Qualifies this campaign's businesses and holds the email prompts that write its emails. Each "
+                  "prompt belongs to one campaign. Without one, the campaign's businesses are not researched.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    send_window_start = models.TimeField(
+        null=True, blank=True,
+        help_text="Approved emails are sent between the start and end time, spread evenly (e.g. 09:00 - 20:00). "
+                  "Empty: sent as soon as sending runs.")
+    send_window_end = models.TimeField(null=True, blank=True)
+    send_timezone = models.CharField(max_length=64, default=DEFAULT_SEND_TIMEZONE,
+                                     help_text="Time zone of the send windows, e.g. Asia/Karachi or Europe/London.")
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
@@ -143,10 +178,18 @@ class DiscoveryCampaign(models.Model):
                 condition=models.Q(status__in=["pending", "running", "completed", "failed"]),
                 name="ck_discovery_campaigns_status",
             ),
+            send_window_constraint("discovery_campaigns"),
         ]
 
     def __str__(self):
         return self.name
+
+    def clean(self):
+        check_send_window(self)
+        try:
+            ZoneInfo(self.send_timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValidationError({"send_timezone": "Unknown time zone; use a name like Asia/Karachi."})
 
 
 class Business(models.Model):
@@ -400,6 +443,8 @@ class Email(models.Model):
     reviewed_at = models.DateTimeField(null=True, blank=True)
     review_note = models.TextField(null=True, blank=True)
     edited_at = models.DateTimeField(null=True, blank=True)
+    scheduled_at = models.DateTimeField(null=True, blank=True, db_index=True,
+                                        help_text="When an approved email goes out: a slot in its send window.")
     sent_at = models.DateTimeField(null=True, blank=True)
     sent_from = models.CharField(max_length=320, null=True, blank=True)
     message_id = models.CharField(max_length=255, null=True, blank=True)

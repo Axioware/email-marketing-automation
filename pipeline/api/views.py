@@ -66,7 +66,7 @@ class DiscoveryCampaignViewSet(viewsets.ModelViewSet):
 
 
 class CampaignPromptViewSet(viewsets.ModelViewSet):
-    """Campaign prompts, each with its email prompts. A new one starts with the built-in first-touch email prompt."""
+    """Campaign prompts (qualification criteria for website research), each with the email prompts that write emails."""
 
     queryset = CampaignPrompt.objects.prefetch_related("email_prompts").select_related("campaign")
     serializer_class = s.CampaignPromptSerializer

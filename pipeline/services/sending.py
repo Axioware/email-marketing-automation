@@ -3,6 +3,12 @@
 By default this only previews what would be sent. Pass `--send` to actually send. Emails are approved in the admin
 (Pipeline > Emails) or through the API; anything still in review or rejected is never sent.
 
+Send windows: a campaign (and each of its follow-ups) can have a window such as 09:00 - 20:00 in the campaign's time
+zone. Each run gives newly approved emails a send time (`scheduled_at`), spreading all the emails waiting for that
+window evenly over what is left of it (the next day's window once today's has ended), and sends only the emails whose
+time has come. Run it every few minutes (cron) to send them on time. Emails without a window go out on the next run;
+`--email-id` sends the given emails now, whatever their window.
+
 Safety:
 - Only approved emails whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not
   `do_not_contact`) are sent.
@@ -18,7 +24,8 @@ import smtplib
 import socket
 import ssl
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 
@@ -27,7 +34,7 @@ from django.db import DatabaseError, transaction
 from django.db.models import F, Q
 from django.db.models.functions import Lower
 
-from pipeline.models import Business, Email, Prospect
+from pipeline.models import Business, Email, FollowUp, Prospect
 from pipeline.services import generation
 
 DEFAULT_SMTP_HOST = "smtp.hostinger.com"
@@ -200,8 +207,83 @@ def sendable_emails():
     )
 
 
-def load_approved(options: dict) -> list[dict]:
+# ---------------------------------------------------------------- send windows
+
+
+def window_bounds(start, end, zone: str, now: datetime) -> tuple[datetime, datetime]:
+    """Today's window in the campaign's time zone, or tomorrow's once today's has ended."""
+    tz = ZoneInfo(zone)
+    day = now.astimezone(tz).date()
+    begin, finish = datetime.combine(day, start, tzinfo=tz), datetime.combine(day, end, tzinfo=tz)
+    if now >= finish:
+        day += timedelta(days=1)
+        begin, finish = datetime.combine(day, start, tzinfo=tz), datetime.combine(day, end, tzinfo=tz)
+    return begin, finish
+
+
+def spread(count: int, begin: datetime, finish: datetime) -> list[datetime]:
+    """`count` send times split evenly over [begin, finish): the first at begin, one interval apart."""
+    step = (finish - begin) / count
+    return [begin + step * index for index in range(count)]
+
+
+def plan_schedule(now: datetime, save: bool = True) -> dict[int, datetime]:
+    """Send time of every sendable email: {email id: scheduled_at}.
+
+    An email whose follow-up step or campaign has a send window gets a slot in it. Whenever emails join a window
+    (newly approved, or left over from a window that has passed), they and the ones still waiting in it are spread
+    evenly over what is left of the window. Emails without a window are due now. Saved unless `save` is False.
+    """
+    rows = list(sendable_emails().values(
+        "id", "scheduled_at", "sequence_step", campaign_id=F("business__discovery_campaign_id"),
+        start=F("business__discovery_campaign__send_window_start"),
+        end=F("business__discovery_campaign__send_window_end"),
+        zone=F("business__discovery_campaign__send_timezone")))
+    follow_ups = {(item["campaign_id"], item["sequence"]): (item["send_window_start"], item["send_window_end"])
+                  for item in FollowUp.objects.filter(send_window_start__isnull=False)
+                  .values("campaign_id", "sequence", "send_window_start", "send_window_end")}
+    groups: dict = {}
+    for row in rows:
+        window = (row["start"], row["end"])
+        if row["sequence_step"] > generation.SEQUENCE_STEP:  # a follow-up: its own window, else the campaign's
+            window = follow_ups.get((row["campaign_id"], row["sequence_step"] - 1), window)
+        key = (window[0], window[1], row["zone"]) if window[0] is not None else None
+        groups.setdefault(key, []).append(row)
+
+    plan, changes = {}, {}
+    for key, group in groups.items():
+        if key is None:  # no window: due now (a time set by an old window no longer applies)
+            for row in group:
+                plan[row["id"]] = row["scheduled_at"] if row["scheduled_at"] and row["scheduled_at"] <= now else now
+                if plan[row["id"]] != row["scheduled_at"]:
+                    changes[row["id"]] = plan[row["id"]]
+            continue
+        begin, finish = window_bounds(*key, now)
+        placed = [row for row in group if row["scheduled_at"] and begin <= row["scheduled_at"] < finish]
+        joining = [row for row in group if row not in placed]
+        for row in placed:
+            plan[row["id"]] = row["scheduled_at"]
+        if not joining:
+            continue
+        waiting = sorted((row for row in placed if row["scheduled_at"] > now), key=lambda row: row["scheduled_at"])
+        batch = waiting + sorted(joining, key=lambda row: row["id"])
+        for row, slot in zip(batch, spread(len(batch), max(now, begin), finish)):
+            plan[row["id"]] = changes[row["id"]] = slot
+    if save:
+        for pk, slot in changes.items():
+            Email.objects.filter(pk=pk, status=Email.Status.APPROVED).update(scheduled_at=slot)
+    return plan
+
+
+def local_time(moment: datetime, zone: str | None = None) -> str:
+    return moment.astimezone(ZoneInfo(zone) if zone else None).strftime("%Y-%m-%d %H:%M %Z").strip()
+
+
+def load_approved(options: dict, due: set[int] | None = None) -> list[dict]:
+    """The approved emails to send in this run; `due` limits them to these ids (the ones whose send time has come)."""
     queryset = sendable_emails()
+    if due is not None:
+        queryset = queryset.filter(id__in=due)
     if options.get("email_id"):
         queryset = queryset.filter(id__in=options["email_id"])
     if options.get("business_id"):
@@ -231,20 +313,30 @@ def run(options: dict) -> int:
         problems = config_problems(config)
         if problems:
             raise CommandError("; ".join(problems))
-        if not options["allow_placeholders"] and (generation.PROMPT_IS_PLACEHOLDER or generation.FOOTER_IS_PLACEHOLDER):
-            raise CommandError("The email prompt or footer in pipeline/services/generation.py is still a placeholder. "
-                               "Fill them in (and set PROMPT_IS_PLACEHOLDER/FOOTER_IS_PLACEHOLDER = False) or pass "
-                               "--allow-placeholders.")
+        if not options["allow_placeholders"] and generation.FOOTER_IS_PLACEHOLDER:
+            raise CommandError("The email footer in pipeline/services/generation.py is still a placeholder. Fill it in "
+                               "(and set FOOTER_IS_PLACEHOLDER = False) or pass --allow-placeholders.")
 
     mailer = Mailer(config)
     try:
         stuck = list(Email.objects.filter(status=Email.Status.SENDING).values_list("id", flat=True))
-        queue = load_approved(options)
+        due, later = None, []
+        if not options.get("email_id"):  # chosen emails go now; the others when their send window says so
+            now = datetime.now(timezone.utc)
+            plan = plan_schedule(now, save=options["send"])
+            due = {pk for pk, slot in plan.items() if slot <= now}
+            later = sorted((slot, pk) for pk, slot in plan.items() if slot > now)
+            if later:
+                zone = Email.objects.filter(pk=later[0][1]).values_list("business__discovery_campaign__send_timezone",
+                                                                         flat=True).first()
+                print(f"{len(later)} approved email(s) are scheduled in their send window; the next goes out at "
+                      f"{local_time(later[0][0], zone)} (run this every few minutes to send them on time).")
+        queue = load_approved(options, due)
         if stuck:
             print(f"Warning: email(s) {', '.join(map(str, stuck))} are stuck in 'sending' (a previous run stopped "
                   "mid-send). They may have been delivered; check the mailbox's Sent folder, then set their status by hand.")
         if not queue:
-            print("No approved emails ready to send.")
+            print("No approved emails are due to send now." if later else "No approved emails ready to send.")
             return 0
 
         mode = "Sending" if options["send"] else "Preview (nothing is sent; pass --send to send)"

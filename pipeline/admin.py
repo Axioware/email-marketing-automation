@@ -22,6 +22,7 @@ from django.utils.text import Truncator
 
 from pipeline import jobs, review
 from pipeline.models import (
+    DEFAULT_SEND_TIMEZONE,
     VARIATIONS,
     Business,
     CampaignPrompt,
@@ -133,7 +134,8 @@ class DiscoveryCampaignForm(forms.ModelForm):
 
     class Meta:
         model = DiscoveryCampaign
-        fields = ["name", "target_country", "target_locations", "search_terms", "campaign_prompt"]
+        fields = ["name", "target_country", "target_locations", "search_terms", "campaign_prompt", "send_window_start",
+                  "send_window_end", "send_timezone"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -141,9 +143,12 @@ class DiscoveryCampaignForm(forms.ModelForm):
             used = DiscoveryCampaign.objects.exclude(pk=self.instance.pk).exclude(campaign_prompt=None)
             self.fields["campaign_prompt"].queryset = CampaignPrompt.objects.exclude(
                 pk__in=used.values("campaign_prompt"))
-            self.fields["campaign_prompt"].help_text = ("Instructions for writing this campaign's emails. Pick a free "
-                                                        "prompt or create one with +. Without one, the built-in "
-                                                        "Axioware prompt is used.")
+            self.fields["campaign_prompt"].help_text = ("Qualifies this campaign's businesses (website research) and "
+                                                        "holds the email prompts that write its emails. Pick a free "
+                                                        "prompt or create one with +. Without one, the campaign's "
+                                                        "businesses are not researched and no emails are written.")
+        if "send_timezone" in self.fields:
+            self.fields["send_timezone"].required = False
         for field in ("target_locations", "search_terms"):
             value = getattr(self.instance, field, None)
             if isinstance(value, list):
@@ -158,6 +163,9 @@ class DiscoveryCampaignForm(forms.ModelForm):
     def clean_search_terms(self):
         return self._split("search_terms")
 
+    def clean_send_timezone(self):
+        return (self.cleaned_data.get("send_timezone") or "").strip() or DEFAULT_SEND_TIMEZONE
+
     def clean_target_country(self):
         country = (self.cleaned_data.get("target_country") or "").strip()
         if "," in country:
@@ -168,24 +176,25 @@ class DiscoveryCampaignForm(forms.ModelForm):
 class FollowUpInline(admin.TabularInline):
     model = FollowUp
     extra = 0
-    fields = ["sequence", "days_after_previous"]
-    verbose_name_plural = "follow-ups (the first email is step 0; each follow-up is written when due and reviewed)"
+    fields = ["sequence", "days_after_previous", "send_window_start", "send_window_end"]
+    verbose_name_plural = ("follow-ups (the first email is step 0; each follow-up is written when due and reviewed; "
+                           "an empty send window uses the campaign's)")
 
 
-def follow_up_problems(campaign) -> list[str]:
-    """Follow-up steps of a campaign that have no email prompt to write them."""
+def prompt_problems(campaign) -> list[str]:
+    """What a campaign is missing to qualify its businesses and write its emails and follow-ups."""
     if campaign is None or not campaign.pk:
         return []
-    steps = list(campaign.follow_ups.values_list("sequence", flat=True))
-    if not steps:
-        return []
     if campaign.campaign_prompt_id is None:
-        return [f"This campaign has {len(steps)} follow-up(s) but no campaign prompt; follow-ups need email prompts "
-                "for their steps."]
+        return ["This campaign has no campaign prompt: its businesses will not be researched (the campaign prompt holds "
+                "the qualification criteria) and no emails will be written. Pick or create one under Prompts."]
     covered = set(EmailPrompt.objects.filter(campaign_prompt_id=campaign.campaign_prompt_id)
                   .values_list("sequence", flat=True))
-    return [f"Follow-up {step} has no email prompt (add one with step {step} to the campaign prompt); it will be "
-            "skipped." for step in steps if step not in covered]
+    problems = [] if 0 in covered else [
+        "The campaign prompt has no email prompt for the first email (step 0); no emails will be written until you add one."]
+    return problems + [f"Follow-up {step} has no email prompt (add one with step {step} to the campaign prompt); it will "
+                       "be skipped." for step in campaign.follow_ups.values_list("sequence", flat=True)
+                       if step not in covered]
 
 
 @admin.register(DiscoveryCampaign)
@@ -197,7 +206,11 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
     readonly_fields = ["status", "created_at", "updated_at", "started_at", "completed_at", "businesses_link"]
     fieldsets = [
         (None, {"fields": ["name", "target_country", "target_locations", "search_terms"]}),
-        ("Emails", {"fields": ["campaign_prompt"]}),
+        ("Prompts", {"fields": ["campaign_prompt"]}),
+        ("Sending", {"fields": [("send_window_start", "send_window_end"), "send_timezone"],
+                     "description": "Approved emails go out between these times, spread evenly over the window "
+                                    "(e.g. 09:00 - 20:00). Sending must run every few minutes (cron) to send them on "
+                                    "time. Leave both empty to send as soon as sending runs."}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
     actions = ["run_pipeline", "fetch_businesses"]
@@ -206,7 +219,7 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
         if request.method == "GET":
-            for problem in follow_up_problems(DiscoveryCampaign.objects.filter(pk=object_id).first()):
+            for problem in prompt_problems(DiscoveryCampaign.objects.filter(pk=object_id).first()):
                 self.message_user(request, problem, messages.WARNING)
         return super().change_view(request, object_id, form_url, extra_context)
 
@@ -284,23 +297,19 @@ class CampaignPromptForm(forms.ModelForm):
         fields = ["name", "prompt"]
         widgets = {"prompt": forms.Textarea(attrs={"rows": 24, "class": "vLargeTextField"})}
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if not self.instance.pk:
-            self.initial.setdefault("prompt", generation.DEFAULT_CAMPAIGN_PROMPT)
-
 
 @admin.register(CampaignPrompt)
 class CampaignPromptAdmin(PipelineAdmin):
     form = CampaignPromptForm
     list_display = ["name", "campaign_link", "email_prompt_count", "updated_at"]
     search_fields = ["name", "prompt"]
-    readonly_fields = ["campaign_link", "created_at", "updated_at"]
+    readonly_fields = ["campaign_link", "created_at", "updated_at", "full_prompt_display"]
     fieldsets = [
         (None, {"fields": ["name", "campaign_link", "prompt"],
-                "description": "The standing instructions for a campaign. When an email is written, the chosen email "
-                               "prompt below is added after this text. New prompts start from the built-in Axioware "
-                               "prompt."}),
+                "description": "The qualification criteria of a campaign: the research agent reads each business's "
+                               "website and scores it 0-100 against this text; businesses scoring 50+ go on to finding "
+                               "decision makers. The email prompts below write the campaign's emails."}),
+        ("What the research agent receives", {"fields": ["full_prompt_display"], "classes": ["collapse"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
     inlines = [EmailPromptInline]
@@ -320,10 +329,15 @@ class CampaignPromptAdmin(PipelineAdmin):
     def email_prompt_count(self, obj):
         return changelist_link(EmailPrompt, obj.email_prompt_total, campaign_prompt__id__exact=obj.pk)
 
+    @admin.display(description="Full prompt")
+    def full_prompt_display(self, obj):
+        return format_html('<pre class="pipeline-pre">{}</pre>', obj.full_prompt) if obj.pk else "-"
+
     def save_related(self, request, form, formsets, change):
         super().save_related(request, form, formsets, change)
-        if form.instance.ensure_email_prompt():
-            self.message_user(request, "Added the built-in first-touch email prompt to it; edit it below.")
+        if not form.instance.email_prompts.filter(sequence=0).exists():
+            self.message_user(request, "This campaign prompt has no email prompt for the first email (step 0) yet; add "
+                                       "one below, or no emails will be written.", messages.WARNING)
 
 
 class EmailPromptForm(forms.ModelForm):
@@ -332,16 +346,8 @@ class EmailPromptForm(forms.ModelForm):
         fields = ["campaign_prompt", "name", "sequence", "variation", "opened", "is_default", "prompt"]
         widgets = {"prompt": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"}), "opened": OpenedSelect}
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if not self.instance.pk:
-            self.initial.setdefault("prompt", generation.DEFAULT_EMAIL_PROMPT)
-
     def clean(self):
         cleaned = super().clean()
-        # A follow-up prompt left on the first-email starting text gets the follow-up starting text instead.
-        if cleaned.get("sequence") and (cleaned.get("prompt") or "").strip() == generation.DEFAULT_EMAIL_PROMPT.strip():
-            cleaned["prompt"] = generation.DEFAULT_FOLLOW_UP_PROMPT
         if not cleaned.get("sequence") and cleaned.get("opened") is not None:
             self.add_error("opened", "Only follow-ups (step 1 or later) can depend on whether the previous email was opened.")
         return cleaned
@@ -354,13 +360,12 @@ class EmailPromptAdmin(PipelineAdmin):
                     "updated_at"]
     list_filter = ["campaign_prompt", "sequence", "variation", "opened", "is_default"]
     search_fields = ["name", "prompt", "campaign_prompt__name"]
-    readonly_fields = ["created_at", "updated_at", "full_prompt_display"]
+    readonly_fields = ["created_at", "updated_at"]
     fieldsets = [
         (None, {"fields": ["campaign_prompt", "name", "sequence", "variation", "opened", "is_default", "prompt"],
-                "description": "How to write one email of the sequence. Step 0 is the first email, step 1 the first "
-                               "follow-up, and so on. The model receives the campaign prompt followed by this text. "
-                               "A new follow-up prompt starts with the built-in follow-up text."}),
-        ("What the model receives", {"fields": ["full_prompt_display"], "classes": ["collapse"]}),
+                "description": "Writes one email of the sequence: the model receives exactly this text, with the "
+                               "prospect's details (and, for follow-ups, follow_up and previous_emails) as input. Step "
+                               "0 is the first email, step 1 the first follow-up, and so on."}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
@@ -374,10 +379,6 @@ class EmailPromptAdmin(PipelineAdmin):
     @admin.display(description="Emails written", ordering="email_total")
     def email_count(self, obj):
         return changelist_link(Email, obj.email_total, email_prompt__id__exact=obj.pk)
-
-    @admin.display(description="Full prompt")
-    def full_prompt_display(self, obj):
-        return format_html('<pre class="pipeline-pre">{}</pre>', obj.full_prompt) if obj.pk else "-"
 
 
 class BusinessSourceInline(ReadOnlyInline):
@@ -983,7 +984,7 @@ class OpenEventInline(ReadOnlyInline):
 class EmailAdmin(PipelineAdmin):
     form = EmailReviewForm
     list_display = ["id", "business", "recipient", "subject_short", "step", "variation", "status_badge",
-                    "generated_at", "sent_at", "open_count", "edited"]
+                    "generated_at", "scheduled_at", "sent_at", "open_count", "edited"]
     list_display_links = ["id", "subject_short"]
     list_filter = ["status", "sequence_step", "prospect__variation", "email_prompt", "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
@@ -994,7 +995,7 @@ class EmailAdmin(PipelineAdmin):
     change_list_template = "admin/pipeline/email/change_list.html"
     details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by", "email_prompt",
                "generated_at", "reviewed_at", "review_note", "edited_at"]
-    delivery = ["sent_at", "sent_from", "message_id", "send_error", "open_count", "first_opened_at", "last_opened_at",
+    delivery = ["scheduled_at", "sent_at", "sent_from", "message_id", "send_error", "open_count", "first_opened_at", "last_opened_at",
                 "tracking_token"]
 
     def has_add_permission(self, request):

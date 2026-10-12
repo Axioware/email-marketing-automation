@@ -86,7 +86,7 @@ def write_followup(item: dict, llm: tuple, chosen: EmailPrompt | None = None, dr
     previous_opened = item["previous"].open_count > 0 if generation.OPEN_TRACKING else None
     resolved = generation.resolve_prompt(row, chosen, cache, sequence=item["sequence"], previous_opened=previous_opened)
     if resolved is None:
-        return "skipped", f"no email prompt for follow-up {item['sequence']} in this campaign's prompts"
+        return "skipped", generation.missing_prompt_reason(row, item["sequence"])
     system_prompt, email_prompt_id = resolved
     context = {
         **generation.prospect_context(row),

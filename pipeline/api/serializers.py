@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from pipeline import jobs, review
@@ -27,11 +28,28 @@ def string_list(value, field):
     return [item.strip() for item in value if item.strip()]
 
 
+def validate_send_window(serializer, attrs: dict) -> dict:
+    """The model's send-window rules (both times or neither, start before end, a known time zone)."""
+    instance = serializer.instance or serializer.Meta.model()
+    for name in ("send_window_start", "send_window_end", "send_timezone"):
+        if name in attrs:
+            setattr(instance, name, attrs[name])
+    try:
+        instance.clean()
+    except DjangoValidationError as error:
+        raise serializers.ValidationError(error.message_dict) from error
+    return attrs
+
+
 class FollowUpSerializer(serializers.ModelSerializer):
     class Meta:
         model = FollowUp
-        fields = ["id", "campaign", "sequence", "days_after_previous", "created_at", "updated_at"]
+        fields = ["id", "campaign", "sequence", "days_after_previous", "send_window_start", "send_window_end",
+                  "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, attrs):
+        return validate_send_window(self, attrs)
 
 
 class DiscoveryCampaignSerializer(serializers.ModelSerializer):
@@ -41,7 +59,8 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
     class Meta:
         model = DiscoveryCampaign
         fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "campaign_prompt",
-                  "follow_ups", "business_count", "created_at", "updated_at", "started_at", "completed_at"]
+                  "send_window_start", "send_window_end", "send_timezone", "follow_ups", "business_count",
+                  "created_at", "updated_at", "started_at", "completed_at"]
         read_only_fields = ["status", "created_at", "updated_at", "started_at", "completed_at"]
 
     def validate_target_locations(self, value):
@@ -55,30 +74,28 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Enter one country only.")
         return value or None
 
+    def validate(self, attrs):
+        return validate_send_window(self, attrs)
+
 
 class EmailPromptSerializer(serializers.ModelSerializer):
-    full_prompt = serializers.CharField(read_only=True, help_text="Campaign prompt + this prompt, as the model receives it.")
-
     class Meta:
         model = EmailPrompt
         fields = ["id", "campaign_prompt", "name", "sequence", "variation", "opened", "prompt", "is_default",
-                  "full_prompt", "created_at", "updated_at"]
+                  "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
 
 
 class CampaignPromptSerializer(serializers.ModelSerializer):
     campaign = serializers.PrimaryKeyRelatedField(read_only=True)
     email_prompts = EmailPromptSerializer(many=True, read_only=True)
+    full_prompt = serializers.CharField(read_only=True, help_text="The research agent's instructions + this prompt (the "
+                                                                  "qualification criteria), as the model receives it.")
 
     class Meta:
         model = CampaignPrompt
-        fields = ["id", "name", "prompt", "campaign", "email_prompts", "created_at", "updated_at"]
+        fields = ["id", "name", "prompt", "full_prompt", "campaign", "email_prompts", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
-
-    def create(self, validated_data):
-        campaign_prompt = super().create(validated_data)
-        campaign_prompt.ensure_email_prompt()  # starts with the built-in first-touch email prompt
-        return campaign_prompt
 
 
 class BusinessSerializer(serializers.ModelSerializer):
@@ -136,7 +153,7 @@ class EmailSerializer(serializers.ModelSerializer):
         fields = ["id", "prospect", "business", "contact", "sequence_step", "recipient", "subject", "body",
                   "body_text", "body_html", "status", "prospect_ready", "generation_provider", "generation_model",
                   "email_prompt",
-                  "generated_at", "reviewed_at", "review_note", "edited_at", "sent_at", "sent_from", "message_id",
+                  "generated_at", "reviewed_at", "review_note", "edited_at", "scheduled_at", "sent_at", "sent_from", "message_id",
                   "send_error", "open_count", "first_opened_at", "last_opened_at", "tracking_token", "created_at",
                   "updated_at"]
         read_only_fields = [field for field in fields if field not in ("subject", "body")]

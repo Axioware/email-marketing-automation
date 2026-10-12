@@ -6,7 +6,7 @@ from django.test import TestCase, TransactionTestCase
 
 from pipeline.models import Business, BusinessContact, BusinessSource, BusinessWebsiteProfile, DiscoveryCampaign
 from pipeline.services import maps, research, stakeholders
-from tests.support import make_business, make_campaign, make_contact, run_command
+from tests.support import QUALIFICATION_PROMPT, make_business, make_campaign, make_contact, run_command
 
 
 class CampaignTests(TestCase):
@@ -92,6 +92,35 @@ class ResearchTests(TestCase):
         research.fail_profile(research.start_profile(failed.pk), ValueError("bad"))
         self.assertEqual(BusinessWebsiteProfile.objects.get(business=failed).agent_reasoning, "ValueError: bad")
 
+    def test_campaign_prompt_is_the_qualification_criteria(self):
+        prompted = make_business(make_campaign(), "A", website_url="https://a.pk")
+        bare = make_business(make_campaign(campaign_prompt=None), "B", website_url="https://b.pk")
+        rows = {row["id"]: row for row in research.load_businesses(None, None)}
+        self.assertEqual(rows[prompted.pk]["qualification_prompt"], QUALIFICATION_PROMPT)
+        self.assertIsNone(rows[bare.pk]["qualification_prompt"])
+        full = research.research_prompt(QUALIFICATION_PROMPT)
+        self.assertTrue(full.startswith(research.AGENT_INSTRUCTIONS))
+        self.assertTrue(full.endswith("QUALIFICATION CRITERIA\n" + QUALIFICATION_PROMPT))
+        self.assertEqual(prompted.discovery_campaign.campaign_prompt.full_prompt, full)
+
+        researched = []
+        fake = lambda client, model, page, business, jina, on_page=None: researched.append(business) or {
+            "action": "SCORE", "pages_scraped": 1, "scraped_urls": [], "scraped_pages": [], "discovered_links": [],
+            "emails": [], "qualification_score": 80, "qualification_reasons": ["fits"], "agent_reasoning": "ok"}
+        with mock.patch.object(research, "make_llm_client", return_value=(object(), "m", "test")), \
+                mock.patch.object(research, "sync_playwright"), mock.patch.object(research, "research_business", fake):
+            result = run_command("research_websites", "--local-only")
+            self.assertEqual(result.returncode, 1)  # a business was skipped
+            self.assertIn(f"Business {bare.pk} (B) skipped: its campaign has no campaign prompt", result.stdout)
+            self.assertEqual([b["id"] for b in researched], [prompted.pk])
+            self.assertEqual(researched[0]["qualification_prompt"], QUALIFICATION_PROMPT)
+            self.assertEqual(BusinessWebsiteProfile.objects.get(business=prompted).qualification_score, 80)
+            self.assertFalse(BusinessWebsiteProfile.objects.filter(business=bare).exists())  # left for later
+
+            result = run_command("research_websites", "--local-only", "--business-id", bare.pk)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("their campaigns have no campaign prompt", result.stderr)
+
     def test_already_researched_business_explains_redo(self):
         business = make_business(make_campaign(), "Done", website_url="https://done.pk", score=70)
         with mock.patch.object(research, "make_llm_client", return_value=(mock.Mock(), "m", "groq")), \
@@ -169,6 +198,34 @@ class CrawlSafetyTests(TestCase):
                 mock.patch.object(stakeholders, "is_public_http_url", side_effect=lambda u: "169.254" not in u):
             self.assertEqual(stakeholders.crawl_site(driver, business, evidence, roles, 2), 0)
         driver.find_element.assert_not_called()
+
+
+class NavigationRetryTests(TestCase):
+    def test_network_errors_are_retried_and_explained(self):
+        page = mock.Mock()
+        page.goto.side_effect = [maps.PlaywrightError("Page.goto: net::ERR_CONNECTION_CLOSED"), None]
+        with mock.patch.object(maps.time, "sleep"):
+            maps.open_page(page, "https://www.google.com/maps/search/x")
+        self.assertEqual(page.goto.call_count, 2)
+        page.goto.side_effect = maps.PlaywrightError("Page.goto: net::ERR_CONNECTION_CLOSED")
+        with mock.patch.object(maps.time, "sleep"), self.assertRaises(maps.PlaywrightError) as raised:
+            maps.open_page(page, "https://www.google.com/maps/search/x")
+        self.assertIn("could not be reached", maps.browser_hint(raised.exception))
+        self.assertIn("playwright install", maps.browser_hint(maps.PlaywrightError("Executable doesn't exist at /x")))
+        self.assertIsNone(maps.browser_hint(maps.PlaywrightError("Timeout 60000ms exceeded")))
+
+    def test_a_page_reached_twice_through_redirects_is_read_once(self):
+        driver = mock.Mock()
+        driver.current_url = "https://example.com/about-us/"  # every path redirects here
+        driver.find_element.return_value.text = "About our clinic. " * 20
+        driver.title = "About"
+        driver.find_elements.return_value = []
+        business = {"website_url": "https://example.com", "scraped_pages": [], "discovered_links": []}
+        evidence = stakeholders.Evidence("Clinic", ["example.com"])
+        roles = stakeholders.load_role_config(stakeholders.DEFAULT_ROLES_FILE)
+        with mock.patch.object(stakeholders.time, "sleep"), mock.patch.object(stakeholders, "linkedin_hrefs", return_value=[]):
+            self.assertEqual(stakeholders.crawl_site(driver, business, evidence, roles, 4), 1)
+        self.assertEqual(driver.get.call_count, 4)
 
 
 class PlaywrightDatabaseTests(TransactionTestCase):

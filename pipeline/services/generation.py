@@ -2,7 +2,7 @@
 
 For every prospect that is ready for outreach (deliverable email, `outreach_status = 'ready'`, not
 `do_not_contact`) the LLM writes a subject and body from what earlier modules learned about the business and the
-contact. Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below): the email
+contact, following the campaign's email prompt (no email prompt for the first email: the prospect is skipped). Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below): the email
 carries no image. When it is on, the HTML footer image points at the tracking edge function
 (`/email/footer/{token}`), which records opens once the email has been sent.
 
@@ -19,79 +19,15 @@ from urllib.parse import quote, urlsplit
 
 from django.core.management.base import CommandError
 from django.db import DatabaseError, IntegrityError, transaction
-from django.db.models import Count, F, FilteredRelation, Q
+from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from pipeline.models import CampaignPrompt, Email, EmailPrompt, Prospect
-from pipeline.services.llm import make_llm_client
+from pipeline.services.llm import make_llm_client, rejected_output
 
-# The model receives the JSON built by `prospect_context` as the user message.
-# The model's instructions = a campaign prompt (who we are, the input, the rules) followed by an email prompt (how to
-# write this particular email). Both are edited in the admin (Campaign prompts, Email prompts); these built-in
-# defaults are used when a campaign has no prompt of its own, and seeded the first prompts in the database.
-DEFAULT_CAMPAIGN_PROMPT = """You write first-touch cold emails for Axioware, sent one at a time to a single named person at a local business. Each email must read like a short, thoughtful note from one person to another, never like a campaign.
-
-ABOUT AXIOWARE (the only facts you may state about us)
-- Axioware is a software and AI company based in Karachi, Pakistan (axioware.tech). It builds AI voice agents, AI chatbots, machine learning solutions, websites and mobile apps.
-- Our lead product for clinics is Ava, an AI dental receptionist that answers the clinic's phone 24/7. Ava books, reschedules and cancels appointments, sends SMS confirmations and reminders, answers questions about treatments, hours and insurance, and hands emergencies or complex billing calls to the clinic's staff. Ava speaks English, Urdu and Arabic.
-- Anyone can try Ava on a live demo call, with no sign-up, at axioware.tech/dental-agent.
-- For businesses that are not dental clinics, offer what fits the facts: an AI voice agent that answers calls and books appointments, or an AI chatbot that answers enquiries and qualifies leads on the website or WhatsApp.
-
-THE INPUT
-You receive JSON describing one prospect:
-- business: name, category, city, country, website, Google rating and review count (any field may be null).
-- contact: the person you are writing to. Use first_name for the greeting. job_title and role_type are our best guess and may be wrong, so never state or imply their role ("as the owner..."); write to them simply as someone at the clinic.
-- website_findings: notes taken from the business's own website (services, opening hours, how patients book, years in practice, branches, reviews shown on the site).
-- qualification.reasons, outreach_facts and research_summary: more notes from our research.
-- validation_feedback: if present, your previous answer was rejected; fix exactly what it says.
-
-RULES YOU MUST NOT BREAK
-- Use only facts present in the input or in the ABOUT AXIOWARE section. Never invent numbers, statistics, results, client names, testimonials, prices, discounts or deadlines, and never claim we have spoken before or that they asked to be contacted.
-- Never mention how we found them, our research, scraping, scores, qualification or AI tools used to write the email.
-- Do not include phone numbers, email addresses, or links other than axioware.tech/dental-agent and axioware.tech.
-- Do not add a footer, address or unsubscribe line; it is added automatically after your text.
-- If the input has little information, write a shorter, more general but still honest email rather than guessing.
-
-OUTPUT
-Return only the JSON object with "subject" and "body". The body starts with the greeting ("Hi <first_name>,") and ends with the sign-off."""
-
-DEFAULT_EMAIL_PROMPT = """HOW TO WRITE IT
-1. Open with one specific, accurate observation about their business taken from the input (for example their opening hours, that patients book by phone, a service they offer, their branches, or their rating). Never open with "I hope this finds you well", "My name is" or praise that could apply to anyone.
-2. Connect it to one problem Ava (or the fitting service) solves: calls missed while the front desk is with patients, calls after hours or on days the clinic is closed, patients left on hold, no-shows and double bookings, or reception workload. Pick the one the facts support best, and present it as a likely possibility, not a claim about their clinic.
-3. Describe Ava, or the fitting service, in one or two plain sentences focused on what changes for them.
-4. End with one low-pressure call to action: invite them to hear Ava on the live demo at axioware.tech/dental-agent, or ask whether a 15-minute call next week would be useful. One call to action only.
-5. Sign off with the sender's name from sender.name and "Axioware" on the next line. If sender.name is empty, sign off as "The Axioware team".
-
-STYLE
-- 60 to 120 words in the body, in short paragraphs separated by blank lines. Plain text only: no markdown, bullet points, emojis, bold text or exclamation marks.
-- English, warm, professional and direct. Simple words; no jargon such as "leverage", "synergy", "revolutionize", "cutting-edge" or "game-changer".
-- Subject: 3 to 7 words, specific to them, in sentence case, mentioning the business name or a detail about it. No "Re:" or "Fwd:", no questions designed to trick, no all caps, no "free", "guaranteed" or "urgent"."""
-
-
-# Starting text for follow-up email prompts (sequence 1, 2, ...). The model also receives `follow_up` (its number and
-# whether the previous email was opened) and `previous_emails` (what we already sent this person).
-DEFAULT_FOLLOW_UP_PROMPT = """HOW TO WRITE THIS FOLLOW-UP
-This is a follow-up to emails we already sent this person; they are in previous_emails (oldest first), and
-follow_up says which follow-up this is and whether the previous email was opened.
-1. Do not repeat the previous email. Add one new, useful angle taken from the input: a different problem Ava (or the
-   fitting service) solves, or a fact about their business we did not use yet.
-2. Refer to the earlier email in a few words at most ("Following up on my note about missed calls"). Never guilt-trip,
-   never say "just checking in" or "bumping this".
-3. End with one simple call to action: the live demo at axioware.tech/dental-agent, or a yes/no question.
-4. Sign off as in the first email.
-
-STYLE
-- 40 to 80 words, short paragraphs, plain text, no exclamation marks.
-- Subject: a new, short subject (2 to 6 words) specific to them. No "Re:", "Fwd:" or "Following up"."""
-
-
-def compose_prompt(campaign_prompt: str, email_prompt: str) -> str:
-    return f"{campaign_prompt.strip()}\n\n{email_prompt.strip()}"
-
-
-SYSTEM_PROMPT = compose_prompt(DEFAULT_CAMPAIGN_PROMPT, DEFAULT_EMAIL_PROMPT)
-PROMPT_IS_PLACEHOLDER = False
+# The model's instructions are one email prompt (email_prompts table, edited in the admin), chosen per campaign, step and
+# A/B variation; it receives the JSON built by `prospect_context` as the user message. There is no built-in prompt.
 SENDER_NAME_ENV = "SMTP_FROM_NAME"  # name used in the sign-off; empty -> "The Axioware team"
 MAX_WEBSITE_FINDINGS = 12
 
@@ -298,15 +234,15 @@ def pick_email_prompt(prompts: list, variation: str | None, previous_opened: boo
 
 
 def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None, sequence: int = 0,
-                   previous_opened: bool | None = None) -> tuple[str, int | None] | None:
+                   previous_opened: bool | None = None) -> tuple[str, int] | None:
     """(system prompt, email prompt id) for one prospect and step (sequence 0 = the first email).
 
     A chosen email prompt wins. Otherwise the prompt comes from the campaign's prompt for that step and the
-    prospect's variation (see pick_email_prompt). For the first email a campaign without a matching prompt falls back
-    to the built-in prompt; for a follow-up with no prompt at all, None is returned (the follow-up is skipped).
+    prospect's variation (see pick_email_prompt). None when the campaign has no email prompt for the step: that email
+    is skipped.
     """
     if chosen is not None:
-        return chosen.full_prompt, chosen.pk
+        return chosen.prompt, chosen.pk
     cache = {} if cache is None else cache
     campaign_id = row.get("campaign_id")
     key = (campaign_id, sequence)
@@ -317,13 +253,14 @@ def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | N
         cache[key] = (campaign_prompt, prompts)
     campaign_prompt, prompts = cache[key]
     prompt = pick_email_prompt(prompts, row.get("variation"), previous_opened)
-    if prompt is not None:
-        return prompt.full_prompt, prompt.pk
-    if sequence > 0:
-        return None
-    if campaign_prompt is not None:
-        return compose_prompt(campaign_prompt.prompt, DEFAULT_EMAIL_PROMPT), None
-    return SYSTEM_PROMPT, None
+    return (prompt.prompt, prompt.pk) if prompt is not None else None
+
+
+def missing_prompt_reason(row: dict, sequence: int = 0) -> str:
+    step = "the first email" if sequence == 0 else f"follow-up {sequence}"
+    if not CampaignPrompt.objects.filter(campaign__id=row.get("campaign_id")).exists():
+        return f"its campaign has no campaign prompt, so no email prompt for {step}"
+    return f"its campaign prompt has no email prompt for {step} (add one with step {sequence})"
 
 
 def assign_variation(row: dict, save: bool = True) -> str:
@@ -345,7 +282,7 @@ def assign_variation(row: dict, save: bool = True) -> str:
     return variation
 
 
-def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str = SYSTEM_PROMPT) -> EmailDraft:
+def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str) -> EmailDraft:
     response_format = {
         "type": "json_schema",
         "json_schema": {"name": "outreach_email", "strict": True, "schema": EmailDraft.model_json_schema()},
@@ -353,18 +290,24 @@ def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str
     feedback = None
     for _ in range(MAX_ATTEMPTS):
         payload = {**context, "validation_feedback": feedback}
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0.7,
-            max_completion_tokens=MAX_COMPLETION_TOKENS,
-            response_format=response_format,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-        )
         try:
-            draft = EmailDraft.model_validate_json(response.choices[0].message.content or "")
+            response = client.chat.completions.create(
+                model=model,
+                temperature=0.7,
+                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                response_format=response_format,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+            )
+            content = response.choices[0].message.content or ""
+        except Exception as error:
+            content = rejected_output(error)  # the provider refused the answer's shape: check it here instead
+            if content is None:
+                raise
+        try:
+            draft = EmailDraft.model_validate_json(content)
         except ValidationError:
             feedback = "Return a JSON object with a non-empty subject and body."
             continue
@@ -409,9 +352,18 @@ PROSPECT_FIELDS = {
 
 def load_prospects(options: dict) -> list[dict]:
     """Ready prospects (deliverable, outreach_status ready, not do-not-contact) that need a first email, with the
-    facts the model may use. With `regenerate`, prospects whose email is in review or rejected are included too."""
+    facts the model may use. With `regenerate`, prospects whose email is in review or rejected are included too.
+
+    One person gets one email: several addresses of a contact can be deliverable (each checked guess is stored), so
+    only the contact's first ready address (candidate order: its own email, then the likeliest guesses) is used, and
+    none once any address of the contact has an email or is marked do-not-contact."""
+    ready = dict(email_status="deliverable", outreach_status="ready", do_not_contact=False)
+    same_contact = Prospect.objects.filter(contact_id=OuterRef("contact_id")).exclude(pk=OuterRef("pk"))
     queryset = (
-        Prospect.objects.filter(email_status="deliverable", outreach_status="ready", do_not_contact=False)
+        Prospect.objects.filter(**ready)
+        .exclude(Exists(Email.objects.filter(contact_id=OuterRef("contact_id")).exclude(prospect_id=OuterRef("pk"))))
+        .exclude(Exists(same_contact.filter(do_not_contact=True)))
+        .exclude(Exists(same_contact.filter(**ready, id__lt=OuterRef("pk"))))
         .annotate(step_email=FilteredRelation("emails", condition=Q(emails__sequence_step=SEQUENCE_STEP)))
         .order_by(F("qualification_score").desc(nulls_last=True), "id")
     )
@@ -507,8 +459,6 @@ def run(options: dict) -> int:
         if chosen is None:
             raise CommandError(f"Email prompt {options['email_prompt_id']} does not exist.")
         print(f"Using email prompt: {chosen}")
-    if PROMPT_IS_PLACEHOLDER:
-        print("Warning: the email prompt is still a placeholder (SYSTEM_PROMPT in pipeline/services/generation.py).")
     if FOOTER_IS_PLACEHOLDER:
         print("Warning: the email footer is still a placeholder (FOOTER_TEXT in pipeline/services/generation.py).")
     print(f"Using {provider} model {model}. Open tracking is " + ("on." if OPEN_TRACKING else "off (no image in emails)."))
@@ -520,10 +470,14 @@ def run(options: dict) -> int:
             return 0
 
         print(f"Generating emails for {len(queue)} prospect(s).")
-        created = failed = 0
+        created = failed = skipped = 0
         prompts: dict = {}
         for row in queue:
             token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
+            if resolve_prompt(row, chosen, prompts) is None:  # checked before a variation is given to the prospect
+                skipped += 1
+                print(f"  Prospect {row['prospect_id']} <{row['recipient']}> skipped: {missing_prompt_reason(row)}.")
+                continue
             assign_variation(row, save=not options["dry_run"])
             system_prompt, email_prompt_id = resolve_prompt(row, chosen, prompts)
             try:
@@ -541,8 +495,8 @@ def run(options: dict) -> int:
                 save_draft(row, draft, body_html, token, provider, model, datetime.now(timezone.utc), email_prompt_id)
             created += 1
         verb = "generated (dry run, not saved)" if options["dry_run"] else "saved for review"
-        print(f"Done: {created} email(s) {verb}, {failed} failed.")
-        return 1 if failed else 0
+        print(f"Done: {created} email(s) {verb}, {failed} failed" + (f", {skipped} skipped (no email prompt)." if skipped else "."))
+        return 1 if failed or skipped else 0
     except DatabaseError as error:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")
         print("Check DATABASE_URL and run `python manage.py migrate` first.")

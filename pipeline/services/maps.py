@@ -222,11 +222,36 @@ def wait_for_manual_consent(page, headed: bool) -> None:
         raise RuntimeError("Google consent was not completed; scraping stopped.")
 
 
+NAVIGATION_ATTEMPTS = 3  # Google sometimes drops the first connection of a fresh browser (net::ERR_CONNECTION_CLOSED)
+
+
+def open_page(page, url: str) -> None:
+    """page.goto, retrying network errors (net::ERR_...) a few times before giving up."""
+    for attempt in range(1, NAVIGATION_ATTEMPTS + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return
+        except PlaywrightError as error:
+            if "net::ERR_" not in str(error) or attempt == NAVIGATION_ATTEMPTS:
+                raise
+            print(f"  Network error opening Google Maps ({str(error).splitlines()[0][:80]}); retrying...", flush=True)
+            time.sleep(3 * attempt)
+
+
+def browser_hint(error: Exception) -> str | None:
+    """Advice for a browser error; only a missing browser is fixed by installing it."""
+    if "Executable doesn't exist" in str(error) or "playwright install" in str(error):
+        return "Install the browser with `python -m playwright install chromium`."
+    if "net::ERR_" in str(error):
+        return "Google Maps could not be reached (network error); run it again."
+    return None
+
+
 def collect_result_cards(
     page, query: str, requested: int, headed: bool
 ) -> list[dict[str, str | None]]:
     search_url = "https://www.google.com/maps/search/" + quote(query, safe="")
-    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+    open_page(page, search_url)
 
     wait_for_manual_consent(page, headed)
 
@@ -353,7 +378,7 @@ def locator_value(page, selector: str) -> str | None:
 def extract_business_details(
     page, card: dict[str, str | None], target_country: str | None, headed: bool
 ):
-    page.goto(card["url"], wait_until="domcontentloaded", timeout=60000)
+    open_page(page, card["url"])
     wait_for_manual_consent(page, headed)
 
     heading = page.locator("h1").first
@@ -632,8 +657,8 @@ def run(options: dict) -> int:
             except DatabaseError:
                 print("Could not persist the campaign's failed status.")
             print(f"Campaign {campaign['id']} failed ({type(error).__name__}): {error}")
-            if isinstance(error, PlaywrightError):
-                print("Install the browser with `python -m playwright install chromium`.")
+            if isinstance(error, PlaywrightError) and browser_hint(error):
+                print(browser_hint(error))
             return 1
         except BaseException:
             try:
@@ -795,7 +820,8 @@ def run_refresh(options: dict) -> int:
         return 1
     except PlaywrightError as error:
         print(f"Browser failed ({type(error).__name__}): {error}")
-        print("Install the browser with `python -m playwright install chromium`.")
+        if browser_hint(error):
+            print(browser_hint(error))
         return 1
     print(f"Done: {updated} business(es) updated, {failed} could not be read.")
     return 1 if failed else 0

@@ -119,7 +119,7 @@ class DueTests(FollowUpCase):
         self.assertEqual(self.followup_of(not_opened).email_prompt.name, "F1 A any")
         self.assertEqual(self.followup_of(opened).email_prompt.name, "F1 A opened")
         self.assertEqual(self.followup_of(other).email_prompt.name, "F1 default")
-        self.assertIn("RULES\n\nF1 A OPENED", self.llm.system_prompts)
+        self.assertIn("F1 A OPENED", self.llm.system_prompts)  # the email prompt alone
 
     def test_no_follow_up_after_a_reply_or_do_not_contact_or_twice(self):
         replied = self.sent_email()
@@ -272,11 +272,11 @@ class AdminAndApiTests(FollowUpCase):
 
     def test_email_prompt_form_rules(self):
         url = reverse("admin:pipeline_emailprompt_add")
-        base = {"campaign_prompt": self.campaign_prompt.pk, "variation": "b", "prompt": generation.DEFAULT_EMAIL_PROMPT}
+        base = {"campaign_prompt": self.campaign_prompt.pk, "variation": "b", "prompt": "My follow-up rules"}
         response = self.client.post(url, {**base, "name": "Bad", "sequence": "0", "opened": "true"})
         self.assertContains(response, "Only follow-ups")
         self.client.post(url, {**base, "name": "F3", "sequence": "3", "opened": "unknown"})
-        self.assertEqual(EmailPrompt.objects.get(name="F3").prompt, generation.DEFAULT_FOLLOW_UP_PROMPT)
+        self.assertEqual(EmailPrompt.objects.get(name="F3").prompt, "My follow-up rules")  # kept as written
 
     def test_email_list_filters_and_dashboard(self):
         first = self.sent_email()

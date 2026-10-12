@@ -64,11 +64,51 @@ class AgentCallTests(unittest.TestCase):
         for model in (r.DEFAULT_GROQ_MODEL, r.DEFAULT_OPENAI_MODEL):
             client = mock.Mock()
             client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=content))]
-            decision = research_business_websites.validate_agent_response(client, model, {"current_page_url": "https://x.com/"}, must_score=False)
+            decision = research_business_websites.validate_agent_response(client, model, {"current_page_url": "https://x.com/"}, must_score=False,
+                                                                               system_prompt="SYS")
             self.assertEqual((decision["action"], decision["qualification_score"]), ("SCORE", 72))
             kwargs = client.chat.completions.create.call_args.kwargs
             self.assertEqual(kwargs["model"], model)
             self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
+            self.assertEqual(kwargs["messages"][0]["content"], "SYS")
+
+    def test_answer_refused_by_groqs_schema_check_is_used_when_only_a_null_field_is_missing(self):
+        import httpx
+        from openai import BadRequestError
+
+        answer = ('{"action":"SCORE","url":null,"score":88,"reasons":["Books by phone"],"reasoning":"ok",'
+                  '"summary":"Dental clinic","relevant_findings":[]}')  # "reason" left out
+        body = {"error": {"code": "json_validate_failed", "failed_generation": answer}}
+        refused = BadRequestError("Generated JSON does not match the expected schema", body=body,
+                                  response=httpx.Response(400, request=httpx.Request("POST", "https://x")))
+        client = mock.Mock()
+        client.chat.completions.create.side_effect = refused
+        decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
+                                                                      must_score=False, system_prompt="SYS")
+        self.assertEqual((decision["action"], decision["qualification_score"]), ("SCORE", 88))
+        other = BadRequestError("bad key", body={"error": {"code": "invalid_api_key"}},
+                                response=httpx.Response(400, request=httpx.Request("POST", "https://x")))
+        client.chat.completions.create.side_effect = other
+        with self.assertRaises(BadRequestError):  # any other error still stops
+            research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
+                                                               must_score=False, system_prompt="SYS")
+
+    def test_agent_that_cannot_pick_a_page_scores_from_what_it_read(self):
+        page = mock.Mock()
+        extracted = {"url": "https://x.com/", "content": "Dental clinic", "links": [], "emails": []}
+        scored = {"action": "SCORE", "summary": "s", "relevant_findings": [], "qualification_score": 70,
+                  "qualification_reasons": ["r"], "agent_reasoning": "based on incomplete information"}
+        with mock.patch.object(research_business_websites, "extract_page", return_value=extracted), \
+                mock.patch.object(research_business_websites, "validate_agent_response",
+                                  side_effect=[research_business_websites.ResearchError("no valid URL"), scored]) as agent:
+            result = research_business_websites.research_business(
+                mock.Mock(), "m", page, {"website_url": "https://x.com", "qualification_prompt": "CRITERIA"}, None)
+        self.assertEqual((result["action"], result["qualification_score"], result["pages_scraped"]), ("SCORE", 70, 1))
+        retry = agent.call_args_list[1]
+        self.assertTrue(retry.args[3])  # must score now
+        self.assertEqual(retry.kwargs["score_note"], "no further useful page could be chosen")
+        self.assertNotIn("qualification_prompt", retry.args[2]["business"])  # the criteria are in the system prompt only
+        self.assertTrue(retry.args[4].endswith("QUALIFICATION CRITERIA\nCRITERIA"))
 
 
 if __name__ == "__main__":
@@ -89,5 +129,8 @@ class PromptSizeTests(unittest.TestCase):
             self.assertNotIn(private, payload)
         self.assertEqual(len(payload["available_links"]), research_business_websites.MAX_PROMPT_LINKS)
         self.assertEqual(set(payload["available_links"][0]), {"url", "text"})
-        size = len(json.dumps(payload)) + len(research_business_websites.SYSTEM_PROMPT)
+        from pipeline.migrations._prompt_texts import QUALIFICATION_PROMPT
+
+        system_prompt = research_business_websites.research_prompt(QUALIFICATION_PROMPT)
+        size = len(json.dumps(payload)) + len(system_prompt)
         self.assertLess(size / 3.5, 7000)  # tokens, with margin under Groq's 8,000 per minute

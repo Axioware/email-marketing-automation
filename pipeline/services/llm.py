@@ -5,7 +5,7 @@ OpenAI-compatible API, so the OpenAI SDK is used for both.
 """
 import os
 
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"  # supports the strict JSON-schema responses the pipeline requires
@@ -27,3 +27,16 @@ def make_llm_client() -> tuple[OpenAI, str, str] | None:
         model = os.environ.get("OPENAI_MODEL", "").strip() or DEFAULT_OPENAI_MODEL
         return OpenAI(api_key=openai_key), model, "openai"
     return None
+
+
+def rejected_output(error: Exception) -> str | None:
+    """The model's answer when the provider refused it for not matching the JSON schema (Groq checks strict schemas
+    itself and answers 400 json_validate_failed, with the answer in failed_generation); None for any other error."""
+    if not isinstance(error, BadRequestError):
+        return None
+    body = error.body if isinstance(error.body, dict) else {}
+    body = body.get("error", body) if isinstance(body.get("error", body), dict) else body
+    if body.get("code") != "json_validate_failed":
+        return None
+    output = body.get("failed_generation")
+    return output if isinstance(output, str) else ""

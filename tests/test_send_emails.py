@@ -2,13 +2,15 @@ import os
 import smtplib
 import time
 import uuid
+from datetime import datetime, time as time_of_day, timedelta, timezone
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from django.db import connection
 from django.test import TestCase
 import unittest
 
-from pipeline.models import Email, Prospect
+from pipeline.models import DiscoveryCampaign, Email, Prospect
 from pipeline.services import generation as g
 from pipeline.services import sending as s
 from tests.fake_smtp import FakeSmtpServer
@@ -267,3 +269,140 @@ class SendEndToEndTests(SendCase, TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertGreaterEqual(time.monotonic() - started, 1.5)
         self.assertEqual(len(self.smtp.messages), 2)
+
+
+KARACHI = ZoneInfo("Asia/Karachi")
+
+
+def karachi(day, hour, minute=0):
+    return datetime(2026, 10, day, hour, minute, tzinfo=KARACHI)
+
+
+class SendWindowTests(SendCase, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.campaign.send_window_start, self.campaign.send_window_end = time_of_day(9), time_of_day(20)
+        self.campaign.save()
+
+    def slots(self, now, save=True):
+        plan = s.plan_schedule(now, save=save)
+        return [plan[pk].astimezone(KARACHI) for pk in sorted(plan)]
+
+    def test_window_helpers(self):
+        self.assertEqual(s.window_bounds(time_of_day(9), time_of_day(20), "Asia/Karachi", karachi(12, 8)),
+                         (karachi(12, 9), karachi(12, 20)))
+        self.assertEqual(s.window_bounds(time_of_day(9), time_of_day(20), "Asia/Karachi", karachi(12, 20)),
+                         (karachi(13, 9), karachi(13, 20)))  # today's window is over: tomorrow's
+        self.assertEqual(s.spread(4, karachi(12, 9), karachi(12, 20)),
+                         [karachi(12, 9), karachi(12, 11, 45), karachi(12, 14, 30), karachi(12, 17, 15)])
+
+    def test_emails_are_spread_evenly_and_newcomers_share_what_is_left(self):
+        ids = [self.draft(f"p{i}@x.org") for i in range(4)]
+        self.assertEqual(self.slots(karachi(12, 8)),
+                         [karachi(12, 9), karachi(12, 11, 45), karachi(12, 14, 30), karachi(12, 17, 15)])
+        self.assertEqual(self.slots(karachi(12, 8)), self.slots(karachi(12, 8)))  # stable: nothing new, nothing moves
+        Email.objects.filter(pk=ids[0]).update(status="sent")  # the 09:00 one went out
+        late = self.draft("late@x.org")  # approved at noon
+        plan = s.plan_schedule(karachi(12, 12))
+        self.assertEqual(plan[ids[1]].astimezone(KARACHI), karachi(12, 11, 45))  # due, waiting for the next run
+        # the ones still waiting (14:30, 17:15) and the newcomer split 12:00 - 20:00
+        self.assertEqual([plan[pk].astimezone(KARACHI) for pk in (ids[2], ids[3], late)],
+                         [karachi(12, 12), karachi(12, 14, 40), karachi(12, 17, 20)])
+
+    def test_emails_missed_after_the_window_wait_for_the_next_one(self):
+        first, second = self.draft("a@x.org"), self.draft("b@x.org")
+        s.plan_schedule(karachi(12, 19))
+        plan = s.plan_schedule(karachi(12, 21))  # sending did not run before 20:00
+        self.assertEqual([plan[first].astimezone(KARACHI), plan[second].astimezone(KARACHI)],
+                         [karachi(13, 9), karachi(13, 14, 30)])
+
+    def test_follow_up_window_and_no_window(self):
+        first = self.draft("a@x.org")
+        follow = Email.objects.get(pk=self.draft("b@x.org"))
+        follow.sequence_step = 2
+        follow.save()
+        Prospect.objects.filter(pk=follow.prospect_id).update(outreach_status="contacted")
+        self.campaign.follow_ups.create(sequence=1, days_after_previous=3, send_window_start=time_of_day(14),
+                                        send_window_end=time_of_day(16))
+        plan = s.plan_schedule(karachi(12, 8))
+        self.assertEqual(plan[first].astimezone(KARACHI), karachi(12, 9))
+        self.assertEqual(plan[follow.pk].astimezone(KARACHI), karachi(12, 14))  # the follow-up's own window
+        open_campaign = make_campaign(name="Any time")
+        self.campaign = open_campaign
+        anytime = self.draft("c@x.org")
+        self.assertEqual(s.plan_schedule(karachi(12, 3))[anytime], karachi(12, 3))  # no window: due now
+
+    def test_send_sends_only_due_emails_and_email_id_sends_now(self):
+        now = datetime.now(timezone.utc)
+        local = now.astimezone(KARACHI)
+        start = (local - timedelta(minutes=1)).time().replace(second=0, microsecond=0)
+        end = (local + timedelta(hours=2)).time().replace(second=0, microsecond=0)
+        if end <= start:
+            self.skipTest("the test window would cross midnight")
+        self.campaign.send_window_start, self.campaign.send_window_end = start, end
+        self.campaign.save()
+        first, second = self.draft("a@x.org"), self.draft("b@x.org")
+        preview = run_command("send_emails", "--delay", "0", env=self.smtp_env())
+        self.assertIn("1 approved email(s) are scheduled in their send window", preview.stdout)
+        self.assertIsNone(self.row(first)["scheduled_at"])  # a preview saves nothing
+        result = run_command("send_emails", "--send", "--delay", "0", env=self.smtp_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.row(first)["status"], self.row(second)["status"]), ("sent", "approved"))
+        self.assertIsNotNone(self.row(second)["scheduled_at"])
+        self.assertIn("No approved emails are due to send now",
+                      run_command("send_emails", "--send", "--delay", "0", env=self.smtp_env()).stdout)
+        run_command("send_emails", "--send", "--delay", "0", "--email-id", second, env=self.smtp_env())
+        self.assertEqual(self.row(second)["status"], "sent")  # chosen by id: sent now
+
+    def test_approving_again_clears_the_old_send_time(self):
+        from pipeline import review
+
+        pk = self.draft("a@x.org")
+        s.plan_schedule(karachi(12, 8))
+        email = Email.objects.get(pk=pk)
+        review.reopen(email)
+        review.approve(Email.objects.get(pk=pk))
+        self.assertIsNone(self.row(pk)["scheduled_at"])
+
+    def test_window_validation(self):
+        from django.core.exceptions import ValidationError
+
+        self.campaign.send_window_end = time_of_day(8)
+        with self.assertRaises(ValidationError):
+            self.campaign.clean()
+        self.campaign.send_window_end, self.campaign.send_timezone = None, "Asia/Karachi"
+        with self.assertRaises(ValidationError):
+            self.campaign.clean()  # only one of the two times
+        self.campaign.send_window_end, self.campaign.send_timezone = time_of_day(20), "Mars/Base"
+        with self.assertRaises(ValidationError):
+            self.campaign.clean()
+
+    def test_api_and_admin_take_send_windows(self):
+        from django.contrib.auth import get_user_model
+        from django.test import override_settings
+        from django.urls import reverse
+        from rest_framework.test import APIClient
+
+        from tests.support import CAMPAIGN_INLINE
+
+        api = APIClient()
+        api.credentials(HTTP_AUTH="window-key")
+        with override_settings(AUTH_TOKEN="window-key"):
+            bad = api.post("/api/campaigns/", {"name": "Bad", "send_window_start": "20:00", "send_window_end": "09:00"},
+                           format="json")
+            self.assertEqual(bad.status_code, 400)
+            self.assertIn("send_window_end", bad.json())
+            good = api.post("/api/campaigns/", {"name": "Good", "send_window_start": "09:00", "send_window_end": "20:00"},
+                            format="json")
+            self.assertEqual(good.status_code, 201, good.content)
+            self.assertEqual((good.json()["send_window_start"], good.json()["send_timezone"]), ("09:00:00", "Asia/Karachi"))
+            half = api.post("/api/follow-ups/", {"campaign": good.json()["id"], "sequence": 1, "send_window_start": "10:00"},
+                            format="json")
+            self.assertEqual(half.status_code, 400)
+        self.client.force_login(get_user_model().objects.create_superuser("w", "w@example.org", "pw"))
+        url = reverse("admin:pipeline_discoverycampaign_add")
+        response = self.client.post(url, {**CAMPAIGN_INLINE, "name": "Admin", "send_window_start": "18:00",
+                                          "send_window_end": "10:00"})
+        self.assertContains(response, "The end must be later than the start")
+        self.client.post(url, {**CAMPAIGN_INLINE, "name": "Admin", "send_window_start": "09:00", "send_window_end": "20:00"})
+        self.assertEqual(str(DiscoveryCampaign.objects.get(name="Admin").send_window_end), "20:00:00")

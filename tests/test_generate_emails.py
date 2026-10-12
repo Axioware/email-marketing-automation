@@ -12,6 +12,7 @@ from django.db import IntegrityError, connection, connections, transaction
 from django.test import TestCase, TransactionTestCase
 
 from pipeline.models import BusinessWebsiteProfile, Email, EmailOpenEvent, Prospect
+from pipeline.migrations import _prompt_texts as prompt_texts
 from pipeline.services import generation as g
 from tests.support import ROOT, make_business, make_campaign, make_contact, run_command
 
@@ -73,12 +74,16 @@ class RenderTests(unittest.TestCase):
         self.assertIn('src="' + BASE + '/a&quot;b"', out)
 
 
+# The Axioware email prompt the migrations seed (0006 + 0008 join the two parts into one email prompt).
+SEEDED_EMAIL_PROMPT = f"{prompt_texts.OLD_CAMPAIGN_PROMPT.strip()}\n\n{prompt_texts.OLD_EMAIL_PROMPT.strip()}"
+
+
 class PromptAndContextTests(unittest.TestCase):
-    def test_prompt_is_the_real_axioware_prompt(self):
-        self.assertFalse(g.PROMPT_IS_PLACEHOLDER)
-        self.assertNotIn("PLACEHOLDER", g.SYSTEM_PROMPT)
+    def test_seeded_prompt_is_the_real_axioware_prompt(self):
+        self.assertFalse(hasattr(g, "SYSTEM_PROMPT"))  # no built-in prompt: every prompt comes from the database
+        self.assertNotIn("PLACEHOLDER", SEEDED_EMAIL_PROMPT)
         for must in ("Axioware", "Ava", "axioware.tech/dental-agent", "Never invent", "first_name", "website_findings"):
-            self.assertIn(must, g.SYSTEM_PROMPT)
+            self.assertIn(must, SEEDED_EMAIL_PROMPT)
 
     def test_prompt_mentions_every_context_field(self):
         row = {"business_name": "B", "category": None, "city": None, "country": None, "website_url": None,
@@ -86,7 +91,7 @@ class PromptAndContextTests(unittest.TestCase):
                "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
                "outreach_facts": [], "research_summary": None, "scraped_pages": []}
         for key in g.prospect_context(row):
-            self.assertIn(key, g.SYSTEM_PROMPT, key)
+            self.assertIn(key, SEEDED_EMAIL_PROMPT, key)
 
     def test_website_findings_keep_business_facts_only(self):
         pages = [
@@ -137,17 +142,17 @@ class GenerationTests(unittest.TestCase):
 
     def test_valid_output(self):
         client = fake_completion(['{"subject": "  Hello   there ", "body": "Body text\\n"}'])
-        draft = g.generate_draft(client, "m", self.CONTEXT)
+        draft = g.generate_draft(client, "m", self.CONTEXT, "RULES")
         self.assertEqual((draft.subject, draft.body), ("Hello there", "Body text"))
         kwargs = client.chat.completions.create.call_args.kwargs
         self.assertEqual(kwargs["model"], "m")
         self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
-        self.assertEqual(kwargs["messages"][0]["content"], g.SYSTEM_PROMPT)
+        self.assertEqual(kwargs["messages"][0]["content"], "RULES")
         self.assertEqual(json.loads(kwargs["messages"][1]["content"])["business"]["name"], "Smile Solutions")
 
     def test_retries_with_feedback_then_succeeds(self):
         client = fake_completion(["not json", '{"subject": "S", "body": "B"}'])
-        self.assertEqual(g.generate_draft(client, "m", self.CONTEXT).subject, "S")
+        self.assertEqual(g.generate_draft(client, "m", self.CONTEXT, "RULES").subject, "S")
         second = json.loads(client.chat.completions.create.call_args_list[1].kwargs["messages"][1]["content"])
         self.assertIn("subject", second["validation_feedback"])
 
@@ -155,11 +160,11 @@ class GenerationTests(unittest.TestCase):
         for bad in ('{"subject": "   ", "body": "B"}', '{"subject": "S", "body": "  "}',
                     json.dumps({"subject": "x" * 300, "body": "B"}), json.dumps({"subject": "S", "body": "b" * 6000})):
             with self.assertRaises(g.GenerationError, msg=bad):
-                g.generate_draft(fake_completion([bad] * 3), "m", self.CONTEXT)
+                g.generate_draft(fake_completion([bad] * 3), "m", self.CONTEXT, "RULES")
 
     def test_extra_fields_are_rejected(self):
         with self.assertRaises(g.GenerationError):
-            g.generate_draft(fake_completion(['{"subject": "S", "body": "B", "to": "x@y.z"}'] * 3), "m", self.CONTEXT)
+            g.generate_draft(fake_completion(['{"subject": "S", "body": "B", "to": "x@y.z"}'] * 3), "m", self.CONTEXT, "RULES")
 
     def test_context_has_no_email_addresses(self):
         row = {"business_name": "B", "category": "Dentist", "city": "Lahore", "country": "PK", "website_url": "http://b.pk",
@@ -293,6 +298,16 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         self.assertNotEqual(rows[p1]["tracking_token"], rows[p2]["tracking_token"])
         self.assertNotIn("prompt is still a placeholder", out)
         self.assertIn("2 email(s) saved for review", out)
+
+    def test_one_email_per_person_even_with_several_deliverable_addresses(self):
+        first = self.prospect(1, "ali@b1.org")
+        self.prospect(1, "a.khan@b1.org")  # another deliverable guess for the same contact
+        self.prospect(2, "x@b2.org")
+        stopped = self.prospect(2, "y@b2.org")
+        Prospect.objects.filter(pk=stopped).update(do_not_contact=True)  # they asked not to be contacted
+        self.run_cli(expect=0)
+        self.assertEqual([row["prospect_id"] for row in self.emails()], [first])
+        self.assertIn("No prospects need an email", self.run_cli(expect=0).stdout)  # the other address never gets one
 
     def test_ineligible_prospects_are_skipped(self):
         self.prospect(1, "a@b1.org", email_status="undeliverable")

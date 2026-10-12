@@ -117,7 +117,8 @@ def save_edit(email: Email, subject: str, body: str) -> str:
 def approve(email: Email) -> str:
     if has_placeholder(email):
         raise ReviewError("This email still contains placeholder text; edit it first.")
-    if not _transition(email.pk, ("in_review",), status="approved", reviewed_at=_now(), review_note=None):
+    if not _transition(email.pk, ("in_review",), status="approved", reviewed_at=_now(), review_note=None,
+                       scheduled_at=None):  # its send time is set by the next sending run
         raise ReviewError("Only emails in review can be approved.")
     return "Approved."
 
@@ -159,7 +160,10 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
         raise ReviewError("The prospect is no longer ready for outreach (check its status).")
     row = rows[0]
     generation.assign_variation(row)
-    system_prompt, email_prompt_id = generation.resolve_prompt(row, email_prompt or email.email_prompt)
+    resolved = generation.resolve_prompt(row, email_prompt or email.email_prompt)
+    if resolved is None:
+        raise ReviewError(f"Cannot regenerate: {generation.missing_prompt_reason(row)}.")
+    system_prompt, email_prompt_id = resolved
     try:
         draft = generation.generate_draft(client, model, generation.prospect_context(row), system_prompt)
     except Exception as error:  # noqa: BLE001 - show any model/API failure to the reviewer

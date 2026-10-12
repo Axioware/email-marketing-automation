@@ -9,7 +9,8 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from pipeline.models import CampaignPrompt, DiscoveryCampaign, Email, EmailPrompt, PipelineRun
-from pipeline.services import generation as g
+from pipeline.migrations import _prompt_texts as prompt_texts
+from pipeline.services import research
 from tests.fake_smtp import FakeSmtpServer
 from tests.support import CAMPAIGN_INLINE, make_business, make_campaign, make_email, review_env, run_command
 from tests.test_generate_emails import FakeLLM
@@ -46,10 +47,14 @@ class PromptCase(TestCase):
 
 class ModelTests(PromptCase):
     def test_seeded_axioware_prompts(self):
+        """The migrations leave the qualification criteria in the campaign prompt and the whole email text (what the
+        model received before 0008) in the email prompt."""
         seeded = CampaignPrompt.objects.get(name="Axioware - dental clinics")
-        self.assertEqual(seeded.prompt, g.DEFAULT_CAMPAIGN_PROMPT)
-        self.assertEqual(seeded.default_email_prompt().prompt, g.DEFAULT_EMAIL_PROMPT)
-        self.assertEqual(seeded.default_email_prompt().full_prompt, g.SYSTEM_PROMPT)
+        self.assertEqual(seeded.prompt, prompt_texts.QUALIFICATION_PROMPT)
+        self.assertIn("SCORING", seeded.full_prompt)
+        self.assertTrue(seeded.full_prompt.startswith(research.AGENT_INSTRUCTIONS))
+        self.assertEqual(seeded.default_email_prompt().prompt,
+                         f"{prompt_texts.OLD_CAMPAIGN_PROMPT.strip()}\n\n{prompt_texts.OLD_EMAIL_PROMPT.strip()}")
 
     def test_one_default_email_prompt_per_campaign_prompt(self):
         campaign_prompt, first, follow = self.prompt_set()
@@ -89,7 +94,7 @@ class GenerationTests(PromptCase):
         prospect = self.ready_prospect(campaign)
         result = self.generate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.llm.system_prompts[-1], "CAMPAIGN RULES Dental\n\nFIRST TOUCH Dental")
+        self.assertEqual(self.llm.system_prompts[-1], "FIRST TOUCH Dental")  # the email prompt alone
         self.assertEqual(Email.objects.get(prospect=prospect).email_prompt, first)
 
     def test_chosen_email_prompt_wins(self):
@@ -98,22 +103,31 @@ class GenerationTests(PromptCase):
         prospect = self.ready_prospect(campaign)
         result = self.generate("--email-prompt-id", follow.pk)
         self.assertIn("Using email prompt: Dental / Follow-up", result.stdout)
-        self.assertEqual(self.llm.system_prompts[-1], "CAMPAIGN RULES Dental\n\nFOLLOW UP Dental")
+        self.assertEqual(self.llm.system_prompts[-1], "FOLLOW UP Dental")
         self.assertEqual(Email.objects.get(prospect=prospect).email_prompt, follow)
 
-    def test_campaign_without_a_prompt_uses_the_built_in_one(self):
-        prospect = self.ready_prospect()
-        self.generate()
-        self.assertEqual(self.llm.system_prompts[-1], g.SYSTEM_PROMPT)
-        self.assertIsNone(Email.objects.get(prospect=prospect).email_prompt)
+    def test_campaign_without_a_prompt_is_skipped(self):
+        prospect = self.ready_prospect(make_campaign(campaign_prompt=None))
+        result = self.generate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"Prospect {prospect.pk} <{prospect.email}> skipped: its campaign has no campaign prompt", result.stdout)
+        self.assertIn("1 skipped (no email prompt)", result.stdout)
+        self.assertEqual(self.llm.system_prompts, [])
+        self.assertFalse(Email.objects.filter(prospect=prospect).exists())
+        prospect.refresh_from_db()
+        self.assertIsNone(prospect.variation)  # no A/B group until it can get an email
 
-    def test_campaign_prompt_without_email_prompts_adds_the_built_in_email_part(self):
-        campaign = make_campaign()
-        campaign.campaign_prompt = CampaignPrompt.objects.create(name="Bare", prompt="BARE RULES")
-        campaign.save()
-        self.ready_prospect(campaign)
-        self.generate()
-        self.assertEqual(self.llm.system_prompts[-1], g.compose_prompt("BARE RULES", g.DEFAULT_EMAIL_PROMPT))
+    def test_campaign_prompt_without_a_first_email_prompt_is_skipped(self):
+        campaign = make_campaign(campaign_prompt=CampaignPrompt.objects.create(name="Bare", prompt="CRITERIA"))
+        EmailPrompt.objects.create(campaign_prompt=campaign.campaign_prompt, name="F1", sequence=1, prompt="x")
+        prospect = self.ready_prospect(campaign)
+        result = self.generate()
+        self.assertIn("its campaign prompt has no email prompt for the first email (add one with step 0)", result.stdout)
+        self.assertEqual(self.llm.system_prompts, [])
+        self.assertFalse(Email.objects.filter(prospect=prospect).exists())
+        email = make_email(campaign=campaign)  # regenerating says why too
+        response = self.client.post(reverse("admin:pipeline_email_regenerate", args=[email.pk]), follow=True)
+        self.assertContains(response, "Cannot regenerate: its campaign prompt has no email prompt for the first email")
 
     def test_each_campaign_uses_its_own_prompt(self):
         first_campaign, second_campaign = make_campaign(name="One"), make_campaign(name="Two")
@@ -122,8 +136,7 @@ class GenerationTests(PromptCase):
         self.ready_prospect(first_campaign)
         self.ready_prospect(second_campaign)
         self.generate()
-        self.assertEqual(sorted(self.llm.system_prompts),
-                         ["CAMPAIGN RULES One\n\nFIRST TOUCH One", "CAMPAIGN RULES Two\n\nFIRST TOUCH Two"])
+        self.assertEqual(sorted(self.llm.system_prompts), ["FIRST TOUCH One", "FIRST TOUCH Two"])
 
     def test_unknown_email_prompt_is_refused(self):
         result = self.generate("--email-prompt-id", 999999)
@@ -136,9 +149,9 @@ class GenerationTests(PromptCase):
         Email.objects.filter(pk=email.pk).update(email_prompt=follow)
         url = reverse("admin:pipeline_email_regenerate", args=[email.pk])
         self.client.post(url)
-        self.assertEqual(self.llm.system_prompts[-1], "CAMPAIGN RULES Dental\n\nFOLLOW UP Dental")
+        self.assertEqual(self.llm.system_prompts[-1], "FOLLOW UP Dental")
         self.client.post(url, {"email_prompt": first.pk})
-        self.assertEqual(self.llm.system_prompts[-1], "CAMPAIGN RULES Dental\n\nFIRST TOUCH Dental")
+        self.assertEqual(self.llm.system_prompts[-1], "FIRST TOUCH Dental")
         self.assertEqual(Email.objects.get(pk=email.pk).email_prompt, first)
         page = self.client.get(reverse("admin:pipeline_email_change", args=[email.pk])).content.decode()
         self.assertIn('name="email_prompt"', page)
@@ -171,14 +184,27 @@ class CampaignAdminTests(PromptCase):
         self.assertFalse(DiscoveryCampaign.objects.filter(name="Steals").exists())
         self.assertContains(response, "Select a valid choice")
 
-    def test_new_campaign_prompt_starts_from_the_built_in_text_and_gets_an_email_prompt(self):
+    def test_new_prompts_start_empty_and_a_missing_first_email_prompt_is_flagged(self):
         url = reverse("admin:pipeline_campaignprompt_add")
-        self.assertEqual(self.client.get(url).context["adminform"].form.initial["prompt"], g.DEFAULT_CAMPAIGN_PROMPT)
-        data = {"name": "Gyms", "prompt": "We sell to gyms.", "email_prompts-TOTAL_FORMS": "0",
+        self.assertNotIn("prompt", self.client.get(url).context["adminform"].form.initial)  # nothing built in
+        self.assertNotIn("prompt", self.client.get(reverse("admin:pipeline_emailprompt_add")).context["adminform"].form.initial)
+        data = {"name": "Gyms", "prompt": "Gyms with 200+ members score high.", "email_prompts-TOTAL_FORMS": "0",
                 "email_prompts-INITIAL_FORMS": "0", "email_prompts-MIN_NUM_FORMS": "0", "email_prompts-MAX_NUM_FORMS": "1000"}
-        self.client.post(url, data)
+        response = self.client.post(url, data, follow=True)
         created = CampaignPrompt.objects.get(name="Gyms")
-        self.assertEqual(created.default_email_prompt().prompt, g.DEFAULT_EMAIL_PROMPT)
+        self.assertFalse(created.email_prompts.exists())  # nothing is added for you
+        self.assertContains(response, "has no email prompt for the first email (step 0) yet")
+
+    def test_campaign_page_warns_about_missing_prompts(self):
+        bare = make_campaign(name="Bare", campaign_prompt=None)
+        page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[bare.pk]))
+        self.assertContains(page, "This campaign has no campaign prompt: its businesses will not be researched")
+        no_first = make_campaign(name="No first", campaign_prompt=CampaignPrompt.objects.create(name="C", prompt="x"))
+        page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[no_first.pk]))
+        self.assertContains(page, "no email prompt for the first email (step 0)")
+        fine = make_campaign(name="Fine")
+        page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[fine.pk]))
+        self.assertNotContains(page, "no email prompt")
 
     def test_prompt_pages(self):
         campaign_prompt, first, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
@@ -188,8 +214,11 @@ class CampaignAdminTests(PromptCase):
                     reverse("admin:pipeline_emailprompt_change", args=[first.pk]),
                     reverse("admin:pipeline_emailprompt_add")):
             self.assertEqual(self.client.get(url).status_code, 200, url)
+        detail = self.client.get(reverse("admin:pipeline_campaignprompt_change", args=[campaign_prompt.pk])).content.decode()
+        self.assertIn("What the research agent receives", detail)  # agent instructions + the criteria
+        self.assertIn("QUALIFICATION CRITERIA\nCAMPAIGN RULES Dental", detail)
         detail = self.client.get(reverse("admin:pipeline_emailprompt_change", args=[first.pk])).content.decode()
-        self.assertIn("CAMPAIGN RULES Dental", detail)  # the full prompt preview
+        self.assertNotIn("CAMPAIGN RULES Dental", detail)  # the email prompt is used on its own
 
 
 class GeneratePageTests(PromptCase):
@@ -264,16 +293,21 @@ class PromptApiTests(PromptCase):
         self.api.credentials(HTTP_AUTH=KEY)
 
     def test_crud_and_campaign_link(self):
-        response = self.api.post("/api/campaign-prompts/", {"name": "Spas", "prompt": "We sell to spas."}, format="json")
+        response = self.api.post("/api/campaign-prompts/", {"name": "Spas", "prompt": "Day spas score high."}, format="json")
         self.assertEqual(response.status_code, 201, response.content)
         created = response.json()
-        self.assertEqual([p["name"] for p in created["email_prompts"]], ["First-touch email"])
+        self.assertEqual(created["email_prompts"], [])  # nothing built in
+        self.assertTrue(created["full_prompt"].endswith("QUALIFICATION CRITERIA\nDay spas score high."))
+        first = self.api.post("/api/email-prompts/", {"campaign_prompt": created["id"], "name": "First",
+                                                       "prompt": "Write to spas."}, format="json")
+        self.assertEqual(first.status_code, 201, first.content)
+        self.assertNotIn("full_prompt", first.json())
         follow = self.api.post("/api/email-prompts/", {"campaign_prompt": created["id"], "name": "Follow-up",
                                                         "sequence": 1, "prompt": "Short follow-up."}, format="json").json()
         duplicate = self.api.post("/api/email-prompts/", {"campaign_prompt": created["id"], "name": "Another first",
                                                            "prompt": "x"}, format="json")
         self.assertEqual(duplicate.status_code, 400)  # step 0, variation a, opened any already exists
-        self.assertEqual(follow["full_prompt"], "We sell to spas.\n\nShort follow-up.")
+        self.assertEqual(follow["prompt"], "Short follow-up.")
         campaign = self.api.post("/api/campaigns/", {"name": "Spa campaign", "campaign_prompt": created["id"]},
                                  format="json")
         self.assertEqual(campaign.status_code, 201, campaign.content)

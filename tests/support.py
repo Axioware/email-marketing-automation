@@ -33,8 +33,26 @@ def run_command(name: str, *args, env: dict | None = None) -> Result:
     return Result(code, out.getvalue(), err.getvalue())
 
 
-def make_campaign(**fields) -> DiscoveryCampaign:
-    return DiscoveryCampaign.objects.create(**{"name": "test", **fields})
+QUALIFICATION_PROMPT = "TEST CRITERIA: appointment-based clinics that book by phone score high."
+EMAIL_PROMPT = "TEST EMAIL RULES: write a short first-touch email; return subject and body."
+_unset = object()
+
+
+def make_prompts(name=None, qualification=QUALIFICATION_PROMPT, email=EMAIL_PROMPT):
+    """A campaign prompt with one default first-email prompt."""
+    from pipeline.models import CampaignPrompt, EmailPrompt
+
+    campaign_prompt = CampaignPrompt.objects.create(name=name or f"Prompts {CampaignPrompt.objects.count() + 1}",
+                                                    prompt=qualification)
+    EmailPrompt.objects.create(campaign_prompt=campaign_prompt, name="First email", prompt=email, is_default=True)
+    return campaign_prompt
+
+
+def make_campaign(campaign_prompt=_unset, **fields) -> DiscoveryCampaign:
+    """A campaign with its own campaign prompt and first-email prompt (pass campaign_prompt=None for none)."""
+    if campaign_prompt is _unset:
+        campaign_prompt = make_prompts()
+    return DiscoveryCampaign.objects.create(**{"name": "test", "campaign_prompt": campaign_prompt, **fields})
 
 
 def make_business(campaign=None, name="Business", score=None, **fields) -> Business:

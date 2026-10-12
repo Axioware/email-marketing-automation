@@ -875,6 +875,7 @@ def crawl_site(driver, business: dict, evidence: Evidence, roles: RoleConfig, ma
     """Waterfall step 2: render the site's team/about/contact pages in Firefox and read what a visitor sees."""
     base_host = host_of(business.get("website_url")) or ""
     rendered = 0
+    read = set()  # final pages already read: a common path (e.g. /about) often redirects to one read before
     for url in choose_site_pages(business, max_pages):
         if evidence.has_target():
             break
@@ -884,6 +885,9 @@ def crawl_site(driver, business: dict, evidence: Evidence, roles: RoleConfig, ma
             driver.get(url)
             if not same_site(driver.current_url, base_host) or not is_public_http_url(driver.current_url):
                 continue  # redirected off the business's site, or to a non-public address
+            if page_identity(driver.current_url) in read:
+                continue
+            read.add(page_identity(driver.current_url))
             time.sleep(RENDER_SETTLE_SECONDS)
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1)

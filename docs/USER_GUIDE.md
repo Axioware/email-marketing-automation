@@ -64,7 +64,8 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Target country**: one country, e.g. Pakistan.
    - **Target locations**: cities or areas, separated by commas, e.g. `Lahore, DHA, Gulberg`.
    - **Search terms**: what you would type into Google Maps, separated by commas, e.g. `dental clinic, dentist`.
-   - **Campaign prompt** (under Emails): the instructions the AI follows when writing this campaign's emails. Pick one from the list, or click **+** to write a new one. Each prompt belongs to one campaign. Leave it empty to use the built-in Axioware prompt. See [Prompts](#prompts).
+   - **Send window** (under Sending, optional): e.g. **09:00** to **20:00**, with the **time zone** (default Asia/Karachi). Approved emails go out between these times, spread evenly; see [Send windows](#send-windows). Leave empty to send as soon as sending runs.
+   - **Campaign prompt** (under Prompts): what makes a good prospect for this campaign. The AI scores each business's website against it, and its email prompts write the campaign's emails. Pick one from the list, or click **+** to write a new one. Each prompt belongs to one campaign. **Without one, the campaign's businesses are not researched and no emails are written**; the campaign page warns you. See [Prompts](#prompts).
 3. Click **Save**.
 
 Every search term is searched in every location, so 2 terms and 3 locations means 6 searches. The campaign's **Status** (Pending, Running, Completed, Failed) is set automatically when businesses are fetched; you cannot edit it.
@@ -91,7 +92,7 @@ On **Businesses**, click one of the **quick filter boxes** above the list (Not r
 2. In the **Action** menu choose **Research websites (Module 2)** and click **Go**.
 3. Click **Start run**.
 
-For each business the AI reads up to 5 pages of its website and gives a score with reasons. The score and status show in the Businesses list; click a business and then its **Website research** link to see what the AI read and why it scored it that way.
+For each business the AI reads up to 5 pages of its website and scores it 0-100 against its campaign's **campaign prompt** (the qualification criteria; see [Prompts](#prompts)), with reasons. Businesses whose campaign has no campaign prompt are skipped and the run says so. The score and status show in the Businesses list; click a business and then its **Website research** link to see what the AI read and why it scored it that way.
 
 Businesses you select are researched even if they were researched before (the new score replaces the old one). The **Research websites** button on the dashboard only does businesses that have not been researched yet. Businesses without a website are skipped. If research fails for one (the site was down, for example), run it again later; **Retry failed** on the dashboard does this.
 
@@ -137,17 +138,15 @@ The AI writes one short email per prospect, based only on what was found about t
 
 ### Prompts
 
-The AI's instructions come in two parts, both edited in the admin:
+Both kinds of prompt are edited in the admin; nothing is built into the code.
 
-- **Campaign prompts** (sidebar): the standing instructions for a campaign: who we are, what we offer, how to read the facts about each business, the rules every email must follow, and the output format. Each campaign uses one campaign prompt.
-- **Email prompts** (sidebar, or inside a campaign prompt's page): how to write one kind of email, e.g. "First-touch email" or "Follow-up". A campaign prompt can have many; the one marked **Default** is used unless you choose another.
+- **Campaign prompts** (sidebar) **qualify businesses**. They describe what you sell, what a good and a poor prospect look like, and what each score range means. In step 3 the AI reads each business's website and scores it 0-100 against its campaign's campaign prompt; businesses scoring 50+ go on to finding decision makers. Each campaign uses one campaign prompt. Open one and expand **What the research agent receives** to see it together with the fixed browsing instructions (which pages to open, when to stop, how to answer).
+- **Email prompts** (sidebar, or inside a campaign prompt's page) **write emails**. Each is complete on its own: who we are and what we offer, the rules, structure, call to action, length and style. The AI receives exactly that text, plus the facts about the prospect. A campaign prompt can have many (the first email, follow-ups, A/B variations); for the first email the one marked **Default** is used unless you choose another.
 
-When an email is written, the AI receives the campaign prompt followed by the email prompt. Open an email prompt and expand **What the model receives** to see the combined text.
-
-- A new campaign prompt starts with the built-in Axioware text; if you save it without an email prompt, the built-in "First-touch email" is added to it.
-- Your first campaign already uses **Axioware - dental clinics** with its **First-touch email**.
-- A campaign without a prompt uses the built-in Axioware prompt.
-- Keep the **OUTPUT** section (subject and body as JSON) in every campaign prompt; the app needs it to read the AI's answer.
+- New prompts start empty. Saving a campaign prompt without a first-email prompt (step 0) shows a warning: no emails are written for that campaign until you add one.
+- Your first campaign uses **Axioware - dental clinics**: its campaign prompt holds starting qualification criteria for Axioware (edit them to match who you want to reach), and its **First-touch email** holds the full email instructions.
+- A campaign without a campaign prompt is not researched and gets no emails; a prospect whose campaign has no email prompt for the first email is skipped and the run says so.
+- Every email prompt should ask for a subject and a body: the app reads the AI's answer as those two fields.
 
 ### Step 7: Review emails
 
@@ -188,15 +187,26 @@ To approve or reject many emails at once: on the Emails list tick them, choose *
 
 After sending, the email's status is **Sent** and the prospect's is **Contacted**. Only approved emails are ever sent, and never twice.
 
+#### Send windows
+
+Give a campaign a send window (e.g. 09:00 - 20:00, in its time zone) and its approved emails are spread evenly over that window instead of going out all at once. Each follow-up can have its own window (in the campaign's **Follow-ups** table); a follow-up without one uses the campaign's.
+
+- Every sending run gives newly approved emails a **send time** (shown as **Scheduled at** on the Emails list and the email page) and sends only the emails whose time has come. Approve 4 emails before 9:00 with a 09:00 - 20:00 window and they go out at 09:00, 11:45, 14:30 and 17:15.
+- Emails approved while the window is open share what is left of it with the emails still waiting: approve one more at 12:00 and the three waiting ones go out at 12:00, 14:40 and 17:20.
+- Once the day's window has ended, emails still waiting move to the next day's window. Nothing is sent outside the window.
+- **Sending has to run regularly** for this to work, e.g. every 5 minutes from a cron job: `*/5 * * * * cd /path/to/project && .venv/bin/python manage.py send_emails --send`, or the API: `POST /api/runs/` with `{"command": "send_emails", "options": {"send": true}}`.
+- **Send now** on an email, and **Send selected approved emails** on the list, send the chosen emails immediately, whatever their window.
+- An email sent back to review and approved again gets a new send time.
+
 If an email shows **Failed**, the recipient's server refused it; the reason is on the email page. If sending stops with a login or connection error, the email goes back to **Approved** so you can try again later.
 
 ### Follow-ups
 
 A campaign can send follow-up emails to people who did not reply, a set number of days after the previous email.
 
-**1. Set the schedule.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** 1 for the first follow-up, 2 for the second, and **Days after previous** (e.g. 3, then 7). The number of rows is the number of follow-ups. The first email is step 0.
+**1. Set the schedule.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** 1 for the first follow-up, 2 for the second, and **Days after previous** (e.g. 3, then 7). Optionally give it its own **send window** (e.g. 10:00 - 13:00); empty uses the campaign's. The number of rows is the number of follow-ups. The first email is step 0.
 
-**2. Write the prompts.** In **Email prompts** (or inside the campaign prompt) add a prompt for each follow-up step with **Sequence** set to its number. A new follow-up prompt starts from a built-in follow-up text. Optional:
+**2. Write the prompts.** In **Email prompts** (or inside the campaign prompt) add a prompt for each follow-up step with **Sequence** set to its number. Write it in full, like the first email's prompt (who we are, the rules, how to write the follow-up); the AI also receives `follow_up` and `previous_emails`, the emails already sent. Optional:
 - **Variation** (A, B, C): A/B testing. When a prospect's first email is written, the prospect joins the variation with the fewest prospects and stays in it for every follow-up, so you compare whole sequences.
 - **Opened** (Any / Previous email opened / Previous email not opened): a different message for people who opened, or did not open, the previous email.
 

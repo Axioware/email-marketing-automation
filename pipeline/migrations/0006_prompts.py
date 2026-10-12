@@ -5,16 +5,17 @@ from django.db import migrations, models
 
 
 def seed_default_prompts(apps, schema_editor):
-    """Save the built-in Axioware prompt as the first campaign and email prompts, used by the oldest campaign."""
-    from pipeline.services.generation import DEFAULT_CAMPAIGN_PROMPT, DEFAULT_EMAIL_PROMPT
+    """Save the Axioware prompt (at the time: email rules + how to write it) as the first campaign and email prompts,
+    used by the oldest campaign. 0008 moves the email rules into the email prompt."""
+    from pipeline.migrations._prompt_texts import OLD_CAMPAIGN_PROMPT, OLD_EMAIL_PROMPT
 
     CampaignPrompt = apps.get_model("pipeline", "CampaignPrompt")
     EmailPrompt = apps.get_model("pipeline", "EmailPrompt")
     DiscoveryCampaign = apps.get_model("pipeline", "DiscoveryCampaign")
     campaign_prompt, _ = CampaignPrompt.objects.get_or_create(
-        name="Axioware - dental clinics", defaults={"prompt": DEFAULT_CAMPAIGN_PROMPT})
+        name="Axioware - dental clinics", defaults={"prompt": OLD_CAMPAIGN_PROMPT})
     EmailPrompt.objects.get_or_create(campaign_prompt=campaign_prompt, name="First-touch email",
-                                      defaults={"prompt": DEFAULT_EMAIL_PROMPT, "is_default": True})
+                                      defaults={"prompt": OLD_EMAIL_PROMPT, "is_default": True})
     campaign = DiscoveryCampaign.objects.filter(campaign_prompt__isnull=True).order_by("created_at").first()
     if campaign is not None and not DiscoveryCampaign.objects.filter(campaign_prompt=campaign_prompt).exists():
         campaign.campaign_prompt = campaign_prompt
