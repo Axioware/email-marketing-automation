@@ -86,3 +86,8 @@ def review_env(smtp, llm) -> dict:
         "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret", "SMTP_FROM_EMAIL": "user@x.org",
         "SMTP_FROM_NAME": "Sender", "SMTP_REPLY_TO": "",
     }
+
+
+# Management-form fields of the follow-ups inline on the campaign form (empty inline).
+CAMPAIGN_INLINE = {"follow_ups-TOTAL_FORMS": "0", "follow_ups-INITIAL_FORMS": "0", "follow_ups-MIN_NUM_FORMS": "0",
+                   "follow_ups-MAX_NUM_FORMS": "1000"}

@@ -11,7 +11,7 @@ from rest_framework.test import APIClient
 from pipeline.models import CampaignPrompt, DiscoveryCampaign, Email, EmailPrompt, PipelineRun
 from pipeline.services import generation as g
 from tests.fake_smtp import FakeSmtpServer
-from tests.support import make_business, make_campaign, make_email, review_env, run_command
+from tests.support import CAMPAIGN_INLINE, make_business, make_campaign, make_email, review_env, run_command
 from tests.test_generate_emails import FakeLLM
 
 KEY = "prompt-test-key"
@@ -33,7 +33,8 @@ class PromptCase(TestCase):
         campaign_prompt = CampaignPrompt.objects.create(name=name, prompt=f"CAMPAIGN RULES {name}")
         first = EmailPrompt.objects.create(campaign_prompt=campaign_prompt, name="First touch",
                                            prompt=f"FIRST TOUCH {name}", is_default=True)
-        follow = EmailPrompt.objects.create(campaign_prompt=campaign_prompt, name="Follow-up", prompt=f"FOLLOW UP {name}")
+        follow = EmailPrompt.objects.create(campaign_prompt=campaign_prompt, name="Follow-up", prompt=f"FOLLOW UP {name}",
+                                             variation="b")
         if campaign is not None:
             campaign.campaign_prompt = campaign_prompt
             campaign.save()
@@ -149,7 +150,7 @@ class CampaignAdminTests(PromptCase):
         url = reverse("admin:pipeline_discoverycampaign_add")
         form = self.client.get(url).context["adminform"].form
         self.assertNotIn("status", form.fields)
-        self.client.post(url, {"name": "New", "status": "completed", "target_locations": "", "search_terms": ""})
+        self.client.post(url, {**CAMPAIGN_INLINE, "name": "New", "status": "completed", "target_locations": "", "search_terms": ""})
         self.assertEqual(DiscoveryCampaign.objects.get(name="New").status, "pending")
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change",
                                        args=[DiscoveryCampaign.objects.get(name="New").pk])).content.decode()
@@ -164,9 +165,9 @@ class CampaignAdminTests(PromptCase):
         self.assertIn(free, choices)
         self.assertNotIn(taken, choices)
         self.assertIn(reverse("admin:pipeline_campaignprompt_add"), page.content.decode())  # the + (create) link
-        self.client.post(url, {"name": "Uses free", "campaign_prompt": free.pk})
+        self.client.post(url, {**CAMPAIGN_INLINE, "name": "Uses free", "campaign_prompt": free.pk})
         self.assertEqual(DiscoveryCampaign.objects.get(name="Uses free").campaign_prompt, free)
-        response = self.client.post(url, {"name": "Steals", "campaign_prompt": taken.pk})
+        response = self.client.post(url, {**CAMPAIGN_INLINE, "name": "Steals", "campaign_prompt": taken.pk})
         self.assertFalse(DiscoveryCampaign.objects.filter(name="Steals").exists())
         self.assertContains(response, "Select a valid choice")
 
@@ -268,7 +269,10 @@ class PromptApiTests(PromptCase):
         created = response.json()
         self.assertEqual([p["name"] for p in created["email_prompts"]], ["First-touch email"])
         follow = self.api.post("/api/email-prompts/", {"campaign_prompt": created["id"], "name": "Follow-up",
-                                                        "prompt": "Short follow-up."}, format="json").json()
+                                                        "sequence": 1, "prompt": "Short follow-up."}, format="json").json()
+        duplicate = self.api.post("/api/email-prompts/", {"campaign_prompt": created["id"], "name": "Another first",
+                                                           "prompt": "x"}, format="json")
+        self.assertEqual(duplicate.status_code, 400)  # step 0, variation a, opened any already exists
         self.assertEqual(follow["full_prompt"], "We sell to spas.\n\nShort follow-up.")
         campaign = self.api.post("/api/campaigns/", {"name": "Spa campaign", "campaign_prompt": created["id"]},
                                  format="json")

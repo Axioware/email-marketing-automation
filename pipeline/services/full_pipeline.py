@@ -1,4 +1,5 @@
-"""The complete pipeline for one campaign: fetch -> research -> decision makers -> verify -> write emails.
+"""The complete pipeline for one campaign: fetch -> research -> decision makers -> verify -> write emails ->
+write due follow-ups.
 
 Each step runs exactly as its own command would, on the campaign's businesses, and only processes what still needs
 it, so rerunning the pipeline continues where it stopped. It never sends: emails end up In review for a person to
@@ -16,6 +17,7 @@ STEPS = {
     "stakeholders": "Find decision makers and candidate emails",
     "verify": "Verify emails",
     "generate": "Write emails for review",
+    "followups": "Write due follow-ups for review",
 }
 PARTIAL_FAILURE = "Finished with errors"  # how a step reports that only some items failed
 
@@ -66,18 +68,20 @@ def run(options: dict) -> int:
             return ["--min-score", str(options["min_score"]), *businesses, *headed]
         if step == "verify":
             return businesses
+        if step == "followups":  # follow-ups use their own prompts per step and variation
+            return ["--campaign-id", str(campaign_id)] if campaign_id is not None else []
         prompt = ["--email-prompt-id", str(options["email_prompt_id"])] if options["email_prompt_id"] else []
         return [*businesses, *prompt]
 
     commands = {"fetch": "fetch_businesses", "research": "research_websites", "stakeholders": "find_stakeholders",
-                "verify": "verify_emails", "generate": "generate_emails"}
+                "verify": "verify_emails", "generate": "generate_emails", "followups": "generate_followups"}
     planned = [step for step in STEPS if step not in skip]
     scope = f"campaign {campaign_id}" if campaign_id is not None else "all businesses"
     print(f"Full pipeline for {scope}: " + " -> ".join(STEPS[step] for step in planned) + ". Nothing is sent.")
     partial = []
     for number, step in enumerate(planned, start=1):
         args = arguments(step)
-        if step != "fetch" and campaign_id is not None and "--business-id" not in args:
+        if step not in ("fetch", "followups") and campaign_id is not None and "--business-id" not in args:
             # Without business ids a step would process every business, not just this campaign's.
             print("\nThe campaign has no businesses yet; nothing more to do.")
             return 1 if partial else 0

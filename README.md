@@ -102,6 +102,7 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 6. Write emails | Prospects or Businesses > action **Generate outreach emails** (choose an email prompt) | `python manage.py generate_emails [--email-prompt-id N]` |
 | 7. Review | Emails: edit, Approve, Reject, Regenerate | - |
 | 8. Send | Email > **Send now**, or Emails > action **Send selected** | `python manage.py send_emails --send` |
+| 9. Follow-ups | Campaign > **Follow-ups** table; dashboard **Write follow-ups**; **Mark replied** on replies | `python manage.py generate_followups` |
 
 Every command has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
 
@@ -130,6 +131,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | Endpoint | What |
 |---|---|
 | `/api/campaigns/` | list, create, edit, delete; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20}` |
+| `/api/follow-ups/` | a campaign's follow-up schedule (sequence, days after previous); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops follow-ups to that business |
 | `/api/campaign-prompts/`, `/api/email-prompts/` | the prompts emails are written with; a campaign links to one campaign prompt (`campaign_prompt`), which has many email prompts |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
 | `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |

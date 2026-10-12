@@ -20,7 +20,7 @@ from pipeline.models import (
 )
 from pipeline.services import generation as g
 from tests.fake_smtp import FakeSmtpServer
-from tests.support import BASE, make_business, make_campaign, make_contact, make_email, review_env
+from tests.support import BASE, CAMPAIGN_INLINE, make_business, make_campaign, make_contact, make_email, review_env
 from tests.test_generate_emails import FakeLLM
 
 
@@ -84,7 +84,7 @@ class AdminPagesTests(AdminCase):
         self.assertEqual(self.row(email.pk)["status"], "in_review")
 
     def test_campaign_form_takes_comma_separated_lists(self):
-        response = self.client.post(reverse("admin:pipeline_discoverycampaign_add"), {
+        response = self.client.post(reverse("admin:pipeline_discoverycampaign_add"), {**CAMPAIGN_INLINE,
             "name": "Karachi dentists", "target_country": "Pakistan", "target_locations": "Karachi, Clifton",
             "search_terms": "dental clinic, dentist", "status": "pending"}, follow=True)
         self.assertEqual(response.status_code, 200)
@@ -95,7 +95,7 @@ class AdminPagesTests(AdminCase):
         self.assertIn("Fetch businesses", page)
 
     def test_campaign_rejects_several_countries(self):
-        response = self.client.post(reverse("admin:pipeline_discoverycampaign_add"), {
+        response = self.client.post(reverse("admin:pipeline_discoverycampaign_add"), {**CAMPAIGN_INLINE,
             "name": "x", "target_country": "Pakistan, India", "status": "pending"})
         self.assertContains(response, "Enter one country only")
         self.assertFalse(DiscoveryCampaign.objects.exists())

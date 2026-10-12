@@ -5,6 +5,7 @@ from pipeline.models import (
     Business,
     CampaignPrompt,
     EmailPrompt,
+    FollowUp,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -26,13 +27,21 @@ def string_list(value, field):
     return [item.strip() for item in value if item.strip()]
 
 
+class FollowUpSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FollowUp
+        fields = ["id", "campaign", "sequence", "days_after_previous", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
+
+
 class DiscoveryCampaignSerializer(serializers.ModelSerializer):
     business_count = serializers.IntegerField(read_only=True, source="businesses.count")
+    follow_ups = FollowUpSerializer(many=True, read_only=True)
 
     class Meta:
         model = DiscoveryCampaign
         fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "campaign_prompt",
-                  "business_count", "created_at", "updated_at", "started_at", "completed_at"]
+                  "follow_ups", "business_count", "created_at", "updated_at", "started_at", "completed_at"]
         read_only_fields = ["status", "created_at", "updated_at", "started_at", "completed_at"]
 
     def validate_target_locations(self, value):
@@ -52,7 +61,8 @@ class EmailPromptSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = EmailPrompt
-        fields = ["id", "campaign_prompt", "name", "prompt", "is_default", "full_prompt", "created_at", "updated_at"]
+        fields = ["id", "campaign_prompt", "name", "sequence", "variation", "opened", "prompt", "is_default",
+                  "full_prompt", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
 
 
@@ -105,7 +115,7 @@ class ProspectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Prospect
         fields = "__all__"
-        read_only_fields = ["email_verification_provider", "email_verified_at", "verdict", "verification_note",
+        read_only_fields = ["variation", "email_verification_provider", "email_verified_at", "verdict", "verification_note",
                             "verification_details", "last_contacted_at", "created_at", "updated_at"]
 
 
@@ -172,7 +182,7 @@ class BulkReviewSerializer(serializers.Serializer):
 class RunPipelineSerializer(serializers.Serializer):
     fetch_limit = serializers.IntegerField(min_value=0, default=20, help_text="New businesses to fetch (0 skips fetching).")
     skip = serializers.ListField(child=serializers.ChoiceField(choices=["fetch", "research", "stakeholders", "verify",
-                                                                         "generate"]), required=False)
+                                                                         "generate", "followups"]), required=False)
     min_score = serializers.IntegerField(min_value=0, max_value=100, required=False)
     email_prompt_id = serializers.IntegerField(required=False)
     headed = serializers.BooleanField(default=False)

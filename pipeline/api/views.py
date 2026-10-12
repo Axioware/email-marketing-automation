@@ -18,6 +18,7 @@ from pipeline.models import (
     Business,
     CampaignPrompt,
     EmailPrompt,
+    FollowUp,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -72,6 +73,18 @@ class CampaignPromptViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "prompt"]
 
 
+class FollowUpViewSet(viewsets.ModelViewSet):
+    """A campaign's follow-up schedule: follow-up 1, 2, ... and the days after the previous email."""
+
+    queryset = FollowUp.objects.all()
+    serializer_class = s.FollowUpSerializer
+    filterset_fields = ["campaign"]
+
+
+def replied_response(message: str):
+    return Response({"detail": message})
+
+
 class EmailPromptViewSet(viewsets.ModelViewSet):
     queryset = EmailPrompt.objects.select_related("campaign_prompt")
     serializer_class = s.EmailPromptSerializer
@@ -87,8 +100,14 @@ class BusinessViewSet(viewsets.ModelViewSet):
         "category": ["exact", "icontains"], "website_profile__status": ["exact"],
         "website_profile__qualification_score": ["gte", "lte"], "website_profile__contact_discovery_status": ["exact", "isnull"],
     }
-    search_fields = ["name", "domain", "phone", "address", "website_url"]
+    search_fields = ["name", "category", "city", "address", "domain", "phone", "website_url"]
     ordering_fields = ["id", "name", "google_rating", "google_review_count", "website_profile__qualification_score"]
+
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=["post"], url_path="mark-replied")
+    def mark_replied(self, request, pk=None):
+        """Someone at the business replied: no more follow-ups go to it."""
+        return replied_response(review.mark_business_replied(self.get_object()))
 
 
 class BusinessSourceViewSet(viewsets.ReadOnlyModelViewSet):
@@ -117,7 +136,14 @@ class BusinessContactViewSet(viewsets.ModelViewSet):
 class ProspectViewSet(viewsets.ModelViewSet):
     queryset = Prospect.objects.all()
     serializer_class = s.ProspectSerializer
-    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "do_not_contact"]
+    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "variation", "do_not_contact"]
+
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=["post"], url_path="mark-replied")
+    def mark_replied(self, request, pk=None):
+        """The prospect replied: its latest sent email becomes Replied and its business gets no more follow-ups."""
+        prospect = self.get_object()
+        return replied_response(review.mark_business_replied(prospect.business, prospect_id=prospect.pk))
     search_fields = ["email", "business__name", "contact__name"]
     ordering_fields = ["id", "qualification_score", "email_verified_at", "last_contacted_at"]
 
@@ -128,7 +154,8 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
 
     queryset = Email.objects.select_related("prospect").all()
     serializer_class = s.EmailSerializer
-    filterset_fields = ["status", "business", "prospect", "contact", "sequence_step", "generation_provider", "email_prompt"]
+    filterset_fields = ["status", "business", "prospect", "contact", "sequence_step", "prospect__variation",
+                        "generation_provider", "email_prompt"]
     search_fields = ["business__name", "recipient", "subject"]
     ordering_fields = ["id", "generated_at", "sent_at", "open_count"]
 
@@ -152,6 +179,12 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
         params = s.RejectSerializer(data=request.data)
         params.is_valid(raise_exception=True)
         return self._act(request, review.reject, params.validated_data.get("note", ""))
+
+    @extend_schema(request=None)
+    @action(detail=True, methods=["post"], url_path="mark-replied")
+    def mark_replied(self, request, pk=None):
+        """This sent email got a reply: it becomes Replied and its business gets no more follow-ups."""
+        return self._act(request, review.mark_replied)
 
     @extend_schema(request=None)
     @action(detail=True, methods=["post"])

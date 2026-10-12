@@ -24,10 +24,10 @@ from email.utils import formataddr, formatdate, make_msgid
 
 from django.core.management.base import CommandError
 from django.db import DatabaseError, transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.db.models.functions import Lower
 
-from pipeline.models import Email, Prospect
+from pipeline.models import Business, Email, Prospect
 from pipeline.services import generation
 
 DEFAULT_SMTP_HOST = "smtp.hostinger.com"
@@ -156,6 +156,8 @@ def send_one(email: dict, config: dict, mailer: "Mailer") -> tuple[str, str]:
     ("stop", reason: login, connection or temporary problem; the email is back in approved) |
     ("skipped", reason: it was no longer approved, e.g. another run or a reviewer took it).
     """
+    if Business.objects.filter(pk=email["business_id"], replied_at__isnull=False).exists():
+        return "skipped", "someone at this business replied, so it is not sent"  # checked again right before sending
     claimed = Email.objects.filter(pk=email["id"], status=Email.Status.APPROVED).update(
         status=Email.Status.SENDING, sent_from=config["from_email"], send_error=None
     )
@@ -181,14 +183,17 @@ EMAIL_FIELDS = ("id", "prospect_id", "business_id", "recipient", "subject", "bod
 
 
 def sendable_emails():
-    """Approved emails whose prospect is still ready and still has the same address."""
+    """Approved emails whose prospect can still be emailed and still has the same address: a first email needs a
+    ready prospect, a follow-up a ready or already contacted one, and nobody at the business may have replied."""
     return (
         Email.objects.filter(
             status=Email.Status.APPROVED,
             prospect__email_status="deliverable",
-            prospect__outreach_status="ready",
             prospect__do_not_contact=False,
+            business__replied_at__isnull=True,
         )
+        .filter(Q(sequence_step=generation.SEQUENCE_STEP, prospect__outreach_status="ready")
+                | Q(sequence_step__gt=generation.SEQUENCE_STEP, prospect__outreach_status__in=["ready", "contacted"]))
         .annotate(prospect_address=Lower("prospect__email"), recipient_address=Lower("recipient"))
         .filter(prospect_address=F("recipient_address"))
         .order_by("id")

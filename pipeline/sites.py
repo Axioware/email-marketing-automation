@@ -31,6 +31,25 @@ def run_url(command: str, arguments: str = "") -> str:
     return f"{reverse('admin:pipeline_pipelinerun_add')}?{urlencode({'command': command, 'arguments': arguments})}"
 
 
+def sequence_results() -> list[dict]:
+    """Sent emails per step and A/B variation, with open and reply rates."""
+    from pipeline.models import Email
+
+    rows = (Email.objects.filter(sent_at__isnull=False)
+            .values("sequence_step", "prospect__variation")
+            .annotate(sent=Count("id"), opened=Count("id", filter=Q(open_count__gt=0) | Q(status="opened")),
+                      replied=Count("id", filter=Q(status="replied")))
+            .order_by("sequence_step", "prospect__variation"))
+    return [{
+        "step": "First email" if row["sequence_step"] == 1 else f"Follow-up {row['sequence_step'] - 1}",
+        "variation": (row["prospect__variation"] or "-").upper(),
+        "sent": row["sent"],
+        "open_rate": round(100 * row["opened"] / row["sent"]),
+        "replied": row["replied"],
+        "reply_rate": round(100 * row["replied"] / row["sent"]),
+    } for row in rows]
+
+
 class PipelineAdminSite(admin.AdminSite):
     site_header = "Email Marketing Automation"
     site_title = "Email Marketing Automation"
@@ -122,6 +141,11 @@ class PipelineAdminSite(admin.AdminSite):
             first = review.next_in_review(0)
             steps.append((f"{emails['in_review']} email(s) are waiting for your review.", "Start reviewing",
                           reverse("admin:pipeline_email_change", args=[first]) if first else changelist("email")))
+        from pipeline.services import followups
+
+        due_followups = len(followups.find_due({}))
+        if due_followups:
+            steps.append((f"{due_followups} follow-up(s) are due.", "Write follow-ups", run_url("generate_followups")))
         if emails["approved"]:
             steps.append((f"{emails['approved']} approved email(s) are ready to send.", "Send approved",
                           run_url("send_emails", "--send")))
@@ -159,6 +183,7 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("Sending is not set up: " + "; ".join(problems) + ".")
 
         return {
+            "results": sequence_results(),
             "funnel": funnel,
             "steps": steps,
             "warnings": warnings,

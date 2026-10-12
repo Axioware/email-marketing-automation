@@ -185,6 +185,7 @@ class FakeLLM:
         self.mode = "ok"
         self.calls = 0
         self.system_prompts = []
+        self.payloads = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -195,6 +196,7 @@ class FakeLLM:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fake.calls += 1
                 fake.system_prompts.append(request["messages"][0]["content"])
+                fake.payloads.append(json.loads(request["messages"][1]["content"]))
                 user = json.loads(request["messages"][1]["content"])
                 name = user["business"]["name"]
                 if fake.mode == "bad" or (fake.mode == "bad-for-b2" and name == "Business 2"):

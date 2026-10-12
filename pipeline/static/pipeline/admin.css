@@ -118,5 +118,5 @@ body.dashboard #content-main { width: 100%; float: none; }
 .pipeline-dash .module table th { width: auto; }
 .pipeline-funnel { grid-template-columns: repeat(4, 1fr); }
 @media (max-width: 900px) { .pipeline-funnel { grid-template-columns: repeat(2, 1fr); } }
-.pipeline-dash .module table th:first-child, .pipeline-dash .module table td:first-child { width: 60px; }
-.pipeline-dash .module table th:nth-child(2), .pipeline-dash .module table td:nth-child(2) { width: 55%; }
+.pipeline-dash table.pipeline-runs th:first-child, .pipeline-dash table.pipeline-runs td:first-child { width: 60px; }
+.pipeline-dash table.pipeline-runs th:nth-child(2), .pipeline-dash table.pipeline-runs td:nth-child(2) { width: 55%; }

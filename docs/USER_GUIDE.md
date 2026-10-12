@@ -190,6 +190,26 @@ After sending, the email's status is **Sent** and the prospect's is **Contacted*
 
 If an email shows **Failed**, the recipient's server refused it; the reason is on the email page. If sending stops with a login or connection error, the email goes back to **Approved** so you can try again later.
 
+### Follow-ups
+
+A campaign can send follow-up emails to people who did not reply, a set number of days after the previous email.
+
+**1. Set the schedule.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** 1 for the first follow-up, 2 for the second, and **Days after previous** (e.g. 3, then 7). The number of rows is the number of follow-ups. The first email is step 0.
+
+**2. Write the prompts.** In **Email prompts** (or inside the campaign prompt) add a prompt for each follow-up step with **Sequence** set to its number. A new follow-up prompt starts from a built-in follow-up text. Optional:
+- **Variation** (A, B, C): A/B testing. When a prospect's first email is written, the prospect joins the variation with the fewest prospects and stays in it for every follow-up, so you compare whole sequences.
+- **Opened** (Yes / No / Unknown = any): a different message for people who opened, or did not open, the previous email.
+
+For each step the prompt is chosen in this order: the prospect's variation with the matching "opened" setting, the prospect's variation with "any", the step's **default** prompt, any prompt of the step. If a follow-up step has no prompt at all, that follow-up is skipped and the run says so; the campaign page warns you about such steps.
+
+**3. Write due follow-ups.** The dashboard shows "N follow-ups are due" with a **Write follow-ups** button (or run **Write due follow-ups** as a pipeline step; the full pipeline does it as its last step). A follow-up is written only when the previous email was sent at least the set number of days ago, that follow-up does not exist yet, nobody at the business has replied and the prospect is not do-not-contact. The AI sees the emails already sent, and whether the last one was opened.
+
+**4. Review and send** exactly like first emails (Emails > In review). The email page shows "Follow-up 1", "Follow-up 2", ... and the prospect's variation.
+
+**5. Mark replies.** When someone replies, click **Mark replied** on that email (or use the **Mark replied** action on Emails, Prospects or Businesses). The email becomes **Replied** and **nobody at that business gets more follow-ups**; a follow-up already written or approved for it is not sent. **Clear replied** on Businesses undoes it.
+
+**Results:** the dashboard's **Results by step and variation** table shows, for the first email and each follow-up, per variation: emails sent, open rate, replies and reply rate. The Emails list can be filtered by step, variation and status (including Replied).
+
 ## 5. Pipeline runs
 
 Steps 2-6 and bulk sending can take minutes, so they run in the background as **pipeline runs**.
@@ -216,6 +236,7 @@ Useful arguments:
 | `--recheck` | Verify | Check addresses that were already checked |
 | `--primary-only` | Verify | Only the main contact of each business |
 | `--regenerate` | Generate emails | Rewrite emails that are in review or rejected |
+| `--campaign-id N` | Write due follow-ups | Only that campaign's follow-ups |
 | `--send` | Send | Actually send (without it, only a preview) |
 
 ## 6. Managing prospects

@@ -27,10 +27,22 @@
       {% endif %}
     </div>
 
+    {% if results %}
+    <div class="module">
+      <h2>Results by step and variation</h2>
+      <table>
+        <thead><tr><th>Step</th><th>Variation</th><th>Sent</th><th>Open rate</th><th>Replies</th><th>Reply rate</th></tr></thead>
+        <tbody>{% for row in results %}
+          <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.open_rate }}%</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    {% endif %}
+
     <div class="module">
       <h2>Recent pipeline runs {% if running %}<small>({{ running }} running)</small>{% endif %}</h2>
       {% if recent_runs %}
-        <table>
+        <table class="pipeline-runs">
           <thead><tr><th>Run</th><th>Command</th><th>Status</th><th>Started by</th><th>When</th></tr></thead>
           <tbody>
           {% for run in recent_runs %}

@@ -11,10 +11,14 @@
 {% url 'admin:pipeline_email_reopen' email.pk as reopen_url %}
 {% url 'admin:pipeline_email_regenerate' email.pk as regenerate_url %}
 {% url 'admin:pipeline_email_send' email.pk as send_url %}
+{% url 'admin:pipeline_email_replied' email.pk as replied_url %}
 <div class="pipeline-review">
   <div class="pipeline-card">
-    <h2>Review <span class="pipeline-badge pipeline-{{ email.status }}">{{ email.get_status_display }}</span>
+    <h2>{% if email.sequence_step > 1 %}Follow-up {{ email.sequence_step|add:"-1" }}{% else %}First email{% endif %}
+      {% if email.prospect.variation %}· variation {{ email.prospect.variation|upper }}{% endif %}
+      <span class="pipeline-badge pipeline-{{ email.status }}">{{ email.get_status_display }}</span>
       {% if in_review_count %}<small>({{ in_review_count }} in review)</small>{% endif %}</h2>
+    {% if email.business.replied_at %}<p class="pipeline-note">{{ email.business.name }} replied on {{ email.business.replied_at|date:"Y-m-d" }}: no more emails go to this business.</p>{% endif %}
     {% if email.review_note %}<p class="pipeline-note">Review note: {{ email.review_note }}</p>{% endif %}
     {% if email.send_error %}<p class="pipeline-error">Last send error: {{ email.send_error }}</p>{% endif %}
     {% if not prospect_ready and email.status in "in_review approved" %}<p class="pipeline-error">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</p>{% endif %}
@@ -32,6 +36,9 @@
       {% endif %}
       {% if email.status == "rejected" or email.status == "approved" %}
         <form method="post" action="{{ reopen_url }}">{% csrf_token %}<input type="submit" value="Back to review"></form>
+      {% endif %}
+      {% if email.status == "sent" or email.status == "opened" %}
+        <form method="post" action="{{ replied_url }}">{% csrf_token %}<input type="submit" value="Mark replied"></form>
       {% endif %}
       {% if email.status == "in_review" or email.status == "rejected" %}
         <form method="post" action="{{ regenerate_url }}">{% csrf_token %}

@@ -18,7 +18,7 @@ from urllib.parse import quote, urlsplit
 
 from django.core.management.base import CommandError
 from django.db import DatabaseError, IntegrityError, transaction
-from django.db.models import F, FilteredRelation, Q
+from django.db.models import Count, F, FilteredRelation, Q
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -68,6 +68,23 @@ STYLE
 - Subject: 3 to 7 words, specific to them, in sentence case, mentioning the business name or a detail about it. No "Re:" or "Fwd:", no questions designed to trick, no all caps, no "free", "guaranteed" or "urgent"."""
 
 
+# Starting text for follow-up email prompts (sequence 1, 2, ...). The model also receives `follow_up` (its number and
+# whether the previous email was opened) and `previous_emails` (what we already sent this person).
+DEFAULT_FOLLOW_UP_PROMPT = """HOW TO WRITE THIS FOLLOW-UP
+This is a follow-up to emails we already sent this person; they are in previous_emails (oldest first), and
+follow_up says which follow-up this is and whether the previous email was opened.
+1. Do not repeat the previous email. Add one new, useful angle taken from the input: a different problem Ava (or the
+   fitting service) solves, or a fact about their business we did not use yet.
+2. Refer to the earlier email in a few words at most ("Following up on my note about missed calls"). Never guilt-trip,
+   never say "just checking in" or "bumping this".
+3. End with one simple call to action: the live demo at axioware.tech/dental-agent, or a yes/no question.
+4. Sign off as in the first email.
+
+STYLE
+- 40 to 80 words, short paragraphs, plain text, no exclamation marks.
+- Subject: a new, short subject (2 to 6 words) specific to them. No "Re:", "Fwd:" or "Following up"."""
+
+
 def compose_prompt(campaign_prompt: str, email_prompt: str) -> str:
     return f"{campaign_prompt.strip()}\n\n{email_prompt.strip()}"
 
@@ -87,7 +104,7 @@ FOOTER_IS_PLACEHOLDER = False
 FOOTER_LINK = "https://axioware.tech"
 
 REGENERATABLE_STATUSES = ("in_review", "rejected")
-SEQUENCE_STEP = 1  # first email of the sequence; follow-ups would use later steps
+SEQUENCE_STEP = 1  # emails.sequence_step of the first email; follow-up N is stored as step N + 1
 MAX_ATTEMPTS = 3
 MAX_COMPLETION_TOKENS = 2500  # a short email; Groq counts this budget against its per-minute token limit
 MAX_SUBJECT_CHARS = 200
@@ -249,23 +266,68 @@ def prospect_context(row: dict) -> dict:
     }
 
 
-def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None) -> tuple[str, int | None]:
-    """(system prompt, email prompt id) for one prospect: the chosen email prompt (with its campaign prompt), else the
-    default email prompt of the prospect's campaign prompt, else the built-in prompt."""
+def pick_email_prompt(prompts: list, variation: str | None, previous_opened: bool | None):
+    """The prompt for one step, first match wins: the prospect's variation with the matching "opened" setting; the
+    prospect's variation with opened = any; the step's default; any prompt of the step. None if the step has none."""
+    if previous_opened is not None:
+        for prompt in prompts:
+            if prompt.variation == variation and prompt.opened is previous_opened:
+                return prompt
+    for prompt in prompts:
+        if prompt.variation == variation and prompt.opened is None:
+            return prompt
+    for prompt in prompts:
+        if prompt.is_default:
+            return prompt
+    return prompts[0] if prompts else None
+
+
+def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None, sequence: int = 0,
+                   previous_opened: bool | None = None) -> tuple[str, int | None] | None:
+    """(system prompt, email prompt id) for one prospect and step (sequence 0 = the first email).
+
+    A chosen email prompt wins. Otherwise the prompt comes from the campaign's prompt for that step and the
+    prospect's variation (see pick_email_prompt). For the first email a campaign without a matching prompt falls back
+    to the built-in prompt; for a follow-up with no prompt at all, None is returned (the follow-up is skipped).
+    """
     if chosen is not None:
         return chosen.full_prompt, chosen.pk
     cache = {} if cache is None else cache
     campaign_id = row.get("campaign_id")
-    if campaign_id not in cache:
+    key = (campaign_id, sequence)
+    if key not in cache:
         campaign_prompt = CampaignPrompt.objects.filter(campaign__id=campaign_id).first() if campaign_id else None
-        email_prompt = campaign_prompt.default_email_prompt() if campaign_prompt else None
-        if email_prompt is not None:
-            cache[campaign_id] = (email_prompt.full_prompt, email_prompt.pk)
-        elif campaign_prompt is not None:
-            cache[campaign_id] = (compose_prompt(campaign_prompt.prompt, DEFAULT_EMAIL_PROMPT), None)
-        else:
-            cache[campaign_id] = (SYSTEM_PROMPT, None)
-    return cache[campaign_id]
+        prompts = list(campaign_prompt.email_prompts.filter(sequence=sequence).select_related("campaign_prompt")
+                       .order_by("id")) if campaign_prompt else []
+        cache[key] = (campaign_prompt, prompts)
+    campaign_prompt, prompts = cache[key]
+    prompt = pick_email_prompt(prompts, row.get("variation"), previous_opened)
+    if prompt is not None:
+        return prompt.full_prompt, prompt.pk
+    if sequence > 0:
+        return None
+    if campaign_prompt is not None:
+        return compose_prompt(campaign_prompt.prompt, DEFAULT_EMAIL_PROMPT), None
+    return SYSTEM_PROMPT, None
+
+
+def assign_variation(row: dict, save: bool = True) -> str:
+    """The prospect's A/B variation: kept if it has one, else the variation with the fewest prospects in its campaign
+    among the campaign's first-email prompts (equal split). Stored on the prospect unless `save` is False."""
+    if row.get("variation"):
+        return row["variation"]
+    campaign_id = row.get("campaign_id")
+    available = sorted(set(EmailPrompt.objects.filter(campaign_prompt__campaign__id=campaign_id, sequence=0)
+                           .values_list("variation", flat=True))) if campaign_id else []
+    if not available:
+        available = ["a"]
+    counts = dict(Prospect.objects.filter(business__discovery_campaign_id=campaign_id, variation__in=available)
+                  .values_list("variation").annotate(n=Count("id")).values_list("variation", "n"))
+    variation = min(available, key=lambda value: (counts.get(value, 0), value))
+    if save:
+        Prospect.objects.filter(pk=row["prospect_id"], variation__isnull=True).update(variation=variation)
+    row["variation"] = variation
+    return variation
 
 
 def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str = SYSTEM_PROMPT) -> EmailDraft:
@@ -306,7 +368,7 @@ def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str
 # ---------------------------------------------------------------- database
 
 
-PROSPECT_COLUMNS = ("business_id", "contact_id", "qualification_score", "outreach_facts", "research_summary")
+PROSPECT_COLUMNS = ("business_id", "contact_id", "qualification_score", "outreach_facts", "research_summary", "variation")
 PROSPECT_FIELDS = {
     "campaign_id": F("business__discovery_campaign_id"),
     "prospect_id": F("id"),
@@ -351,8 +413,14 @@ def load_prospects(options: dict) -> list[dict]:
     return list(queryset.values(*PROSPECT_COLUMNS, **PROSPECT_FIELDS))
 
 
+def prospect_rows(queryset) -> list[dict]:
+    """The same facts as load_prospects, for any prospects (used for follow-ups)."""
+    queryset = queryset.annotate(step_email=FilteredRelation("emails", condition=Q(emails__sequence_step=SEQUENCE_STEP)))
+    return list(queryset.values(*PROSPECT_COLUMNS, **PROSPECT_FIELDS))
+
+
 def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provider: str, model: str,
-               now: datetime, email_prompt_id: int | None = None) -> bool:
+               now: datetime, email_prompt_id: int | None = None, sequence_step: int = SEQUENCE_STEP) -> bool:
     """Insert the email for review, or replace an existing one that is in review or rejected (it goes back to
     review). Approved, sent and failed emails are never modified. Returns whether anything was written."""
     content = {
@@ -367,7 +435,7 @@ def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provide
     with transaction.atomic():
         existing = (
             Email.objects.select_for_update()
-            .filter(prospect_id=row["prospect_id"], sequence_step=SEQUENCE_STEP)
+            .filter(prospect_id=row["prospect_id"], sequence_step=sequence_step)
             .first()
         )
         if existing is None:
@@ -377,7 +445,7 @@ def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provide
                         prospect_id=row["prospect_id"],
                         business_id=row["business_id"],
                         contact_id=row["contact_id"],
-                        sequence_step=SEQUENCE_STEP,
+                        sequence_step=sequence_step,
                         recipient=row["recipient"],
                         tracking_token=token,
                         status=Email.Status.IN_REVIEW,
@@ -442,6 +510,7 @@ def run(options: dict) -> int:
         prompts: dict = {}
         for row in queue:
             token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
+            assign_variation(row, save=not options["dry_run"])
             system_prompt, email_prompt_id = resolve_prompt(row, chosen, prompts)
             try:
                 draft = generate_draft(client, model, prospect_context(row), system_prompt)
@@ -450,7 +519,8 @@ def run(options: dict) -> int:
                 print(f"  Prospect {row['prospect_id']} <{row['recipient']}> failed ({type(error).__name__}): {error}")
                 continue
             body_html = render_html(draft.body, tracking_url(base_url, token))
-            print(f"  Prospect {row['prospect_id']} <{row['recipient']}>: {draft.subject}")
+            print(f"  Prospect {row['prospect_id']} <{row['recipient']}> (variation {row['variation'].upper()}): "
+                  f"{draft.subject}")
             if options["dry_run"]:
                 print("    " + draft.body.replace("\n", "\n    "))
             else:

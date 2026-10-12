@@ -34,6 +34,7 @@ COMMANDS = {
     "find_stakeholders": "Module 3 - find decision makers and candidate emails",
     "verify_emails": "Module 4 - verify emails with Reacher (creates prospects)",
     "generate_emails": "Module 5 - generate outreach emails for review",
+    "generate_followups": "Follow-ups - write the follow-ups that are due, for review",
     "send_emails": "Send approved emails (preview unless --send)",
 }
 # Options every Django command has; they are not pipeline options.

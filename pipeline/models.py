@@ -26,8 +26,8 @@ class CampaignPrompt(models.Model):
     def __str__(self):
         return self.name
 
-    def default_email_prompt(self):
-        return self.email_prompts.order_by("-is_default", "id").first()
+    def default_email_prompt(self, sequence: int = 0):
+        return self.email_prompts.filter(sequence=sequence).order_by("-is_default", "id").first()
 
     def ensure_email_prompt(self) -> bool:
         """Give a campaign prompt without email prompts the built-in first-touch one. Returns whether one was added."""
@@ -40,32 +40,44 @@ class CampaignPrompt(models.Model):
         return True
 
 
+VARIATIONS = [("a", "A"), ("b", "B"), ("c", "C")]
+
+
 class EmailPrompt(models.Model):
-    """Instructions for one kind of email in a campaign (e.g. first touch, follow-up)."""
+    """Instructions for one email of a campaign's sequence: which step, which A/B variation, and whether it is meant
+    for prospects who opened the previous email."""
 
     campaign_prompt = models.ForeignKey(CampaignPrompt, on_delete=models.CASCADE, related_name="email_prompts")
     name = models.CharField(max_length=255)
+    sequence = models.PositiveIntegerField(default=0, help_text="0 = the first email, 1 = the first follow-up, ...")
+    variation = models.CharField(max_length=1, choices=VARIATIONS, default="a",
+                                 help_text="A/B variation. Each prospect stays in one variation for the whole sequence.")
+    opened = models.BooleanField(null=True, blank=True,
+                                 help_text="Follow-ups only: use this prompt when the previous email was opened (Yes), "
+                                           "not opened (No), or either (Unknown/any).")
     prompt = models.TextField(help_text="How to write this email: structure, call to action, length and style.")
-    is_default = models.BooleanField(default=False, help_text="Used when no email prompt is chosen.")
+    is_default = models.BooleanField(default=False, help_text="Used for this step when no variation matches.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "email_prompts"
-        ordering = ["campaign_prompt__name", "-is_default", "name"]
+        ordering = ["campaign_prompt__name", "sequence", "variation", "-is_default", "name"]
         constraints = [
             models.UniqueConstraint(fields=["campaign_prompt", "name"], name="uq_email_prompts_name"),
-            models.UniqueConstraint(fields=["campaign_prompt"], condition=models.Q(is_default=True),
+            models.UniqueConstraint(fields=["campaign_prompt", "sequence"], condition=models.Q(is_default=True),
                                     name="uq_email_prompts_one_default"),
+            models.UniqueConstraint(fields=["campaign_prompt", "sequence", "variation", "opened"],
+                                    nulls_distinct=False, name="uq_email_prompts_step_variation"),
         ]
 
     def __str__(self):
         return f"{self.campaign_prompt.name} / {self.name}"
 
     def save(self, *args, **kwargs):
-        if self.is_default:  # only one default per campaign prompt
-            EmailPrompt.objects.filter(campaign_prompt_id=self.campaign_prompt_id, is_default=True).exclude(
-                pk=self.pk).update(is_default=False)
+        if self.is_default:  # only one default per step of a campaign prompt
+            EmailPrompt.objects.filter(campaign_prompt_id=self.campaign_prompt_id, sequence=self.sequence,
+                                       is_default=True).exclude(pk=self.pk).update(is_default=False)
         super().save(*args, **kwargs)
 
     @property
@@ -73,6 +85,29 @@ class EmailPrompt(models.Model):
         from pipeline.services.generation import compose_prompt
 
         return compose_prompt(self.campaign_prompt.prompt, self.prompt)
+
+
+class FollowUp(models.Model):
+    """One follow-up in a campaign's sequence: sent `days_after_previous` days after the previous email."""
+
+    campaign = models.ForeignKey("DiscoveryCampaign", on_delete=models.CASCADE, related_name="follow_ups")
+    sequence = models.PositiveIntegerField(help_text="1 = the first follow-up (the first email is 0).")
+    days_after_previous = models.PositiveIntegerField(default=3, help_text="Days after the previous email was sent.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "follow_ups"
+        ordering = ["campaign_id", "sequence"]
+        verbose_name = "follow-up"
+        constraints = [
+            models.UniqueConstraint(fields=["campaign", "sequence"], name="uq_follow_ups_campaign_sequence"),
+            models.CheckConstraint(condition=models.Q(sequence__gte=1), name="ck_follow_ups_sequence"),
+            models.CheckConstraint(condition=models.Q(days_after_previous__gte=1), name="ck_follow_ups_days"),
+        ]
+
+    def __str__(self):
+        return f"Follow-up {self.sequence} ({self.days_after_previous} days later)"
 
 
 class DiscoveryCampaign(models.Model):
@@ -140,6 +175,8 @@ class Business(models.Model):
     source_url = models.TextField(null=True, blank=True)
     first_discovered_at = models.DateTimeField(null=True, blank=True)
     last_discovered_at = models.DateTimeField(null=True, blank=True)
+    replied_at = models.DateTimeField(null=True, blank=True,
+                                      help_text="Set when someone at the business replied: no more follow-ups go to it.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -309,6 +346,8 @@ class Prospect(models.Model):
     qualification_score = models.IntegerField(null=True, blank=True)
     outreach_status = models.CharField(max_length=32, choices=OutreachStatus.choices, default=OutreachStatus.PENDING, db_index=True)
     outreach_priority = models.CharField(max_length=16, null=True, blank=True)
+    variation = models.CharField(max_length=1, choices=VARIATIONS, null=True, blank=True,
+                                 help_text="A/B variation, set when the first email is written; kept for every follow-up.")
     outreach_facts = models.JSONField(default=list, blank=True)
     research_summary = models.TextField(null=True, blank=True)
     do_not_contact = models.BooleanField(default=False)
@@ -340,6 +379,7 @@ class Email(models.Model):
         SENT = "sent", "Sent"
         OPENED = "opened", "Opened"
         FAILED = "failed", "Failed"
+        REPLIED = "replied", "Replied"
 
     id = models.AutoField(primary_key=True)
     prospect = models.ForeignKey(Prospect, on_delete=models.CASCADE, related_name="emails")
@@ -376,7 +416,8 @@ class Email(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["prospect", "sequence_step"], name="uq_emails_prospect_step"),
             models.CheckConstraint(
-                condition=models.Q(status__in=["in_review", "approved", "rejected", "sending", "sent", "opened", "failed"]),
+                condition=models.Q(status__in=["in_review", "approved", "rejected", "sending", "sent", "opened", "failed",
+                                               "replied"]),
                 name="ck_emails_status",
             ),
         ]

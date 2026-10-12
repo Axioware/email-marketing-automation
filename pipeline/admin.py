@@ -22,9 +22,11 @@ from django.utils.text import Truncator
 
 from pipeline import jobs, review
 from pipeline.models import (
+    VARIATIONS,
     Business,
     CampaignPrompt,
     EmailPrompt,
+    FollowUp,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -163,6 +165,29 @@ class DiscoveryCampaignForm(forms.ModelForm):
         return country or None
 
 
+class FollowUpInline(admin.TabularInline):
+    model = FollowUp
+    extra = 0
+    fields = ["sequence", "days_after_previous"]
+    verbose_name_plural = "follow-ups (the first email is step 0; each follow-up is written when due and reviewed)"
+
+
+def follow_up_problems(campaign) -> list[str]:
+    """Follow-up steps of a campaign that have no email prompt to write them."""
+    if campaign is None or not campaign.pk:
+        return []
+    steps = list(campaign.follow_ups.values_list("sequence", flat=True))
+    if not steps:
+        return []
+    if campaign.campaign_prompt_id is None:
+        return [f"This campaign has {len(steps)} follow-up(s) but no campaign prompt; follow-ups need email prompts "
+                "for their steps."]
+    covered = set(EmailPrompt.objects.filter(campaign_prompt_id=campaign.campaign_prompt_id)
+                  .values_list("sequence", flat=True))
+    return [f"Follow-up {step} has no email prompt (add one with step {step} to the campaign prompt); it will be "
+            "skipped." for step in steps if step not in covered]
+
+
 @admin.register(DiscoveryCampaign)
 class DiscoveryCampaignAdmin(PipelineAdmin):
     form = DiscoveryCampaignForm
@@ -176,7 +201,14 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
     actions = ["run_pipeline", "fetch_businesses"]
+    inlines = [FollowUpInline]
     change_form_template = "admin/pipeline/discoverycampaign/change_form.html"
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        if request.method == "GET":
+            for problem in follow_up_problems(DiscoveryCampaign.objects.filter(pk=object_id).first()):
+                self.message_user(request, problem, messages.WARNING)
+        return super().change_view(request, object_id, form_url, extra_context)
 
     def get_queryset(self, request):
         return super().get_queryset(request).annotate(business_total=Count("businesses"))
@@ -228,7 +260,7 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
 class EmailPromptInline(admin.StackedInline):
     model = EmailPrompt
     extra = 0
-    fields = ["name", "is_default", "prompt"]
+    fields = [("name", "sequence", "variation", "opened", "is_default"), "prompt"]
     show_change_link = True
 
 
@@ -283,7 +315,7 @@ class CampaignPromptAdmin(PipelineAdmin):
 class EmailPromptForm(forms.ModelForm):
     class Meta:
         model = EmailPrompt
-        fields = ["campaign_prompt", "name", "is_default", "prompt"]
+        fields = ["campaign_prompt", "name", "sequence", "variation", "opened", "is_default", "prompt"]
         widgets = {"prompt": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"})}
 
     def __init__(self, *args, **kwargs):
@@ -291,24 +323,39 @@ class EmailPromptForm(forms.ModelForm):
         if not self.instance.pk:
             self.initial.setdefault("prompt", generation.DEFAULT_EMAIL_PROMPT)
 
+    def clean(self):
+        cleaned = super().clean()
+        # A follow-up prompt left on the first-email starting text gets the follow-up starting text instead.
+        if cleaned.get("sequence") and (cleaned.get("prompt") or "").strip() == generation.DEFAULT_EMAIL_PROMPT.strip():
+            cleaned["prompt"] = generation.DEFAULT_FOLLOW_UP_PROMPT
+        if not cleaned.get("sequence") and cleaned.get("opened") is not None:
+            self.add_error("opened", "Only follow-ups (step 1 or later) can depend on whether the previous email was opened.")
+        return cleaned
+
 
 @admin.register(EmailPrompt)
 class EmailPromptAdmin(PipelineAdmin):
     form = EmailPromptForm
-    list_display = ["name", "campaign_prompt", "is_default", "email_count", "updated_at"]
-    list_filter = ["campaign_prompt", "is_default"]
+    list_display = ["name", "campaign_prompt", "sequence", "variation", "opened_display", "is_default", "email_count",
+                    "updated_at"]
+    list_filter = ["campaign_prompt", "sequence", "variation", "opened", "is_default"]
     search_fields = ["name", "prompt", "campaign_prompt__name"]
     readonly_fields = ["created_at", "updated_at", "full_prompt_display"]
     fieldsets = [
-        (None, {"fields": ["campaign_prompt", "name", "is_default", "prompt"],
-                "description": "How to write one kind of email. The model receives the campaign prompt followed by "
-                               "this text."}),
+        (None, {"fields": ["campaign_prompt", "name", "sequence", "variation", "opened", "is_default", "prompt"],
+                "description": "How to write one email of the sequence. Step 0 is the first email, step 1 the first "
+                               "follow-up, and so on. The model receives the campaign prompt followed by this text. "
+                               "A new follow-up prompt starts with the built-in follow-up text."}),
         ("What the model receives", {"fields": ["full_prompt_display"], "classes": ["collapse"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related("campaign_prompt").annotate(email_total=Count("emails"))
+
+    @admin.display(description="Previous opened", ordering="opened")
+    def opened_display(self, obj):
+        return {True: "Opened", False: "Not opened", None: "Any"}[obj.opened] if obj.sequence else "-"
 
     @admin.display(description="Emails written", ordering="email_total")
     def email_count(self, obj):
@@ -426,6 +473,12 @@ class ProspectsFilter(ChoiceFilter):
     ]
 
 
+class RepliedFilter(ChoiceFilter):
+    title = "replied"
+    parameter_name = "replied"
+    options = [("yes", "Replied", Q(replied_at__isnull=False)), ("no", "Not replied", Q(replied_at__isnull=True))]
+
+
 class EmailsFilter(ChoiceFilter):
     title = "emails"
     parameter_name = "emails"
@@ -465,7 +518,7 @@ class BusinessAdmin(PipelineAdmin):
     list_display = ["name", "category", "city", "google_rating", "google_review_count", "website",
                     "research_status", "score", "discovery", "contact_count", "prospect_count"]
     list_filter = ["discovery_campaign", HasWebsiteFilter, ResearchStatusFilter, ScoreFilter, ContactSearchFilter,
-                   ContactsFilter, ProspectsFilter, EmailsFilter, RatingFilter, ReviewCountFilter, "category",
+                   ContactsFilter, ProspectsFilter, EmailsFilter, RepliedFilter, RatingFilter, ReviewCountFilter, "category",
                    "country", "city"]
     search_fields = ["name", "category", "city", "state", "address", "domain", "phone", "website_url"]
     change_list_template = "admin/pipeline/business/change_list.html"
@@ -476,11 +529,13 @@ class BusinessAdmin(PipelineAdmin):
         ("Location", {"fields": ["address", "city", "state", "country", "postal_code", "latitude", "longitude"]}),
         ("Google Maps", {"fields": ["google_place_id", "google_maps_url", "google_rating", "google_review_count",
                                     "opening_hours_display", "source", "source_url"], "classes": ["collapse"]}),
+        ("Replies", {"fields": ["replied_at"]}),
         ("Timestamps", {"fields": ["first_discovered_at", "last_discovered_at", "created_at", "updated_at"],
                         "classes": ["collapse"]}),
     ]
     inlines = [BusinessContactInline, ProspectInline, EmailInline, BusinessSourceInline]
-    actions = ["refresh_details", "research_websites", "find_stakeholders", "verify_emails", "generate_emails"]
+    actions = ["refresh_details", "research_websites", "find_stakeholders", "verify_emails", "generate_emails",
+               "mark_replied", "clear_replied"]
     list_select_related = ["website_profile"]
 
     def get_queryset(self, request):
@@ -554,6 +609,17 @@ class BusinessAdmin(PipelineAdmin):
     @admin.display(description="Opening hours")
     def opening_hours_display(self, obj):
         return pretty_json(obj.opening_hours)
+
+    @admin.action(description="Mark replied (stop follow-ups)")
+    def mark_replied(self, request, queryset):
+        for business in queryset:
+            review.mark_business_replied(business)
+        self.message_user(request, f"{queryset.count()} business(es) marked replied; no more follow-ups go to them.")
+
+    @admin.action(description="Clear replied (allow follow-ups again)")
+    def clear_replied(self, request, queryset):
+        count = queryset.update(replied_at=None)
+        self.message_user(request, f"{count} business(es) can receive follow-ups again.")
 
     @admin.action(description="Refresh Google Maps details (category, reviews, city)")
     def refresh_details(self, request, queryset):
@@ -745,9 +811,11 @@ class GenerateEmailsForm(forms.Form):
 
 @admin.register(Prospect)
 class ProspectAdmin(PipelineAdmin):
-    list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge", "do_not_contact",
+    list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge", "variation",
+                    "do_not_contact",
                     "qualification_score", "email_verified_at", "last_contacted_at"]
-    list_filter = ["email_status", "verdict", "outreach_status", "do_not_contact", "email_verification_provider"]
+    list_filter = ["email_status", "verdict", "outreach_status", "variation", "do_not_contact",
+                   "email_verification_provider"]
     search_fields = ["email", "business__name", "contact__name"]
     list_select_related = ["business", "contact"]
     autocomplete_fields = ["business", "contact"]
@@ -762,7 +830,7 @@ class ProspectAdmin(PipelineAdmin):
                                  "last_contacted_at", "emails_link"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
-    actions = ["generate_emails", "regenerate_emails", "mark_do_not_contact", "clear_do_not_contact"]
+    actions = ["generate_emails", "regenerate_emails", "mark_replied", "mark_do_not_contact", "clear_do_not_contact"]
 
     @admin.display(description="Email", ordering="email_status")
     def status_badge(self, obj):
@@ -843,6 +911,13 @@ class ProspectAdmin(PipelineAdmin):
         }
         return TemplateResponse(request, "admin/pipeline/generate_emails.html", context)
 
+    @admin.action(description="Mark replied (stop follow-ups to their business)")
+    def mark_replied(self, request, queryset):
+        for prospect in queryset.select_related("business"):
+            review.mark_business_replied(prospect.business, prospect_id=prospect.pk)
+        self.message_user(request, f"{queryset.count()} prospect(s) marked replied; their businesses get no more "
+                                   "follow-ups.")
+
     @admin.action(description="Mark do not contact")
     def mark_do_not_contact(self, request, queryset):
         count = queryset.update(do_not_contact=True)
@@ -893,13 +968,13 @@ class OpenEventInline(ReadOnlyInline):
 @admin.register(Email)
 class EmailAdmin(PipelineAdmin):
     form = EmailReviewForm
-    list_display = ["id", "business", "recipient", "subject_short", "status_badge", "generated_at", "sent_at",
-                    "open_count", "edited"]
+    list_display = ["id", "business", "recipient", "subject_short", "step", "variation", "status_badge",
+                    "generated_at", "sent_at", "open_count", "edited"]
     list_display_links = ["id", "subject_short"]
-    list_filter = ["status", "email_prompt", "generation_provider", "sequence_step"]
+    list_filter = ["status", "sequence_step", "prospect__variation", "email_prompt", "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
-    list_select_related = ["business"]
-    actions = ["approve_selected", "reject_selected", "send_selected"]
+    list_select_related = ["business", "prospect"]
+    actions = ["approve_selected", "reject_selected", "send_selected", "mark_replied_selected"]
     inlines = [OpenEventInline]
     change_form_template = "admin/pipeline/email/change_form.html"
     change_list_template = "admin/pipeline/email/change_list.html"
@@ -994,6 +1069,26 @@ class EmailAdmin(PipelineAdmin):
                          "open_rate": review.open_rate(counts)}
         return super().changelist_view(request, extra_context=extra_context)
 
+    @admin.display(description="Step", ordering="sequence_step")
+    def step(self, obj):
+        return "First email" if obj.sequence_step == generation.SEQUENCE_STEP else f"Follow-up {obj.sequence_step - 1}"
+
+    @admin.display(description="Variation", ordering="prospect__variation")
+    def variation(self, obj):
+        return (obj.prospect.variation or "-").upper()
+
+    @admin.action(description="Mark replied (stop follow-ups to their businesses)")
+    def mark_replied_selected(self, request, queryset):
+        done = skipped = 0
+        for email in queryset:
+            try:
+                review.mark_replied(email)
+                done += 1
+            except review.ReviewError:
+                skipped += 1
+        extra = f", {skipped} skipped (not sent yet)" if skipped else ""
+        self.message_user(request, f"{done} email(s) marked replied{extra}.")
+
     @admin.action(description="Approve selected emails (in review only)")
     def approve_selected(self, request, queryset):
         done, skipped = review.bulk("approve", list(queryset.values_list("pk", flat=True)))
@@ -1021,7 +1116,7 @@ class EmailAdmin(PipelineAdmin):
             path(f"<int:object_id>/{name}/", self.admin_site.admin_view(view), name=f"pipeline_email_{name}")
             for name, view in (("approve", self.approve_view), ("reject", self.reject_view),
                                ("reopen", self.reopen_view), ("regenerate", self.regenerate_view),
-                               ("send", self.send_view))
+                               ("send", self.send_view), ("replied", self.replied_view))
         ]
         return actions + super().get_urls()
 
@@ -1083,6 +1178,9 @@ class EmailAdmin(PipelineAdmin):
         prompt_id = request.POST.get("email_prompt") or ""
         prompt = EmailPrompt.objects.filter(pk=prompt_id).first() if prompt_id.isdigit() else None
         return self._review_action(request, object_id, lambda e: review.regenerate(e, prompt))
+
+    def replied_view(self, request, object_id):
+        return self._review_action(request, object_id, review.mark_replied)
 
     def send_view(self, request, object_id):
         return self._review_action(request, object_id, lambda e: review.send(e, request.POST.get("confirm", "")))

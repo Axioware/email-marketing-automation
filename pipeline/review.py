@@ -7,11 +7,11 @@ from datetime import datetime, timezone
 
 from django.db.models import Count, Q
 
-from pipeline.models import Email, EmailPrompt
+from pipeline.models import Business, Email, EmailPrompt
 from pipeline.services import generation, sending
 
 EDITABLE = ("in_review", "approved", "rejected")
-STATUS_ORDER = ("in_review", "approved", "rejected", "sent", "opened", "failed", "sending")
+STATUS_ORDER = ("in_review", "approved", "rejected", "sent", "opened", "replied", "failed", "sending")
 MAX_SUBJECT = generation.MAX_SUBJECT_CHARS
 MAX_BODY = generation.MAX_BODY_CHARS
 
@@ -29,7 +29,34 @@ def _transition(email_id: int, allowed_from: tuple[str, ...], **values) -> bool:
 
 
 def prospect_ready(email: Email) -> bool:
-    return email.prospect.is_ready
+    """Whether this email may still be sent to its prospect (a follow-up also goes to an already contacted one)."""
+    prospect = email.prospect
+    statuses = ("ready",) if email.sequence_step == generation.SEQUENCE_STEP else ("ready", "contacted")
+    return (prospect.email_status == "deliverable" and prospect.outreach_status in statuses
+            and not prospect.do_not_contact and email.business.replied_at is None)
+
+
+def mark_replied(email: Email) -> str:
+    """Record a reply to a sent email: the email becomes Replied and its business gets no more follow-ups."""
+    if email.status == "replied":
+        return "Already marked as replied."
+    if not _transition(email.pk, ("sent", "opened"), status="replied"):
+        raise ReviewError("Only sent or opened emails can be marked replied.")
+    Business.objects.filter(pk=email.business_id, replied_at__isnull=True).update(replied_at=_now())
+    return "Marked replied. No more follow-ups go to this business."
+
+
+def mark_business_replied(business: Business, prospect_id: int | None = None) -> str:
+    """Mark the latest sent email of a business (or of one of its prospects) as replied; with no sent email, just
+    stop follow-ups for the business."""
+    emails = Email.objects.filter(business=business, status__in=("sent", "opened"))
+    if prospect_id is not None:
+        emails = emails.filter(prospect_id=prospect_id)
+    latest = emails.order_by("-sent_at", "-id").first()
+    if latest is not None:
+        return mark_replied(latest)
+    Business.objects.filter(pk=business.pk, replied_at__isnull=True).update(replied_at=_now())
+    return "Marked replied. No more follow-ups go to this business."
 
 
 def has_placeholder(email: Email) -> bool:
@@ -111,6 +138,16 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
     else the one the email was written with, else its campaign's default."""
     if email.status not in generation.REGENERATABLE_STATUSES:
         raise ReviewError("Only emails in review or rejected can be regenerated.")
+    if email.sequence_step > generation.SEQUENCE_STEP:  # a follow-up: rewritten from the thread so far
+        from pipeline.services import followups
+
+        try:
+            provider, model = followups.regenerate(email, email_prompt)
+        except ValueError as error:
+            raise ReviewError(str(error)) from error
+        except Exception as error:  # noqa: BLE001 - show any model/API failure to the reviewer
+            raise ReviewError(f"Regeneration failed ({type(error).__name__}): {error}"[:300]) from error
+        return f"Regenerated with {provider} ({model})."
     llm = generation.make_llm_client()
     base_url = generation.default_tracking_base_url()
     if llm is None or not base_url:
@@ -120,6 +157,7 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
     if not rows:
         raise ReviewError("The prospect is no longer ready for outreach (check its status).")
     row = rows[0]
+    generation.assign_variation(row)
     system_prompt, email_prompt_id = generation.resolve_prompt(row, email_prompt or email.email_prompt)
     try:
         draft = generation.generate_draft(client, model, generation.prospect_context(row), system_prompt)
@@ -139,6 +177,8 @@ def send(email: Email, confirm: str) -> str:
         raise ReviewError("Type the recipient's address exactly to confirm sending.")
     if has_placeholder(email):
         raise ReviewError("This email still contains placeholder text.")
+    if email.business.replied_at is not None:
+        raise ReviewError("Someone at this business replied, so no more emails go to it; not sent.")
     if not prospect_ready(email):
         raise ReviewError("The prospect is no longer ready for outreach; not sent.")
     if email.recipient.casefold() != email.prospect.email.casefold():
