@@ -257,8 +257,22 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
         return super().render_change_form(request, context, *args, **kwargs)
 
 
+class OpenedSelect(forms.NullBooleanSelect):
+    """The "opened" choice in plain words: any / opened / not opened (Django says Unknown / Yes / No)."""
+
+    def __init__(self, attrs=None):
+        super().__init__(attrs)
+        self.choices = [("unknown", "Any (opened or not)"), ("true", "Previous email opened"),
+                        ("false", "Previous email not opened")]
+
+
 class EmailPromptInline(admin.StackedInline):
     model = EmailPrompt
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        if db_field.name == "opened":
+            kwargs["widget"] = OpenedSelect
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
     extra = 0
     fields = [("name", "sequence", "variation", "opened", "is_default"), "prompt"]
     show_change_link = True
@@ -316,7 +330,7 @@ class EmailPromptForm(forms.ModelForm):
     class Meta:
         model = EmailPrompt
         fields = ["campaign_prompt", "name", "sequence", "variation", "opened", "is_default", "prompt"]
-        widgets = {"prompt": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"})}
+        widgets = {"prompt": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"}), "opened": OpenedSelect}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1066,7 +1080,7 @@ class EmailAdmin(PipelineAdmin):
         chips = [{"status": status, "label": Email.Status(status).label, "count": counts[status]}
                  for status in review.STATUS_ORDER]
         extra_context = {**(extra_context or {}), "status_chips": chips, "email_total": sum(counts.values()),
-                         "open_rate": review.open_rate(counts)}
+                         "open_rate": review.open_rate(counts), "open_tracking": generation.OPEN_TRACKING}
         return super().changelist_view(request, extra_context=extra_context)
 
     @admin.display(description="Step", ordering="sequence_step")

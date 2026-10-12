@@ -198,7 +198,7 @@ A campaign can send follow-up emails to people who did not reply, a set number o
 
 **2. Write the prompts.** In **Email prompts** (or inside the campaign prompt) add a prompt for each follow-up step with **Sequence** set to its number. A new follow-up prompt starts from a built-in follow-up text. Optional:
 - **Variation** (A, B, C): A/B testing. When a prospect's first email is written, the prospect joins the variation with the fewest prospects and stays in it for every follow-up, so you compare whole sequences.
-- **Opened** (Yes / No / Unknown = any): a different message for people who opened, or did not open, the previous email.
+- **Opened** (Any / Previous email opened / Previous email not opened): a different message for people who opened, or did not open, the previous email.
 
 For each step the prompt is chosen in this order: the prospect's variation with the matching "opened" setting, the prospect's variation with "any", the step's **default** prompt, any prompt of the step. If a follow-up step has no prompt at all, that follow-up is skipped and the run says so; the campaign page warns you about such steps.
 
@@ -245,15 +245,15 @@ Useful arguments:
 - **Add a contact by hand:** **Contacts > Add contact**, then run **Verify** for that contact. Hand-added contacts are kept when Find decision makers runs again.
 - **Status meanings:** Ready (can be emailed), Needs review (risky or unknown address), Rejected (undeliverable), Contacted (an email was sent). The **Verdict** column says exactly why an address is not ready.
 
-## 7. Open tracking
+## 7. Open tracking (off)
 
-When a recipient opens an email and their email app loads images, the open is recorded: the email's status changes from **Sent** to **Opened**, and the time and email app appear under **Email opens** on the email's page. The Emails list shows the overall **open rate**.
+Open tracking is **switched off**: emails are sent without any image, so nobody's opens are recorded. The email still ends with the Axioware footer text (company details and the unsubscribe line).
 
-Keep in mind:
+What this means in the admin:
+- The open rate shows as "off" on the dashboard and the Emails list, and emails stay **Sent** (they never become Opened).
+- Follow-up prompts set to "Previous email opened" or "Previous email not opened" are not used; the prompts set to "Any" are.
 
-- An open means the image was loaded. Some apps block images (no open recorded) and some security scanners load them automatically (an open that was not a person).
-- Opens are only counted after an email is sent; previews in the admin never count.
-- Treat the open rate as a signal, not an exact number.
+Tracking can be switched back on later by a developer (see the README); everything it needs is still in place.
 
 ## 8. Automating with the API
 

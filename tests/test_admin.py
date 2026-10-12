@@ -206,14 +206,20 @@ class EmailReviewTests(AdminCase):
         self.assertIn("Alpha subject", page)
         self.assertNotIn("Beta subject", page)
 
+    def test_detail_preview_has_no_image_while_tracking_is_off(self):
+        eid = self.email()
+        page = self.client.get(self.change_url(eid)).content.decode()
+        self.assertNotIn("&lt;img", page)  # the preview (srcdoc) carries no image at all
+        self.assertIn("Hours: 9-5", page)  # website findings shown to the reviewer
+        self.assertIn("Strong reviews", page)
+
+    @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_detail_preview_never_uses_the_tracking_url(self):
         eid = self.email()
         token = self.row(eid)["tracking_token"]
         page = self.client.get(self.change_url(eid)).content.decode()
         self.assertNotIn(f"{BASE}/{token}", page)  # viewing in the admin must not count as an open
         self.assertIn("storage/v1/object/public/email-assets/footer.png", page)
-        self.assertIn("Hours: 9-5", page)  # website findings shown to the reviewer
-        self.assertIn("Strong reviews", page)
 
     def test_hostile_recipient_cannot_reach_inline_javascript(self):
         evil = "x');alert(document.cookie);//@evil.org"
@@ -243,7 +249,8 @@ class EmailReviewTests(AdminCase):
         self.assertEqual(row["subject"], "New subject")
         self.assertEqual(g.editable_body(row["body_text"]), "Hi Ali,\n\nRewritten.")
         self.assertIn(g.FOOTER_TEXT.splitlines()[0], row["body_text"])
-        self.assertIn(f"{BASE}/{token}", row["body_html"])
+        self.assertNotIn("<img", row["body_html"])  # open tracking is off: no image
+        self.assertEqual(row["tracking_token"], token)
         self.assertIn("Rewritten.", row["body_html"])
         self.assertIsNotNone(row["edited_at"])
         self.assertEqual(row["status"], "in_review")
@@ -315,7 +322,7 @@ class EmailReviewTests(AdminCase):
         self.assertEqual(row["status"], "in_review")
         self.assertIn("Idea for Clinic", row["subject"])
         self.assertEqual(row["tracking_token"], token)
-        self.assertIn(f"{BASE}/{token}", row["body_html"])
+        self.assertNotIn("<img", row["body_html"])
 
     def test_regenerate_failure_is_shown_and_changes_nothing(self):
         eid = self.email()
@@ -357,6 +364,7 @@ class EmailReviewTests(AdminCase):
         self.assertContains(self.post_action(eid, "send", confirm="reject@x.org"), "marked failed")
         self.assertEqual(self.row(eid)["status"], "failed")
 
+    @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_opens_are_shown(self):
         eid = self.email("approved")
         self.post_action(eid, "send", confirm=self.row(eid)["recipient"])

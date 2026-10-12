@@ -13,7 +13,7 @@ cd email-marketing-automation
 python -m venv .venv && source .venv/bin/activate    # skip if .venv already exists
 python -m pip install -r requirements.txt
 python -m playwright install chromium               # Modules 1 and 2
-cp .env_example .env                                # then fill it in (see below)
+cp .env.example .env                                # then fill it in (see below)
 python manage.py migrate                            # creates / updates every table
 python manage.py createsuperuser                    # your admin login
 python manage.py runserver                          # http://127.0.0.1:8000/admin/
@@ -75,7 +75,7 @@ docker rm -f reacher                # delete it (the next run recreates it from 
 
 If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the container automatically. Port 8080 already in use? Set `REACHER_URL=http://127.0.0.1:8081` in `.env` and that port is used. Add `--no-auto-start` to manage the container yourself (command in Module 4 below).
 
-`.env` keys (`.env_example` lists every one):
+`.env` keys (`.env.example` lists every one):
 
 | Needed for | Keys |
 |---|---|
@@ -285,7 +285,11 @@ python manage.py generate_emails --limit 1 --dry-run
 
 Options: `--prospect-id`, `--business-id` (both repeatable), `--email-prompt-id` (default: each campaign's default email prompt), `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
 
-### Open tracking
+### Open tracking (switched off)
+
+**Open tracking is off: emails contain no image, and opens are not recorded.** Emails carry the body and the footer text (company details and unsubscribe line) only. Everything tracking needs is kept as a placeholder so it can be turned back on: each email's tracking token and open fields (`open_count`, `first_opened_at`, `last_opened_at`, status `opened`), the `email_open_events` table, the `record_email_open` database function and the Supabase edge function. While it is off, the dashboard and the Emails list show the open rate as "off", `EMAIL_TRACKING_BASE_URL` is not needed, and follow-up prompts set to "previous email opened / not opened" are not chosen (opens are unknown).
+
+To turn it back on, set `OPEN_TRACKING = True` in `pipeline/services/generation.py`: new emails then carry the tracked footer image again. How it works when on:
 
 Each email gets a random tracking token (`secrets.token_urlsafe(32)`) that contains nothing about the recipient. The HTML footer image points at the Supabase Edge Function `email`:
 

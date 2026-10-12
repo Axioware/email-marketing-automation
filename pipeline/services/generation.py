@@ -1,9 +1,10 @@
-"""Generate one outreach email per prospect and store it in `emails` for review, ready for open tracking.
+"""Generate one outreach email per prospect and store it in `emails` for review.
 
 For every prospect that is ready for outreach (deliverable email, `outreach_status = 'ready'`, not
 `do_not_contact`) the LLM writes a subject and body from what earlier modules learned about the business and the
-contact. Each email gets a cryptographically random tracking token, and its HTML footer image points at the
-tracking edge function (`/email/footer/{token}`), which records opens once the email has been sent.
+contact. Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below): the email
+carries no image. When it is on, the HTML footer image points at the tracking edge function
+(`/email/footer/{token}`), which records opens once the email has been sent.
 
 Nothing is sent here: emails are stored with status `in_review`; approve or edit them in the admin
 (Pipeline > Emails) or through the API. The LLM is Groq when its key is set, otherwise OpenAI (see `llm.py`).
@@ -112,6 +113,10 @@ MAX_BODY_CHARS = 5000
 FOOTER_ALT = "Axioware"
 FOOTER_WIDTH = 600  # matches assets/email-footer.png (rendered at 2x)
 TRACKING_PATH = "/functions/v1/email/footer"
+# Open tracking is switched off: emails carry no image, so opens are not recorded. Everything it needs stays in place
+# (tracking tokens, the open fields on emails, the Supabase edge function and record_email_open); set this to True
+# (and EMAIL_TRACKING_BASE_URL if the database is not on Supabase) to send the tracked footer image again.
+OPEN_TRACKING = False
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")  # must match the edge function's check
 
 
@@ -186,17 +191,27 @@ def footer_preview_url(base_url: str | None) -> str | None:
     return None
 
 
-def render_html(body: str, footer_url: str) -> str:
-    """Plain-text body as escaped HTML paragraphs, then the tracked footer image and the footer text."""
+def footer_image_url(token: str) -> str | None:
+    """The tracked footer image for an email, or None while open tracking is off (no image is sent at all)."""
+    if not OPEN_TRACKING:
+        return None
+    base_url = default_tracking_base_url()
+    return tracking_url(base_url, token) if base_url else None
+
+
+def render_html(body: str, footer_url: str | None = None) -> str:
+    """Plain-text body as escaped HTML paragraphs, then the footer image (only when a URL is given) and the footer
+    text."""
     image = (
         f'<a href="{FOOTER_LINK}"><img src="{html.escape(footer_url, quote=True)}" alt="{FOOTER_ALT}" '
-        f'width="{FOOTER_WIDTH}" style="display:block;border:0;max-width:100%;height:auto;"></a>'
+        f'width="{FOOTER_WIDTH}" style="display:block;border:0;max-width:100%;height:auto;"></a>\n'
+        if footer_url else ""
     )
     footer_text = _paragraphs_html(FOOTER_TEXT).replace("<p>", '<p style="font-size:12px;color:#666;">')
     return (
         "<!doctype html>\n<html><body>\n"
         f"{_paragraphs_html(body)}\n"
-        f'<div class="footer">\n{image}\n{footer_text}\n</div>\n'
+        f'<div class="footer">\n{image}{footer_text}\n</div>\n'
         "</body></html>"
     )
 
@@ -480,8 +495,7 @@ def add_arguments(parser) -> None:
 def run(options: dict) -> int:
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
-    base_url = default_tracking_base_url()
-    if not base_url:
+    if OPEN_TRACKING and not default_tracking_base_url():
         raise CommandError("Set EMAIL_TRACKING_BASE_URL (e.g. https://<project>.supabase.co/functions/v1/email/footer) in .env")
     llm = make_llm_client()
     if llm is None:
@@ -497,7 +511,7 @@ def run(options: dict) -> int:
         print("Warning: the email prompt is still a placeholder (SYSTEM_PROMPT in pipeline/services/generation.py).")
     if FOOTER_IS_PLACEHOLDER:
         print("Warning: the email footer is still a placeholder (FOOTER_TEXT in pipeline/services/generation.py).")
-    print(f"Using {provider} model {model}. Tracking URL base: {base_url}")
+    print(f"Using {provider} model {model}. Open tracking is " + ("on." if OPEN_TRACKING else "off (no image in emails)."))
 
     try:
         queue = load_prospects(options)
@@ -518,7 +532,7 @@ def run(options: dict) -> int:
                 failed += 1
                 print(f"  Prospect {row['prospect_id']} <{row['recipient']}> failed ({type(error).__name__}): {error}")
                 continue
-            body_html = render_html(draft.body, tracking_url(base_url, token))
+            body_html = render_html(draft.body, footer_image_url(token))
             print(f"  Prospect {row['prospect_id']} <{row['recipient']}> (variation {row['variation'].upper()}): "
                   f"{draft.subject}")
             if options["dry_run"]:

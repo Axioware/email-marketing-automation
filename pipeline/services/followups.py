@@ -67,12 +67,13 @@ def thread_context(prospect_id: int, before_step: int) -> list[dict]:
     emails = Email.objects.filter(prospect_id=prospect_id, sequence_step__lt=before_step, sent_at__isnull=False)
     return [
         {"step": email.sequence_step, "subject": email.subject, "body": generation.editable_body(email.body_text),
-         "sent_on": email.sent_at.date().isoformat(), "opened": email.open_count > 0}
+         "sent_on": email.sent_at.date().isoformat(),
+         **({"opened": email.open_count > 0} if generation.OPEN_TRACKING else {})}  # unknown while tracking is off
         for email in emails.order_by("sequence_step")
     ]
 
 
-def write_followup(item: dict, llm: tuple, base_url: str, chosen: EmailPrompt | None = None, dry_run: bool = False,
+def write_followup(item: dict, llm: tuple, chosen: EmailPrompt | None = None, dry_run: bool = False,
                    cache: dict | None = None) -> tuple[str, str]:
     """Write one follow-up. Returns (outcome, detail): ("saved", subject), ("dry_run", body), ("skipped", reason)."""
     client, model, provider = llm
@@ -81,7 +82,8 @@ def write_followup(item: dict, llm: tuple, base_url: str, chosen: EmailPrompt | 
         return "skipped", "the prospect no longer exists"
     row = rows[0]
     generation.assign_variation(row, save=not dry_run)
-    previous_opened = item["previous"].open_count > 0
+    # Without open tracking nobody's opens are known, so "opened"/"not opened" prompts are not chosen.
+    previous_opened = item["previous"].open_count > 0 if generation.OPEN_TRACKING else None
     resolved = generation.resolve_prompt(row, chosen, cache, sequence=item["sequence"], previous_opened=previous_opened)
     if resolved is None:
         return "skipped", f"no email prompt for follow-up {item['sequence']} in this campaign's prompts"
@@ -96,7 +98,7 @@ def write_followup(item: dict, llm: tuple, base_url: str, chosen: EmailPrompt | 
         return "dry_run", f"{draft.subject}\n{draft.body}"
     existing = Email.objects.filter(prospect_id=item["prospect_id"], sequence_step=item["step"]).first()
     token = existing.tracking_token if existing else generation.new_tracking_token()
-    body_html = generation.render_html(draft.body, generation.tracking_url(base_url, token))
+    body_html = generation.render_html(draft.body, generation.footer_image_url(token))
     if not generation.save_draft(row, draft, body_html, token, provider, model, now(), email_prompt_id,
                                  sequence_step=item["step"]):
         return "skipped", "that follow-up was already written and is no longer in review"
@@ -126,8 +128,7 @@ def run(options: dict) -> int:
         if not due:
             print("No follow-ups are due.")
             return 0
-        base_url = generation.default_tracking_base_url()
-        if not base_url:
+        if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
             raise CommandError("Set EMAIL_TRACKING_BASE_URL in .env")
         llm = generation.make_llm_client()
         if llm is None:
@@ -138,7 +139,7 @@ def run(options: dict) -> int:
         for item in due:
             label = f"Prospect {item['prospect_id']} <{item['previous'].recipient}>, follow-up {item['sequence']}"
             try:
-                outcome, detail = write_followup(item, llm, base_url, chosen, options["dry_run"], cache)
+                outcome, detail = write_followup(item, llm, chosen, options["dry_run"], cache)
             except Exception as error:  # one bad follow-up must not stop the others
                 failed += 1
                 print(f"  {label} failed ({type(error).__name__}): {error}")
@@ -168,10 +169,9 @@ def regenerate(email: Email, chosen: EmailPrompt | None = None) -> tuple[str, st
     item = {"prospect_id": email.prospect_id, "step": email.sequence_step, "sequence": email.sequence_step - 1,
             "previous": previous, "follow_up": None}
     llm = generation.make_llm_client()
-    base_url = generation.default_tracking_base_url()
-    if llm is None or not base_url:
-        raise ValueError("Set an LLM key (GROQ_API_KEY or OPENAI_API_KEY) and the tracking URL.")
-    outcome, detail = write_followup(item, llm, base_url, chosen or email.email_prompt)
+    if llm is None:
+        raise ValueError("Set an LLM key (GROQ_API_KEY or OPENAI_API_KEY).")
+    outcome, detail = write_followup(item, llm, chosen or email.email_prompt)
     if outcome != "saved":
         raise ValueError(f"Not regenerated: {detail}")
     return llm[2], llm[1]

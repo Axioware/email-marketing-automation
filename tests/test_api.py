@@ -142,6 +142,7 @@ class ResourceTests(ApiCase):
         self.assertTrue(prospect.do_not_contact)
         self.assertIsNone(prospect.email_verification_provider)  # read-only
 
+    @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_stats(self):
         make_email("sent")
         make_email("opened")
@@ -161,7 +162,7 @@ class EmailApiTests(ApiCase):
         self.assertEqual(response.status_code, 200, response.content)
         email.refresh_from_db()
         self.assertEqual((email.subject, email.status), ("New subject", "in_review"))
-        self.assertIn(f"{BASE}/{email.tracking_token}", email.body_html)
+        self.assertNotIn("<img", email.body_html)  # open tracking is off
         self.assertEqual(response.json()["body"], "Hi Ali,\n\nNew.")
 
     def test_read_only_fields_cannot_be_changed(self):

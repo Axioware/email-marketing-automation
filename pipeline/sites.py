@@ -34,6 +34,7 @@ def run_url(command: str, arguments: str = "") -> str:
 def sequence_results() -> list[dict]:
     """Sent emails per step and A/B variation, with open and reply rates."""
     from pipeline.models import Email
+    from pipeline.services.generation import OPEN_TRACKING as tracking
 
     rows = (Email.objects.filter(sent_at__isnull=False)
             .values("sequence_step", "prospect__variation")
@@ -44,7 +45,7 @@ def sequence_results() -> list[dict]:
         "step": "First email" if row["sequence_step"] == 1 else f"Follow-up {row['sequence_step'] - 1}",
         "variation": (row["prospect__variation"] or "-").upper(),
         "sent": row["sent"],
-        "open_rate": round(100 * row["opened"] / row["sent"]),
+        "open_rate": f"{round(100 * row['opened'] / row['sent'])}%" if tracking else "off",
         "replied": row["replied"],
         "reply_rate": round(100 * row["replied"] / row["sent"]),
     } for row in rows]
@@ -124,11 +125,12 @@ class PipelineAdminSite(admin.AdminSite):
             ("Websites researched", profiles["researched"], changelist("businesswebsiteprofile", status__exact="completed"), "Module 2"),
             (f"Qualified (score {QUALIFIED_SCORE}+)", profiles["qualified"], changelist("business"), "Module 2"),
             ("Contacts found", BusinessContact.objects.count(), changelist("businesscontact"), "Module 3"),
-            ("Verified prospects", ready.count(), changelist("prospect", outreach_status__exact="ready"), "Module 4"),
+            ("Ready to email", ready.count(), changelist("prospect", outreach_status__exact="ready"), "Module 4"),
             ("Emails in review", emails["in_review"], changelist("email", status__exact="in_review"), "Module 5"),
             ("Sent", sent, changelist("email", status__exact="sent"), "Delivery"),
             ("Opened", emails["opened"], changelist("email", status__exact="opened"),
-             f"{review.open_rate(emails)}% open rate" if sent else "Open rate -"),
+             "Open tracking off" if not generation.OPEN_TRACKING
+             else (f"{review.open_rate(emails)}% open rate" if sent else "Open rate -")),
         ]
 
         steps = []
@@ -176,7 +178,7 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("No LLM key: set GROQ_API_KEY or OPENAI_API_KEY in .env (needed to research and write emails).")
         if not os.environ.get("VERIFY_HELO"):
             warnings.append("VERIFY_HELO is not set in .env, so email verification cannot run.")
-        if not generation.default_tracking_base_url():
+        if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
             warnings.append("The open-tracking URL is unknown: set EMAIL_TRACKING_BASE_URL in .env.")
         problems = sending.config_problems(sending.smtp_config())
         if problems:

@@ -33,7 +33,7 @@ html[data-theme="dark"] { --link-fg: #5fd3dc; --link-hover-color: #9be7ec; --lin
 .pipeline-in_review, .pipeline-pending, .pipeline-queued, .pipeline-needs_review, .pipeline-unverified { background: #fff3d6; color: #8a5a00; }
 .pipeline-approved, .pipeline-running, .pipeline-ready, .pipeline-sending { background: #e0f4f6; color: #0b7680; }
 .pipeline-sent, .pipeline-contacted { background: #e6eefb; color: #2456a6; }
-.pipeline-opened, .pipeline-completed, .pipeline-succeeded, .pipeline-deliverable { background: #e7f6f0; color: #1e8a5f; }
+.pipeline-opened, .pipeline-replied, .pipeline-completed, .pipeline-succeeded, .pipeline-deliverable { background: #e7f6f0; color: #1e8a5f; }
 .pipeline-rejected, .pipeline-failed, .pipeline-undeliverable, .pipeline-cancelled { background: #fdecec; color: #b3261e; }
 .pipeline-risky, .pipeline-unknown { background: #f3e8fd; color: #6a2ca0; }
 .pipeline-pre { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 8px 10px; font-size: 12px;

@@ -6,6 +6,6 @@
     {% for chip in status_chips %}
       <a href="?status__exact={{ chip.status }}" class="{% if request.GET.status__exact == chip.status %}active{% endif %}"><b>{{ chip.count }}</b><span>{{ chip.label }}</span></a>
     {% endfor %}
-    <a><b>{% if open_rate is not None %}{{ open_rate }}%{% else %}-{% endif %}</b><span>Open rate</span></a>
+    <a><b>{% if open_rate is not None %}{{ open_rate }}%{% else %}-{% endif %}</b><span>Open rate{% if not open_tracking %} (tracking off){% endif %}</span></a>
   </div>
 {% endblock %}

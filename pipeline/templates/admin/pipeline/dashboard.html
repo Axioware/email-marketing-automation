@@ -33,7 +33,7 @@
       <table>
         <thead><tr><th>Step</th><th>Variation</th><th>Sent</th><th>Open rate</th><th>Replies</th><th>Reply rate</th></tr></thead>
         <tbody>{% for row in results %}
-          <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.open_rate }}%</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
+          <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.open_rate }}</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
         {% endfor %}</tbody>
       </table>
     </div>

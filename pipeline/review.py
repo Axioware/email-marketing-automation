@@ -70,7 +70,7 @@ def editable_body(email: Email) -> str:
 def preview_html(email: Email) -> str:
     """The email as the recipient will see it, with the footer image loaded straight from Storage so viewing a
     preview never counts as an open."""
-    footer = generation.footer_preview_url(generation.default_tracking_base_url()) or ""
+    footer = generation.footer_preview_url(generation.default_tracking_base_url()) if generation.OPEN_TRACKING else None
     return generation.render_html(editable_body(email), footer)
 
 
@@ -81,6 +81,9 @@ def status_counts() -> dict[str, int]:
 
 
 def open_rate(counts: dict[str, int]) -> int | None:
+    """Percentage of sent emails that were opened; None while open tracking is off or nothing was sent."""
+    if not generation.OPEN_TRACKING:
+        return None
     sent_total = counts.get("sent", 0) + counts.get("opened", 0)
     return round(100 * counts.get("opened", 0) / sent_total) if sent_total else None
 
@@ -96,14 +99,13 @@ def save_edit(email: Email, subject: str, body: str) -> str:
         raise ReviewError("Subject and body cannot be empty.")
     if len(subject) > MAX_SUBJECT or len(body) > MAX_BODY:
         raise ReviewError(f"Keep the subject under {MAX_SUBJECT} and the body under {MAX_BODY} characters.")
-    base_url = generation.default_tracking_base_url()
-    if not base_url:
+    if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
         raise ReviewError("Cannot build the tracking URL; set EMAIL_TRACKING_BASE_URL.")
     changed = _transition(
         email.pk, EDITABLE,
         subject=subject,
         body_text=generation.render_text(body),
-        body_html=generation.render_html(body, generation.tracking_url(base_url, email.tracking_token)),
+        body_html=generation.render_html(body, generation.footer_image_url(email.tracking_token)),
         edited_at=_now(),
         status="in_review", reviewed_at=None,  # an edited email always needs a fresh approval
     )
@@ -149,9 +151,8 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
             raise ReviewError(f"Regeneration failed ({type(error).__name__}): {error}"[:300]) from error
         return f"Regenerated with {provider} ({model})."
     llm = generation.make_llm_client()
-    base_url = generation.default_tracking_base_url()
-    if llm is None or not base_url:
-        raise ReviewError("Set an LLM key (GROQ_API_KEY or OPENAI_API_KEY) and the tracking URL.")
+    if llm is None:
+        raise ReviewError("Set an LLM key (GROQ_API_KEY or OPENAI_API_KEY).")
     client, model, provider = llm
     rows = generation.load_prospects({"prospect_id": [email.prospect_id], "regenerate": True})
     if not rows:
@@ -163,7 +164,7 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
         draft = generation.generate_draft(client, model, generation.prospect_context(row), system_prompt)
     except Exception as error:  # noqa: BLE001 - show any model/API failure to the reviewer
         raise ReviewError(f"Regeneration failed ({type(error).__name__}): {error}"[:300]) from error
-    body_html = generation.render_html(draft.body, generation.tracking_url(base_url, row["tracking_token"]))
+    body_html = generation.render_html(draft.body, generation.footer_image_url(row["tracking_token"]))
     if not generation.save_draft(row, draft, body_html, row["tracking_token"], provider, model, _now(), email_prompt_id):
         raise ReviewError("The email changed while it was being regenerated; nothing was saved.")
     return f"Regenerated with {provider} ({model})."

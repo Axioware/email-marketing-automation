@@ -288,7 +288,8 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         self.assertIn("Business 1", first["subject"])
         self.assertIn("Hi P1", first["body_text"])
         self.assertRegex(first["tracking_token"], EDGE_TOKEN_PATTERN)
-        self.assertIn(f'src="{BASE}/{first["tracking_token"]}"', first["body_html"])
+        self.assertNotIn("<img", first["body_html"])  # open tracking is off: no image in the email
+        self.assertIn(g.FOOTER_TEXT.splitlines()[0], first["body_html"])  # the footer text is still there
         self.assertNotEqual(rows[p1]["tracking_token"], rows[p2]["tracking_token"])
         self.assertNotIn("prompt is still a placeholder", out)
         self.assertIn("2 email(s) saved for review", out)
@@ -371,9 +372,19 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         no_llm = self.run_cli(OPENAI_API_KEY="", GROQ_API_KEY="", GROK_API_KEY="")
         self.assertEqual(no_llm.returncode, 1)
         self.assertIn("GROQ_API_KEY", no_llm.stderr)
-        no_base = self.run_cli(EMAIL_TRACKING_BASE_URL="", DATABASE_URL="postgresql://u:p@localhost/db")
+        without_tracking = self.run_cli(EMAIL_TRACKING_BASE_URL="", DATABASE_URL="postgresql://u:p@localhost/db")
+        self.assertNotIn("EMAIL_TRACKING_BASE_URL", without_tracking.stderr)  # not needed while tracking is off
+        with mock.patch.object(g, "OPEN_TRACKING", True):
+            no_base = self.run_cli(EMAIL_TRACKING_BASE_URL="", DATABASE_URL="postgresql://u:p@localhost/db")
         self.assertEqual(no_base.returncode, 1)
         self.assertIn("EMAIL_TRACKING_BASE_URL", no_base.stderr)
+
+    def test_tracked_image_when_open_tracking_is_on(self):
+        self.prospect(1, "a@b1.org")
+        with mock.patch.object(g, "OPEN_TRACKING", True):
+            self.run_cli(expect=0)
+        first = self.emails()[0]
+        self.assertIn(f'src="{BASE}/{first["tracking_token"]}"', first["body_html"])
 
     # --------------------------------------------------------- open tracking (database side)
 

@@ -98,12 +98,19 @@ class DueTests(FollowUpCase):
         self.assertEqual((follow_up.status, follow_up.sequence_step, follow_up.recipient),
                          ("in_review", 2, due.recipient))
         self.assertNotEqual(follow_up.tracking_token, due.tracking_token)
-        self.assertIn(f"{BASE}/{follow_up.tracking_token}", follow_up.body_html)
+        self.assertNotIn("<img", follow_up.body_html)  # open tracking is off
         payload = self.llm.payloads[-1]
-        self.assertEqual(payload["follow_up"], {"number": 1, "previous_email_opened": False})
+        self.assertEqual(payload["follow_up"], {"number": 1, "previous_email_opened": None})  # unknown: tracking off
+        self.assertNotIn("opened", payload["previous_emails"][0])
         self.assertEqual([e["subject"] for e in payload["previous_emails"]], [due.subject])
         self.assertIn("1 follow-up(s) saved for review", result.stdout)
 
+    def test_without_tracking_opened_prompts_are_never_chosen(self):
+        opened = self.sent_email(variation="a", opened=True)
+        self.write()
+        self.assertEqual(self.followup_of(opened).email_prompt.name, "F1 A any")
+
+    @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_prompt_depends_on_variation_and_opened(self):
         not_opened = self.sent_email(variation="a")
         opened = self.sent_email(variation="a", opened=True)
@@ -235,6 +242,7 @@ class ReplyAndSendTests(FollowUpCase):
             cursor.execute("select record_email_open(%s, 'Mail')", [first.tracking_token])
         self.assertEqual(Email.objects.get(pk=first.pk).status, "replied")
 
+    @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_regenerate_a_follow_up(self):
         first = self.sent_email(opened=True)
         self.write()
