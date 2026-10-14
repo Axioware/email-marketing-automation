@@ -4,10 +4,7 @@ Table and column names are the ones the database already uses (they were created
 `manage.py migrate --fake-initial` adopts an existing database without changing it. The Supabase open-tracking edge
 function writes to `emails` and `email_open_events` through the `record_email_open` database function.
 """
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 from django.conf import settings
-from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Now
 from django.utils import timezone
@@ -85,27 +82,7 @@ class EmailPrompt(models.Model):
         super().save(*args, **kwargs)
 
 
-DEFAULT_SEND_TIMEZONE = "Asia/Karachi"
 LEAD_SOURCES = [("browser", "Built-in browser"), ("scraper_api", "Scraper container")]
-
-
-def send_window_constraint(table: str) -> models.CheckConstraint:
-    """A send window is both times (start before end, same day) or neither."""
-    return models.CheckConstraint(
-        condition=models.Q(send_window_start__isnull=True, send_window_end__isnull=True)
-        | models.Q(send_window_start__isnull=False, send_window_end__isnull=False,
-                   send_window_start__lt=models.F("send_window_end")),
-        name=f"ck_{table}_send_window",
-    )
-
-
-def check_send_window(obj) -> None:
-    start, end = obj.send_window_start, obj.send_window_end
-    if (start is None) != (end is None):
-        raise ValidationError({"send_window_end" if start else "send_window_start":
-                               "Set both the start and the end of the send window, or neither."})
-    if start is not None and start >= end:
-        raise ValidationError({"send_window_end": "The end must be later than the start (same day, e.g. 09:00 - 20:00)."})
 
 
 class FollowUp(models.Model):
@@ -114,9 +91,6 @@ class FollowUp(models.Model):
     campaign = models.ForeignKey("DiscoveryCampaign", on_delete=models.CASCADE, related_name="follow_ups")
     sequence = models.PositiveIntegerField(help_text="1 = the first follow-up (the first email is 0).")
     days_after_previous = models.PositiveIntegerField(default=3, help_text="Days after the previous email was sent.")
-    send_window_start = models.TimeField(null=True, blank=True, help_text="Send this follow-up between these times "
-                                                                          "(campaign time zone). Empty: the campaign's window.")
-    send_window_end = models.TimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -128,14 +102,10 @@ class FollowUp(models.Model):
             models.UniqueConstraint(fields=["campaign", "sequence"], name="uq_follow_ups_campaign_sequence"),
             models.CheckConstraint(condition=models.Q(sequence__gte=1), name="ck_follow_ups_sequence"),
             models.CheckConstraint(condition=models.Q(days_after_previous__gte=1), name="ck_follow_ups_days"),
-            send_window_constraint("follow_ups"),
         ]
 
     def __str__(self):
         return f"Follow-up {self.sequence} ({self.days_after_previous} days later)"
-
-    def clean(self):
-        check_send_window(self)
 
 
 class DiscoveryCampaign(models.Model):
@@ -164,13 +134,6 @@ class DiscoveryCampaign(models.Model):
         max_length=20, choices=LEAD_SOURCES, default="browser",
         help_text="How businesses are found on Google Maps: the built-in browser, or the Google Maps scraper container "
                   "(MAPS_SCRAPER_URL in .env).")
-    send_window_start = models.TimeField(
-        null=True, blank=True,
-        help_text="Approved emails are sent between the start and end time, spread evenly (e.g. 09:00 - 20:00). "
-                  "Empty: sent as soon as sending runs.")
-    send_window_end = models.TimeField(null=True, blank=True)
-    send_timezone = models.CharField(max_length=64, default=DEFAULT_SEND_TIMEZONE,
-                                     help_text="Time zone of the send windows, e.g. Asia/Karachi or Europe/London.")
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
@@ -183,20 +146,12 @@ class DiscoveryCampaign(models.Model):
                 condition=models.Q(status__in=["pending", "running", "completed", "failed"]),
                 name="ck_discovery_campaigns_status",
             ),
-            send_window_constraint("discovery_campaigns"),
             models.CheckConstraint(condition=models.Q(lead_source__in=["browser", "scraper_api"]),
                                    name="ck_discovery_campaigns_lead_source"),
         ]
 
     def __str__(self):
         return self.name
-
-    def clean(self):
-        check_send_window(self)
-        try:
-            ZoneInfo(self.send_timezone)
-        except (ZoneInfoNotFoundError, ValueError):
-            raise ValidationError({"send_timezone": "Unknown time zone; use a name like Asia/Karachi."})
 
 
 class Business(models.Model):
@@ -454,8 +409,6 @@ class Email(models.Model):
     reviewed_at = models.DateTimeField(null=True, blank=True)
     review_note = models.TextField(null=True, blank=True)
     edited_at = models.DateTimeField(null=True, blank=True)
-    scheduled_at = models.DateTimeField(null=True, blank=True, db_index=True,
-                                        help_text="When an approved email goes out: a slot in its send window.")
     sent_at = models.DateTimeField(null=True, blank=True)
     sent_from = models.CharField(max_length=320, null=True, blank=True)
     message_id = models.CharField(max_length=255, null=True, blank=True)

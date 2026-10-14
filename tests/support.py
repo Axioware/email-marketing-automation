@@ -96,13 +96,10 @@ def make_email(status="in_review", body="Hi Ali,\n\nA short note.", subject="Hel
                                 status=status)
 
 
-def review_env(smtp, llm) -> dict:
+def review_env(llm) -> dict:
     return {
         "EMAIL_TRACKING_BASE_URL": BASE, "OPENAI_API_KEY": "test", "OPENAI_BASE_URL": llm.url,
-        "OPENAI_MODEL": "fake-model", "GROQ_API_KEY": "", "GROK_API_KEY": "",
-        "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(smtp.port), "SMTP_SECURITY": "none",
-        "SMTP_USERNAME": "user@x.org", "SMTP_PASSWORD": "secret", "SMTP_FROM_EMAIL": "user@x.org",
-        "SMTP_FROM_NAME": "Sender", "SMTP_REPLY_TO": "",
+        "OPENAI_MODEL": "fake-model", "GROQ_API_KEY": "", "GROK_API_KEY": "", "SENDER_NAME": "Sender",
     }
 
 

@@ -1,14 +1,15 @@
-"""Reviewing generated emails: edit, approve, reject, reopen, regenerate and send. Used by the admin and the API.
+"""Reviewing generated emails: edit, approve, reject, reopen, regenerate. Used by the admin and the API.
 
-Every change is a conditional update on the email's current status, so two reviewers (or a reviewer and a send run)
-can never move an email through an invalid transition. Editing always sends an email back to review.
+Every change is a conditional update on the email's current status, so two reviewers can never move an email through
+an invalid transition. Editing always sends an email back to review. This app does not send emails: approved ones
+wait for whichever sending method is chosen.
 """
 from datetime import datetime, timezone
 
 from django.db.models import Count, Q
 
 from pipeline.models import Business, Email, EmailPrompt
-from pipeline.services import generation, sending
+from pipeline.services import generation
 
 EDITABLE = ("in_review", "approved", "rejected")
 STATUS_ORDER = ("in_review", "approved", "rejected", "sent", "opened", "replied", "failed", "sending")
@@ -59,8 +60,12 @@ def mark_business_replied(business: Business, prospect_id: int | None = None) ->
     return "Marked replied. No more follow-ups go to this business."
 
 
+PLACEHOLDER_MARKER = "PLACEHOLDER"
+
+
 def has_placeholder(email: Email) -> bool:
-    return sending.has_placeholder({"subject": email.subject, "body_text": email.body_text, "body_html": email.body_html})
+    """Text left for a person to fill in; such an email cannot be approved."""
+    return any(PLACEHOLDER_MARKER in (getattr(email, field) or "") for field in ("subject", "body_text", "body_html"))
 
 
 def editable_body(email: Email) -> str:
@@ -117,8 +122,7 @@ def save_edit(email: Email, subject: str, body: str) -> str:
 def approve(email: Email) -> str:
     if has_placeholder(email):
         raise ReviewError("This email still contains placeholder text; edit it first.")
-    if not _transition(email.pk, ("in_review",), status="approved", reviewed_at=_now(), review_note=None,
-                       scheduled_at=None):  # its send time is set by the next sending run
+    if not _transition(email.pk, ("in_review",), status="approved", reviewed_at=_now(), review_note=None):
         raise ReviewError("Only emails in review can be approved.")
     return "Approved."
 
@@ -172,39 +176,6 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
     if not generation.save_draft(row, draft, body_html, row["tracking_token"], provider, model, _now(), email_prompt_id):
         raise ReviewError("The email changed while it was being regenerated; nothing was saved.")
     return f"Regenerated with {provider} ({model})."
-
-
-def send(email: Email, confirm: str) -> str:
-    """Send one approved email now. `confirm` must be the recipient's address, typed by the person sending."""
-    if email.status != "approved":
-        raise ReviewError("Only approved emails can be sent.")
-    if (confirm or "").strip().casefold() != email.recipient.casefold():
-        raise ReviewError("Type the recipient's address exactly to confirm sending.")
-    if has_placeholder(email):
-        raise ReviewError("This email still contains placeholder text.")
-    if email.business.replied_at is not None:
-        raise ReviewError("Someone at this business replied, so no more emails go to it; not sent.")
-    if not prospect_ready(email):
-        raise ReviewError("The prospect is no longer ready for outreach; not sent.")
-    if email.recipient.casefold() != email.prospect.email.casefold():
-        raise ReviewError("The recipient no longer matches the prospect's verified address; not sent.")
-    config = sending.smtp_config()
-    problems = sending.config_problems(config)
-    if problems:
-        raise ReviewError("SMTP is not configured: " + "; ".join(problems))
-    message = {field: getattr(email, field) for field in sending.EMAIL_FIELDS}
-    mailer = sending.Mailer(config)
-    try:
-        outcome, detail = sending.send_one(message, config, mailer)
-    finally:
-        mailer.close()
-    if outcome == "sent":
-        return f"Sent to {email.recipient}."
-    if outcome == "failed":
-        raise ReviewError(f"The server rejected it; marked failed: {detail}")
-    if outcome == "stop":
-        raise ReviewError(f"Not sent, still approved: {detail}")
-    raise ReviewError(f"Not sent: {detail}")
 
 
 def bulk(action: str, ids: list[int]) -> tuple[int, int]:

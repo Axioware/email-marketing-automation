@@ -246,3 +246,48 @@ class CrossCampaignTests(ScraperCase):
         maps.accept_record(second, {"id": self.campaign.pk}, [], records)
         self.assertEqual(maps.save_records(records), 1)  # the raced one is skipped, the other saved
         self.assertTrue(Business.objects.filter(name="Hafiz dental clinic", discovery_campaign=self.campaign).exists())
+
+
+class PlaceIdTests(TestCase):
+    def test_place_id_is_read_from_a_maps_link(self):
+        url = ("https://www.google.com/maps/place/Clinic/data=!4m7!3m6!1s0x3eb338acf76:0x1!8m2!3d24.9!4d67.1"
+               "!16s%2Fg%2F11x!19sChIJt1Zu96w4sz4R2EwodF7D35U?authuser=0&hl=en")
+        self.assertEqual(maps.place_id_from_url(url), "ChIJt1Zu96w4sz4R2EwodF7D35U")  # no word boundary before it
+        self.assertIsNone(maps.place_id_from_url("https://www.google.com/maps/search/dentist"))
+        self.assertIsNone(maps.place_id_from_url(None))
+        place = {**PLACES[0], "place_id": None}
+        self.assertEqual(scraper_api.record_from_place({**place, "link": url}, "Pakistan")["business"]["google_place_id"],
+                         "ChIJt1Zu96w4sz4R2EwodF7D35U")
+
+    def test_backfill_migration(self):
+        from importlib import import_module
+
+        from django.apps import apps
+
+        backfill = import_module("pipeline.migrations.0013_backfill_place_ids").backfill_place_ids
+        link = "https://www.google.com/maps/place/X/data=!4m7!19sChIJaaaaaaaaaaaaaaaa?hl=en"
+        campaign = make_campaign()
+        old = make_business(campaign, "Old", google_maps_url=link)
+        BusinessSource.objects.create(business=old, source="google_maps", raw_data={})
+        twin = make_business(campaign, "Twin", google_maps_url=link)  # same place: left empty
+        make_business(campaign, "Has one", google_place_id="ChIJbbbbbbbbbbbbbbbb", google_maps_url=link.replace("a", "b"))
+        backfill(apps, None)
+        old.refresh_from_db()
+        twin.refresh_from_db()
+        self.assertEqual(old.google_place_id, "ChIJaaaaaaaaaaaaaaaa")
+        self.assertEqual(old.sources.get().source_business_id, "ChIJaaaaaaaaaaaaaaaa")
+        self.assertIsNone(twin.google_place_id)
+
+
+@override_settings(AUTH_TOKEN="place-key")
+class PlaceIdApiTests(TestCase):
+    def test_api_refuses_a_second_business_for_the_same_place(self):
+        campaign = make_campaign()
+        make_business(campaign, "First", google_place_id="ChIJcccccccccccccccc")
+        api = APIClient()
+        api.credentials(HTTP_AUTH="place-key")
+        response = api.post("/api/businesses/", {"discovery_campaign": campaign.pk, "name": "Second",
+                                                 "google_place_id": "ChIJcccccccccccccccc"}, format="json")
+        self.assertEqual(response.status_code, 400, response.content)
+        ok = api.post("/api/businesses/", {"discovery_campaign": campaign.pk, "name": "Third"}, format="json")
+        self.assertEqual(ok.status_code, 201, ok.content)

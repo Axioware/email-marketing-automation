@@ -1,6 +1,6 @@
 # Email Marketing Automation
 
-Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email for each, lets you review and approve them, sends them, and tracks opens. It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email for each and lets you review and approve them. It does not send emails: approved emails wait for the sending method you choose. It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
 
 **Using the admin day to day:** see the [user guide](docs/USER_GUIDE.md), also available in the admin under **Guide** (top right).
 
@@ -83,7 +83,7 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 | The API | `AUTH_TOKEN` (sent in every request's `Auth` header) |
 | Research and email writing | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
-| Sending | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` (host, port and security default to Hostinger) |
+| Email sign-off | `SENDER_NAME` (optional; empty: "The Axioware team") |
 
 ### Docker setup (Google Maps scraper, optional second lead source)
 
@@ -100,7 +100,7 @@ docker compose up -d --build      # serves http://127.0.0.1:8001
 curl http://127.0.0.1:8001/       # {"message": "Google Maps Scraper API is running."}
 ```
 
-Set `MAPS_SCRAPER_URL` in `.env` if it runs elsewhere (default `http://127.0.0.1:8001`). The dashboard's **Get leads** panel shows whether it answers. Each search runs inside the container and must finish in its 5-minute limit, so one search asks for at most 40 places (3 places took about 100 seconds in testing; a search that times out is skipped and reported). Its own guidance: at most about 500 places a day per IP, at least a minute between searches.
+Its `docker-compose.yml` should publish the port as `127.0.0.1:8001:8001` (this machine only; the service has no password), not `8001:8001`, which opens it to the whole network. Set `MAPS_SCRAPER_URL` in `.env` if it runs elsewhere (default `http://127.0.0.1:8001`). The dashboard's **Get leads** panel shows whether it answers. Each search runs inside the container and must finish in its 5-minute limit, so one search asks for at most 40 places (3 places took about 100 seconds in testing; a search that times out is skipped and reported). Its own guidance: at most about 500 places a day per IP, at least a minute between searches.
 
 ### The pipeline
 
@@ -118,15 +118,13 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 5. Verify emails | Businesses or Contacts > action **Verify emails** | `python manage.py verify_emails` |
 | 6. Write emails | Prospects or Businesses > action **Generate outreach emails** (choose an email prompt) | `python manage.py generate_emails [--email-prompt-id N]` |
 | 7. Review | Emails: edit, Approve, Reject, Regenerate | - |
-| 8. Send | Email > **Send now**, or Emails > action **Send selected** | `python manage.py send_emails --send` |
-| 9. Follow-ups | Campaign > **Follow-ups** table; dashboard **Write follow-ups**; **Mark replied** on replies | `python manage.py generate_followups` |
+| 8. Follow-ups | Campaign > **Follow-ups** table; dashboard **Write follow-ups**; **Mark replied** on replies | `python manage.py generate_followups` |
 
 Every command has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
 
 ```sh
 python manage.py verify_emails --limit 2 --dry-run
 python manage.py generate_emails --limit 1 --dry-run
-python manage.py send_emails --limit 1          # preview only; add --send to actually send
 ```
 
 ### Pipeline runs (background jobs)
@@ -153,7 +151,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
 | `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |
 | `/api/emails/` | list, view, `PATCH` `subject`/`body` (goes back to review), delete |
-| `/api/emails/{id}/approve/`, `reject/` `{"note"}`, `reopen/`, `regenerate/`, `send/` `{"confirm": "<recipient>"}` | review actions; `409` when not allowed in the email's current status |
+| `/api/emails/{id}/approve/`, `reject/` `{"note"}`, `reopen/`, `regenerate/` | review actions; `409` when not allowed in the email's current status |
 | `/api/emails/{id}/preview/`, `/api/emails/bulk/` `{"action": "approve", "ids": [...]}`, `/api/emails/stats/` | preview HTML, bulk review, counts and open rate |
 | `/api/email-opens/` | recorded opens |
 | `/api/runs/` | start a pipeline step, list and follow runs; `GET /api/runs/commands/` lists commands and options; `POST /api/runs/{id}/cancel/` |
@@ -283,7 +281,7 @@ Reacher's `is_reachable` is mapped as: `safe` -> `deliverable`, `invalid` -> `un
 | `risky` | `catch_all`, `full_inbox`, `disposable`, `risky` |
 | `unknown` | `smtp_unreachable`, `blocked` (the server refused the check), `temporary_failure` (greylisting), `check_failed`, `unknown` |
 
-Only `ready` prospects are ever emailed: generation and sending skip everything else. A rerun skips addresses already stored as deliverable, undeliverable or risky and checks `unknown` ones again; `--recheck` checks everything. Rechecking refreshes the verification columns; `outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact` and `last_contacted_at` belong to later stages and are never overwritten, and a prospect with `do_not_contact` set or one a later stage has moved on (e.g. `contacted`) keeps its `outreach_status`.
+Only `ready` prospects get emails: generation skips everything else. A rerun skips addresses already stored as deliverable, undeliverable or risky and checks `unknown` ones again; `--recheck` checks everything. Rechecking refreshes the verification columns; `outreach_priority`, `outreach_facts`, `research_summary`, `do_not_contact` and `last_contacted_at` belong to later stages and are never overwritten, and a prospect with `do_not_contact` set or one a later stage has moved on (e.g. `contacted`) keeps its `outreach_status`.
 
 If a domain is a catch-all, or its mail server cannot be reached, the remaining addresses on that domain are not probed (they would get the same answer) and are recorded with that outcome (verdict `catch_all`, `probed: false`). Catch-all domains are remembered across runs, so new addresses on them are recorded the same way without a probe; `--probe-all` checks every address anyway. The run stops early if Reacher becomes unreachable, or if it cannot open an SMTP connection to 3 servers in a row (port 25 blocked); results so far are kept.
 
@@ -299,7 +297,7 @@ Options: `--business-id`, `--contact-id` (both repeatable), `--limit` (contacts)
 
 `python manage.py generate_emails` (admin: select prospects or businesses, action **Generate outreach emails**) writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`pipeline/services/llm.py`).
 
-The model's instructions are one **email prompt** (table `email_prompts`, edited in the admin), used as is: it belongs to the campaign's campaign prompt and is chosen per step and A/B variation (default for the first email, or `--email-prompt-id`). There is no built-in prompt: a prospect whose campaign has no email prompt for the first email is skipped and reported. The seeded **First-touch email** writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SMTP_FROM_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
+The model's instructions are one **email prompt** (table `email_prompts`, edited in the admin), used as is: it belongs to the campaign's campaign prompt and is chosen per step and A/B variation (default for the first email, or `--email-prompt-id`). There is no built-in prompt: a prospect whose campaign has no email prompt for the first email is skipped and reported. The seeded **First-touch email** writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SENDER_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
 
 ```sh
 python manage.py generate_emails --limit 1 --dry-run
@@ -344,37 +342,17 @@ Opens are rate limited in the database: at most 10 recorded opens per email per 
 
 Every generated email starts in `in_review`. Review them in the admin under **Emails**:
 
-- **List**: counts per status and the open rate at the top (click one to filter), search by business, recipient or subject, and the actions **Approve selected**, **Reject selected** and **Send selected approved emails**.
-- **Email page**: edit the subject and body (the footer and tracking image are added automatically), see a preview (which loads the footer directly, so viewing never counts as an open), and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (then jumps to the next email in review), **Reject** with an optional note, **Back to review**, **Regenerate with AI**, and **Send now** for approved emails (type the recipient's address to confirm; uses the `SMTP_*` settings in `.env`).
+- **List**: counts per status and the open rate at the top (click one to filter), search by business, recipient or subject, and the actions **Approve selected**, **Reject selected** and **Mark replied**.
+- **Email page**: edit the subject and body (the footer and tracking image are added automatically), see a preview (which loads the footer directly, so viewing never counts as an open), and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (then jumps to the next email in review), **Reject** with an optional note, **Back to review**, and **Regenerate with AI**.
 - Editing an approved email sends it back to review. Emails with `PLACEHOLDER` text cannot be approved. Sent emails are read-only and show their opens.
 
-Statuses: `in_review` -> `approved` -> `sending` -> `sent` -> `opened`, plus `rejected` and `failed`. Only `approved` emails are ever sent, from the admin, the API or `send_emails`.
-
-### Send
-
-`python manage.py send_emails` sends **approved** emails in bulk through SMTP (Hostinger: `smtp.hostinger.com`, port 465, SSL) using the `SMTP_*` settings in `.env`. **Without `--send` it only previews.**
-
-```sh
-python manage.py send_emails --limit 1          # preview
-python manage.py send_emails --limit 1 --send   # send
-```
-
-- Only approved emails whose prospect is still ready (deliverable, `outreach_status = 'ready'`, not `do_not_contact`, same address) are sent.
-- Each email is claimed (`approved` -> `sending`) before sending, so two runs never send the same email. On success it becomes `sent` (`sent_at`, `message_id`, `sent_from`) and the prospect becomes `contacted` with `last_contacted_at`; open tracking counts from then on.
-- A rejected recipient or content marks that email `failed` (`send_error`). A login, connection or temporary error puts the email back to `approved` and stops the run. An email left in `sending` (the process died mid-send) is reported and never retried automatically, since it may have been delivered.
-- Placeholders: `--send` refuses while `FOOTER_TEXT` in `pipeline/services/generation.py` is a placeholder, and skips any email containing `PLACEHOLDER`, unless `--allow-placeholders` is given.
-- Each message has a plain-text and HTML part, the footer (`FOOTER_TEXT`), and a `List-Unsubscribe` header pointing at `SMTP_REPLY_TO` (or the sender).
-
-- **Send windows**: a campaign can have `send_window_start`/`send_window_end` (e.g. 09:00 - 20:00) and `send_timezone` (default `Asia/Karachi`); each follow-up step can have its own window (empty: the campaign's). Each run gives newly approved emails a `scheduled_at` slot, spreading all the emails waiting for a window evenly over what is left of it (the next day's window once today's has ended), and sends only the emails whose slot has come. Run `send_emails --send` every few minutes (cron, or `POST /api/runs/` with `{"command": "send_emails", "options": {"send": true}}`). Emails without a window go out on the next run; `--email-id` (and **Send now** / **Send selected** in the admin) sends the chosen emails immediately. The preview shows the plan without saving it.
-
-Options: `--email-id`, `--business-id` (both repeatable), `--limit`, `--delay` (seconds between sends, default 20), `--timeout`, `--allow-placeholders`.
+Statuses: `in_review` -> `approved`, plus `rejected`. **This app does not send emails** (SMTP sending was removed): approved emails wait for whichever sending method is chosen. The later statuses (`sent`, `opened`, `replied`, `failed`) and the delivery fields (`sent_at`, `message_id`, ...) stay for that sender to fill in; follow-ups become due from an email's `sent_at`, so they start once emails are marked sent.
 
 ### Placeholders to fill
 
 | What | Where |
 |---|---|
 | Footer image | upload `assets/email-footer.png` to Supabase Storage as `email-assets/footer.png` |
-| SMTP account and sender | `SMTP_*` in `.env` |
 
 ## Tests
 
@@ -383,7 +361,7 @@ python manage.py test
 npx deno test supabase/functions/email/handler_test.ts
 ```
 
-Tests never use the `.env` database: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set). Reacher, SMTP and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
+Tests never use the `.env` database: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set). Reacher, the scraper container and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
 
 ## Project layout
 
@@ -391,7 +369,7 @@ Tests never use the `.env` database: they run against a throwaway Postgres conta
 |---|---|
 | `emailautomation/` | Django settings and URLs |
 | `pipeline/models.py` | one model per table |
-| `pipeline/services/` | the pipeline steps (Google Maps, research agent, stakeholders, Reacher, generation, SMTP) |
+| `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups) |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |
 | `pipeline/api/` | the REST API |

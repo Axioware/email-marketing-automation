@@ -11,7 +11,6 @@ from rest_framework.test import APIClient
 from pipeline.models import CampaignPrompt, DiscoveryCampaign, Email, EmailPrompt, PipelineRun
 from pipeline.migrations import _prompt_texts as prompt_texts
 from pipeline.services import research
-from tests.fake_smtp import FakeSmtpServer
 from tests.support import CAMPAIGN_INLINE, make_business, make_campaign, make_email, review_env, run_command
 from tests.test_generate_emails import FakeLLM
 
@@ -20,11 +19,9 @@ KEY = "prompt-test-key"
 
 class PromptCase(TestCase):
     def setUp(self):
-        self.smtp = FakeSmtpServer()
         self.llm = FakeLLM()
-        self.addCleanup(self.smtp.close)
         self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.smtp, self.llm))
+        env = mock.patch.dict(os.environ, review_env(self.llm))
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_superuser("admin", "a@example.org", "pw")

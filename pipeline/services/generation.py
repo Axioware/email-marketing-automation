@@ -28,7 +28,7 @@ from pipeline.services.llm import make_llm_client, rejected_output
 
 # The model's instructions are one email prompt (email_prompts table, edited in the admin), chosen per campaign, step and
 # A/B variation; it receives the JSON built by `prospect_context` as the user message. There is no built-in prompt.
-SENDER_NAME_ENV = "SMTP_FROM_NAME"  # name used in the sign-off; empty -> "The Axioware team"
+SENDER_NAME_ENV = "SENDER_NAME"  # name used in the sign-off; empty -> "The Axioware team"
 MAX_WEBSITE_FINDINGS = 12
 
 # Added under every email, in text and HTML. Outreach law (e.g. CAN-SPAM, GDPR/PECR) generally requires identifying

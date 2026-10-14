@@ -121,9 +121,9 @@ class PromptAndContextTests(unittest.TestCase):
                "google_rating": None, "google_review_count": None, "contact_name": "A B", "first_name": "A",
                "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
                "outreach_facts": [], "research_summary": None}
-        with mock.patch.dict(os.environ, {"SMTP_FROM_NAME": "Abdul Rauf"}):
+        with mock.patch.dict(os.environ, {"SENDER_NAME": "Abdul Rauf"}):
             self.assertEqual(g.prospect_context(row)["sender"], {"name": "Abdul Rauf", "company": "Axioware"})
-        with mock.patch.dict(os.environ, {"SMTP_FROM_NAME": ""}):
+        with mock.patch.dict(os.environ, {"SENDER_NAME": ""}):
             self.assertEqual(g.prospect_context(row)["sender"]["name"], "")
 
 

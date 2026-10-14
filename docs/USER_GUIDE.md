@@ -1,6 +1,6 @@
 # User guide
 
-This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email for each person, and lets you review every email before anything is sent. Opens are tracked after sending.
+This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email for each person, and lets you review and approve every email. **It does not send emails**: approved emails wait for the sending method you choose.
 
 You do everything from the **admin** in your browser. Nothing is ever sent without your approval.
 
@@ -25,7 +25,7 @@ The home page shows the whole pipeline at a glance:
 - **Get leads** lists your campaigns with two buttons each, one per way of finding businesses on Google Maps: **Built-in browser** and **Scraper container**. It also shows whether the scraper container is running. See [Step 2](#step-2-fetch-businesses).
 - **What to do next** lists the jobs that are waiting, with a button for each, e.g. "3 emails are waiting for your review: Start reviewing".
 - **Recent pipeline runs** shows the jobs you started and whether they finished.
-- **Yellow warnings** at the top mean something in the settings is missing (for example the email account for sending). See [Settings](#9-settings).
+- **Yellow warnings** at the top mean something in the settings is missing (for example the AI key). See [Settings](#9-settings).
 
 The left sidebar lists the pages in pipeline order (its **Jump to a page** box only narrows this list of pages, it does not filter records): **Campaigns > Businesses > Website research > Contacts > Prospects > Emails**, then **Pipeline runs**, **Email opens** and **Google Maps listings**.
 
@@ -40,7 +40,6 @@ The left sidebar lists the pages in pipeline order (its **Jump to a page** box o
 | 5. Verify emails | Each guessed address is checked and saved with its result; only real ones are ready to email | Businesses > **Verify contact emails** |
 | 6. Write emails | The AI writes one email per prospect | Prospects > **Generate outreach emails** |
 | 7. Review | You read, edit, approve or reject each email | Emails |
-| 8. Send | Approved emails are sent from your email account | Email > **Send now** |
 
 Each step only processes what still needs it, so it is always safe to run a step again.
 
@@ -48,7 +47,7 @@ Each step only processes what still needs it, so it is always safe to run a step
 
 Open a campaign and click **Run full pipeline** (top right), or tick it on the Campaigns list and use the action **Run the full pipeline**. The run form opens with `--campaign-id N --fetch-limit 20`; change the number of businesses to fetch and click **Start run**.
 
-It runs steps 2 to 6 one after another for that campaign's businesses: find businesses, research websites, find decision makers, verify emails, write emails. You can follow every step on the run page. It **never sends anything**: the new emails wait in **Emails > In review** for you to approve (steps 7 and 8).
+It runs steps 2 to 6 one after another for that campaign's businesses: find businesses, research websites, find decision makers, verify emails, write emails. You can follow every step on the run page. It **never sends anything**: the new emails wait in **Emails > In review** for you to approve (step 7).
 
 - Each step only does what is still needed, so running the pipeline again continues where it left off.
 - If a few items fail (one website is down, for example), the pipeline carries on with the next step.
@@ -65,7 +64,6 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Target country**: one country, e.g. Pakistan.
    - **Target locations**: cities or areas, separated by commas, e.g. `Lahore, DHA, Gulberg`.
    - **Search terms**: what you would type into Google Maps, separated by commas, e.g. `dental clinic, dentist`.
-   - **Send window** (under Sending, optional): e.g. **09:00** to **20:00**, with the **time zone** (default Asia/Karachi). Approved emails go out between these times, spread evenly; see [Send windows](#send-windows). Leave empty to send as soon as sending runs.
    - **Lead source** (under Leads): how businesses are found on Google Maps: **Built-in browser** (default) or **Scraper container**. You can still pick the other one for a single fetch.
    - **Campaign prompt** (under Prompts): what makes a good prospect for this campaign. The AI scores each business's website against it, and its email prompts write the campaign's emails. Pick one from the list, or click **+** to write a new one. Each prompt belongs to one campaign. **Without one, the campaign's businesses are not researched and no emails are written**; the campaign page warns you. See [Prompts](#prompts).
 3. Click **Save**.
@@ -177,7 +175,7 @@ What you can do:
 
 | Button | What it does |
 |---|---|
-| **Approve** | Marks the email ready to send and jumps to the next email in review |
+| **Approve** | Marks the email approved and jumps to the next email in review |
 | **Reject** | Puts it aside; add a reason so you remember why |
 | **Regenerate with AI** | Writes a new version (it stays in review). The menu next to it lets you pick a different email prompt; by default it uses the same one |
 | **Back to review** | Undoes Approve or Reject |
@@ -192,34 +190,15 @@ Editing:
 
 To approve or reject many emails at once: on the Emails list tick them, choose **Approve selected emails** or **Reject selected emails** in the Action menu, and click **Go**. Emails that still contain the word `PLACEHOLDER` cannot be approved.
 
-### Step 8: Send
+### After approval
 
-**One email:** open an approved email. Under **Send now**, type the recipient's address to confirm, then click **Send**.
-
-**Many emails:** on the Emails list tick the approved emails, choose **Send selected approved emails** and click **Go**. The run form opens with `--send`. Click **Start run**. Emails are sent one at a time, 20 seconds apart, to stay within your email provider's limits.
-
-> **Want to check first?** Remove `--send` from the arguments. The run then only lists what would be sent.
-
-After sending, the email's status is **Sent** and the prospect's is **Contacted**. Only approved emails are ever sent, and never twice.
-
-#### Send windows
-
-Give a campaign a send window (e.g. 09:00 - 20:00, in its time zone) and its approved emails are spread evenly over that window instead of going out all at once. Each follow-up can have its own window (in the campaign's **Follow-ups** table); a follow-up without one uses the campaign's.
-
-- Every sending run gives newly approved emails a **send time** (shown as **Scheduled at** on the Emails list and the email page) and sends only the emails whose time has come. Approve 4 emails before 9:00 with a 09:00 - 20:00 window and they go out at 09:00, 11:45, 14:30 and 17:15.
-- Emails approved while the window is open share what is left of it with the emails still waiting: approve one more at 12:00 and the three waiting ones go out at 12:00, 14:40 and 17:20.
-- Once the day's window has ended, emails still waiting move to the next day's window. Nothing is sent outside the window.
-- **Sending has to run regularly** for this to work, e.g. every 5 minutes from a cron job: `*/5 * * * * cd /path/to/project && .venv/bin/python manage.py send_emails --send`, or the API: `POST /api/runs/` with `{"command": "send_emails", "options": {"send": true}}`.
-- **Send now** on an email, and **Send selected approved emails** on the list, send the chosen emails immediately, whatever their window.
-- An email sent back to review and approved again gets a new send time.
-
-If an email shows **Failed**, the recipient's server refused it; the reason is on the email page. If sending stops with a login or connection error, the email goes back to **Approved** so you can try again later.
+This app does not send emails. Approved emails stay under **Emails > Approved** until a sending method is chosen; the email page says so. Their delivery fields (sent, opened, replied) are kept for that sender to fill in.
 
 ### Follow-ups
 
-A campaign can send follow-up emails to people who did not reply, a set number of days after the previous email.
+A campaign can have follow-up emails for people who did not reply, written a set number of days after the previous email was sent. Follow-ups become due from the previous email's **sent** date, so they start once emails are marked sent by the sending method you choose.
 
-**1. Set the schedule.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** 1 for the first follow-up, 2 for the second, and **Days after previous** (e.g. 3, then 7). Optionally give it its own **send window** (e.g. 10:00 - 13:00); empty uses the campaign's. The number of rows is the number of follow-ups. The first email is step 0.
+**1. Set the schedule.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** 1 for the first follow-up, 2 for the second, and **Days after previous** (e.g. 3, then 7). The number of rows is the number of follow-ups. The first email is step 0.
 
 **2. Write the prompts.** In **Email prompts** (or inside the campaign prompt) add a prompt for each follow-up step with **Sequence** set to its number. Write it in full, like the first email's prompt (who we are, the rules, how to write the follow-up); the AI also receives `follow_up` and `previous_emails`, the emails already sent. Optional:
 - **Variation** (A, B, C): A/B testing. When a prospect's first email is written, the prospect joins the variation with the fewest prospects and stays in it for every follow-up, so you compare whole sequences.
@@ -229,7 +208,7 @@ For each step the prompt is chosen in this order: the prospect's variation with 
 
 **3. Write due follow-ups.** The dashboard shows "N follow-ups are due" with a **Write follow-ups** button (or run **Write due follow-ups** as a pipeline step; the full pipeline does it as its last step). A follow-up is written only when the previous email was sent at least the set number of days ago, that follow-up does not exist yet, nobody at the business has replied and the prospect is not do-not-contact. The AI sees the emails already sent, and whether the last one was opened.
 
-**4. Review and send** exactly like first emails (Emails > In review). The email page shows "Follow-up 1", "Follow-up 2", ... and the prospect's variation.
+**4. Review and approve** exactly like first emails (Emails > In review). The email page shows "Follow-up 1", "Follow-up 2", ... and the prospect's variation.
 
 **5. Mark replies.** When someone replies, click **Mark replied** on that email (or use the **Mark replied** action on Emails, Prospects or Businesses). The email becomes **Replied** and **nobody at that business gets more follow-ups**; a follow-up already written or approved for it is not sent. **Clear replied** on Businesses undoes it.
 
@@ -237,7 +216,7 @@ For each step the prompt is chosen in this order: the prospect's variation with 
 
 ## 5. Pipeline runs
 
-Steps 2-6 and bulk sending can take minutes, so they run in the background as **pipeline runs**.
+Steps 2-6 can take minutes, so they run in the background as **pipeline runs**.
 
 - **Starting:** an action opens the run form with the command and the selected records filled in. You can edit the **Arguments** before clicking **Start run**. All available options for each step are listed under the form.
 - **Watching:** the run page shows the output as it happens and refreshes every few seconds. You can leave the page and come back; the run continues.
@@ -264,7 +243,6 @@ Useful arguments:
 | `--primary-only` | Verify | Only the main contact of each business |
 | `--regenerate` | Generate emails | Rewrite emails that are in review or rejected |
 | `--campaign-id N` | Write due follow-ups | Only that campaign's follow-ups |
-| `--send` | Send | Actually send (without it, only a preview) |
 
 ## 6. Managing prospects
 
@@ -312,8 +290,7 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | `AUTH_TOKEN` | The API: every request must send it in the `Auth` header |
 | `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) and writing emails (step 6) |
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
-| `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` | Sending (step 8); `SMTP_FROM_NAME` is also the name in each email's sign-off |
-| `SMTP_REPLY_TO` | Optional: where replies and unsubscribe requests go |
+| `SENDER_NAME` | Optional: the name in each email's sign-off (empty: "The Axioware team") |
 | `MAPS_SCRAPER_URL` | Optional: where the scraper container answers (default `http://127.0.0.1:8001`) |
 
 ## 10. Troubleshooting
@@ -321,7 +298,6 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | Problem | What to do |
 |---|---|
 | A yellow warning on the dashboard | Add the missing setting to `.env` and restart the app |
-| "Sending is not set up" / "SMTP is not configured" | Fill in the `SMTP_*` settings |
 | A run failed | Open it under **Pipeline runs**; the last lines of the output say why |
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
 | Verify: "Cannot reach Reacher" | Docker is not running; start Docker and run again |

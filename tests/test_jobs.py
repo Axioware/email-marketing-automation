@@ -20,7 +20,7 @@ class ArgumentTests(TestCase):
             ["--limit", "3", "--dry-run", "--business-id", "1", "--business-id", "2", "--min-score", "40"],
         )
         self.assertEqual(jobs.build_arguments("generate_emails", {"prospect_id": 7}), ["--prospect-id", "7"])
-        self.assertEqual(jobs.build_arguments("send_emails", arguments="--limit 2 --send"), ["--limit", "2", "--send"])
+        self.assertEqual(jobs.build_arguments("generate_followups", arguments="--limit 2 --dry-run"), ["--limit", "2", "--dry-run"])
 
     def test_invalid_input_is_reported(self):
         for command, options, arguments, message in (
@@ -54,26 +54,26 @@ class ArgumentTests(TestCase):
 
 class ExecuteTests(TestCase):
     def test_success_records_output_and_status(self):
-        run = PipelineRun.objects.create(command="send_emails", arguments=["--delay", "0"])
+        run = PipelineRun.objects.create(command="generate_followups", arguments=["--limit", "5"])
         self.assertEqual(jobs.execute_run(run.pk), 0)
         run.refresh_from_db()
         self.assertEqual((run.status, run.exit_code), ("succeeded", 0))
-        self.assertIn("$ python manage.py send_emails --delay 0", run.output)
-        self.assertIn("No approved emails ready to send.", run.output)
+        self.assertIn("$ python manage.py generate_followups --limit 5", run.output)
+        self.assertIn("No follow-ups are due.", run.output)
         self.assertIsNotNone(run.started_at)
         self.assertIsNotNone(run.finished_at)
         self.assertEqual(run.pid, os.getpid())
 
     def test_command_error_is_recorded_as_failed(self):
-        run = PipelineRun.objects.create(command="send_emails", arguments=["--delay", "-1"])
+        run = PipelineRun.objects.create(command="generate_followups", arguments=["--limit", "0"])
         self.assertEqual(jobs.execute_run(run.pk), 1)
         run.refresh_from_db()
         self.assertEqual((run.status, run.exit_code), ("failed", 1))
-        self.assertIn("Error: --delay cannot be negative", run.output)
+        self.assertIn("Error: --limit must be a positive integer", run.output)
 
     def test_unexpected_exception_keeps_the_traceback(self):
-        run = PipelineRun.objects.create(command="send_emails", arguments=[])
-        with mock.patch("pipeline.services.sending.run", side_effect=RuntimeError("boom")):
+        run = PipelineRun.objects.create(command="generate_followups", arguments=[])
+        with mock.patch("pipeline.services.followups.run", side_effect=RuntimeError("boom")):
             jobs.execute_run(run.pk)
         run.refresh_from_db()
         self.assertEqual(run.status, "failed")
@@ -81,23 +81,23 @@ class ExecuteTests(TestCase):
         self.assertIn("Traceback", run.output)
 
     def test_a_run_executes_once(self):
-        run = PipelineRun.objects.create(command="send_emails", arguments=["--delay", "0"])
+        run = PipelineRun.objects.create(command="generate_followups", arguments=["--limit", "5"])
         jobs.execute_run(run.pk)
         output = PipelineRun.objects.get().output
         jobs.execute_run(run.pk)  # already finished: nothing happens
         self.assertEqual(PipelineRun.objects.get().output, output)
 
     def test_cancelled_before_start_never_runs(self):
-        run = PipelineRun.objects.create(command="send_emails")
+        run = PipelineRun.objects.create(command="generate_followups")
         self.assertIn("before it started", jobs.cancel_run(run))
         jobs.execute_run(run.pk)
         self.assertEqual(PipelineRun.objects.get().status, "cancelled")
 
     def test_dead_process_and_never_started_runs_are_marked_failed(self):
-        dead = PipelineRun.objects.create(command="send_emails", status="running", pid=2 ** 22 + 12345, output="so far\n")
-        stuck = PipelineRun.objects.create(command="send_emails")
+        dead = PipelineRun.objects.create(command="generate_followups", status="running", pid=2 ** 22 + 12345, output="so far\n")
+        stuck = PipelineRun.objects.create(command="generate_followups")
         PipelineRun.objects.filter(pk=stuck.pk).update(created_at=timezone.now() - jobs.QUEUED_TIMEOUT * 2)
-        fresh = PipelineRun.objects.create(command="send_emails")
+        fresh = PipelineRun.objects.create(command="generate_followups")
         jobs.refresh_stale_runs()
         dead.refresh_from_db()
         self.assertEqual(dead.status, "failed")
@@ -121,7 +121,7 @@ class BackgroundProcessTests(TransactionTestCase):
         make_email("approved")
         db = connection.settings_dict
         url = f"postgresql://{db['USER']}:{db['PASSWORD']}@{db['HOST']}:{db['PORT']}/{db['NAME']}"
-        run = PipelineRun.objects.create(command="send_emails", arguments=["--delay", "0"])
+        run = PipelineRun.objects.create(command="generate_followups", arguments=["--limit", "5"])
         with mock.patch.dict(os.environ, {"DATABASE_URL": url, "DJANGO_DEBUG": "1"}):
             jobs.launch(run.pk)
         deadline = time.monotonic() + 90
@@ -131,6 +131,5 @@ class BackgroundProcessTests(TransactionTestCase):
                 break
             time.sleep(0.5)
         self.assertEqual(run.status, "succeeded", run.output + jobs._log_tail(run.pk))
-        self.assertIn("Preview (nothing is sent", run.output)
-        self.assertIn("1 would be sent", run.output)
+        self.assertIn("No follow-ups are due.", run.output)
         self.assertNotEqual(run.pid, os.getpid())

@@ -1,6 +1,6 @@
 """REST API over the whole pipeline. Every request must send the `Auth` header (AUTH_TOKEN in .env).
 
-Long steps (scraping, research, discovery, verification, generation, bulk sending) are started as pipeline runs:
+Long steps (scraping, research, discovery, verification, generation) are started as pipeline runs:
 `POST /api/runs/` returns at once, and `GET /api/runs/{id}/` shows progress and output.
 """
 from django.db.models import Count
@@ -150,7 +150,7 @@ class ProspectViewSet(viewsets.ModelViewSet):
 
 class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin,
                    mixins.DestroyModelMixin, viewsets.GenericViewSet):
-    """Generated emails. Create them with the generate_emails run; edit, review and send them here."""
+    """Generated emails. Create them with the generate_emails run; edit and review them here."""
 
     queryset = Email.objects.select_related("prospect").all()
     serializer_class = s.EmailSerializer
@@ -197,14 +197,6 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
         params = s.RegenerateSerializer(data=request.data)
         params.is_valid(raise_exception=True)
         return self._act(request, review.regenerate, params.validated_data.get("email_prompt"))
-
-    @extend_schema(request=s.SendSerializer)
-    @action(detail=True, methods=["post"])
-    def send(self, request, pk=None):
-        """Send one approved email now. `confirm` must repeat the recipient's address."""
-        params = s.SendSerializer(data=request.data)
-        params.is_valid(raise_exception=True)
-        return self._act(request, review.send, params.validated_data["confirm"])
 
     @extend_schema(responses={(200, "text/html"): str})
     @action(detail=True, methods=["get"])

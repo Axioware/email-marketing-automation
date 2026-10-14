@@ -10,7 +10,6 @@
 {% url 'admin:pipeline_email_reject' email.pk as reject_url %}
 {% url 'admin:pipeline_email_reopen' email.pk as reopen_url %}
 {% url 'admin:pipeline_email_regenerate' email.pk as regenerate_url %}
-{% url 'admin:pipeline_email_send' email.pk as send_url %}
 {% url 'admin:pipeline_email_replied' email.pk as replied_url %}
 <div class="pipeline-review">
   <div class="pipeline-card">
@@ -51,16 +50,7 @@
     </div>
 
     {% if email.status == "approved" %}
-      <h3>Send now</h3>
-      {% if smtp_problems %}
-        <p class="pipeline-error">SMTP is not configured in .env: {{ smtp_problems|join:"; " }}.</p>
-      {% else %}
-        <form method="post" action="{{ send_url }}" class="pipeline-actions">{% csrf_token %}
-          <label>Type <b>{{ email.recipient }}</b> to confirm:
-            <input type="text" name="confirm" autocomplete="off" required></label>
-          <input type="submit" class="default" value="Send from {{ sender }}">
-        </form>
-      {% endif %}
+      <p class="pipeline-note">Approved. This app does not send emails; it waits here for the sending method you choose.</p>
     {% endif %}
 
     <h3>What we know about them</h3>

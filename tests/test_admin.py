@@ -6,6 +6,7 @@ from unittest import mock
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from pipeline.models import (
     Business,
@@ -19,18 +20,15 @@ from pipeline.models import (
     Prospect,
 )
 from pipeline.services import generation as g
-from tests.fake_smtp import FakeSmtpServer
 from tests.support import BASE, CAMPAIGN_INLINE, make_business, make_campaign, make_contact, make_email, review_env
 from tests.test_generate_emails import FakeLLM
 
 
 class AdminCase(TestCase):
     def setUp(self):
-        self.smtp = FakeSmtpServer()
         self.llm = FakeLLM()
-        self.addCleanup(self.smtp.close)
         self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.smtp, self.llm))
+        env = mock.patch.dict(os.environ, review_env(self.llm))
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_superuser("admin", "admin@example.org", "pw")
@@ -154,11 +152,11 @@ class PipelineActionTests(AdminCase):
 
     def test_run_form_lists_every_command_and_option(self):
         page = self.client.get(reverse("admin:pipeline_pipelinerun_add")).content.decode()
-        for flag in ("--campaign-id", "--retry-failed", "--min-score", "--probe-all", "--regenerate", "--send"):
+        for flag in ("--campaign-id", "--retry-failed", "--min-score", "--probe-all", "--regenerate", "--source"):
             self.assertIn(flag, page)
 
     def test_finished_run_shows_output_and_run_again(self):
-        run = PipelineRun.objects.create(command="send_emails", arguments=["--limit", "1"], status="succeeded",
+        run = PipelineRun.objects.create(command="generate_emails", arguments=["--limit", "1"], status="succeeded",
                                          output="Preview done: <b>1</b>")
         page = self.client.get(reverse("admin:pipeline_pipelinerun_change", args=[run.pk])).content.decode()
         self.assertIn("Preview done: &lt;b&gt;1&lt;/b&gt;", page)
@@ -180,11 +178,9 @@ class PipelineActionTests(AdminCase):
         self.assertEqual(response["Location"], f"{reverse('admin:pipeline_prospect_generate')}?scope=prospect"
                                                f"&ids={email.prospect_id}&regenerate=1")
 
-    def test_send_selected_only_takes_approved_emails(self):
-        approved, in_review = self.email("approved"), self.email()
-        response = self.changelist_action("email", "send_selected", [approved, in_review])
-        arguments = self.client.get(response["Location"]).context["adminform"].form.initial["arguments_text"]
-        self.assertEqual(arguments, f"--send --email-id {approved}")
+    def test_no_send_action(self):
+        actions = self.client.get(reverse("admin:pipeline_email_changelist")).context["action_form"].fields["action"].choices
+        self.assertNotIn("send_selected", [name for name, _ in actions])
 
 
 class EmailReviewTests(AdminCase):
@@ -331,44 +327,19 @@ class EmailReviewTests(AdminCase):
         self.assertContains(self.post_action(eid, "regenerate"), "Regeneration failed")
         self.assertEqual(self.row(eid)["subject"], "Hello there")
 
-    def test_send_needs_the_typed_recipient_and_then_sends(self):
+    def test_approved_email_has_no_send_button(self):
         eid = self.email("approved")
-        recipient = self.row(eid)["recipient"]
-        self.post_action(eid, "send", confirm="wrong@x.org")
-        self.assertEqual((self.row(eid)["status"], self.smtp.messages), ("approved", []))
-        self.assertContains(self.post_action(eid, "send", confirm=recipient.upper()), f"Sent to {recipient}")
-        self.assertEqual(self.row(eid)["status"], "sent")
-        self.assertEqual(len(self.smtp.messages), 1)
-        self.assertEqual(self.smtp.messages[0][1], [recipient])
-        self.assertEqual(Prospect.objects.get().outreach_status, "contacted")
-
-    def test_only_approved_emails_can_be_sent(self):
-        eid = self.email("in_review")
-        self.post_action(eid, "send", confirm=self.row(eid)["recipient"])
-        self.assertEqual((self.row(eid)["status"], self.smtp.messages), ("in_review", []))
-
-    def test_do_not_contact_prospect_is_never_sent(self):
-        eid = self.email("approved", do_not_contact=True)
-        self.assertContains(self.post_action(eid, "send", confirm=self.row(eid)["recipient"]), "no longer ready")
-        self.assertEqual(self.smtp.messages, [])
-
-    def test_missing_smtp_settings(self):
-        eid = self.email("approved")
-        with mock.patch.dict(os.environ, {"SMTP_PASSWORD": ""}):
-            self.assertContains(self.client.get(self.change_url(eid)), "SMTP is not configured")
-            page = self.post_action(eid, "send", confirm=self.row(eid)["recipient"])
-        self.assertContains(page, "SMTP is not configured")
-        self.assertEqual(self.row(eid)["status"], "approved")
-
-    def test_smtp_rejection_marks_failed(self):
-        eid = self.email("approved", recipient="reject@x.org")
-        self.assertContains(self.post_action(eid, "send", confirm="reject@x.org"), "marked failed")
-        self.assertEqual(self.row(eid)["status"], "failed")
+        page = self.client.get(self.change_url(eid)).content.decode()
+        self.assertIn("This app does not send emails", page)
+        self.assertNotIn("Send now", page)
+        self.assertNotIn("/send/", page)
+        self.client.post(self.change_url(eid).replace("change/", "send/"), {"confirm": self.row(eid)["recipient"]})
+        self.assertEqual(self.row(eid)["status"], "approved")  # no send view: the admin just redirects
 
     @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_opens_are_shown(self):
         eid = self.email("approved")
-        self.post_action(eid, "send", confirm=self.row(eid)["recipient"])
+        Email.objects.filter(pk=eid).update(status="sent", sent_at=timezone.now())  # sent elsewhere
         from django.db import connection
 
         with connection.cursor() as cursor:
@@ -402,15 +373,14 @@ class DashboardTests(AdminCase):
         self.assertIn("Emails in review", page)
         self.assertIn("1 email(s) are waiting for your review.", page)
         self.assertIn("Start reviewing", page)
-        self.assertIn("1 approved email(s) are ready to send.", page)
+        self.assertNotIn("ready to send", page)  # this app does not send
         self.assertIn("verify_emails --limit 5", page)
-        self.assertNotIn("Sending is not set up", page)  # SMTP is configured in these tests
 
     def test_empty_database_suggests_a_campaign_and_warns_about_settings(self):
-        with mock.patch.dict(os.environ, {"SMTP_PASSWORD": "", "VERIFY_HELO": ""}):
+        with mock.patch.dict(os.environ, {"VERIFY_HELO": ""}):
             page = self.client.get(reverse("admin:index")).content.decode()
         self.assertIn("Create your first campaign", page)
-        self.assertIn("Sending is not set up", page)
+        self.assertNotIn("Sending is not set up", page)
         self.assertIn("VERIFY_HELO is not set", page)
 
     def test_sidebar_follows_the_pipeline(self):

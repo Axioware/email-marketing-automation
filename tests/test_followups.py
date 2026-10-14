@@ -1,4 +1,4 @@
-"""Follow-up sequences: A/B assignment, when follow-ups are due, prompt choice, replies, sending, admin and API."""
+"""Follow-up sequences: A/B assignment, when follow-ups are due, prompt choice, replies, admin and API."""
 import os
 from datetime import timedelta
 from unittest import mock
@@ -11,19 +11,16 @@ from rest_framework.test import APIClient
 
 from pipeline import review
 from pipeline.models import Business, CampaignPrompt, Email, EmailPrompt, FollowUp, PipelineRun, Prospect
-from pipeline.services import followups, generation, sending
-from tests.fake_smtp import FakeSmtpServer
+from pipeline.services import followups, generation
 from tests.support import BASE, CAMPAIGN_INLINE, make_campaign, make_email, review_env, run_command
 from tests.test_generate_emails import FakeLLM
 
 
 class FollowUpCase(TestCase):
     def setUp(self):
-        self.smtp = FakeSmtpServer()
         self.llm = FakeLLM()
-        self.addCleanup(self.smtp.close)
         self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.smtp, self.llm))
+        env = mock.patch.dict(os.environ, review_env(self.llm))
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_superuser("admin", "a@example.org", "pw")
@@ -195,25 +192,14 @@ class ReplyAndSendTests(FollowUpCase):
         follow_up.refresh_from_db()
         return first, follow_up
 
-    def test_follow_up_to_a_contacted_prospect_is_sendable(self):
-        _, follow_up = self.approved_follow_up()
-        self.assertIn(follow_up.pk, set(sending.sendable_emails().values_list("id", flat=True)))
-        self.assertIn("Sent to", review.send(follow_up, follow_up.recipient))
-        self.assertEqual(Email.objects.get(pk=follow_up.pk).status, "sent")
-
-    def test_reply_blocks_sending_even_after_approval(self):
+    def test_a_reply_after_approval_stops_the_business(self):
         first, follow_up = self.approved_follow_up()
         response = self.client.post(reverse("admin:pipeline_email_replied", args=[first.pk]), follow=True)
         self.assertContains(response, "No more follow-ups go to this business")
         first.refresh_from_db()
         self.assertEqual(first.status, "replied")
         self.assertIsNotNone(Business.objects.get(pk=first.business_id).replied_at)
-        self.assertNotIn(follow_up.pk, set(sending.sendable_emails().values_list("id", flat=True)))
-        with self.assertRaisesMessage(review.ReviewError, "replied"):
-            review.send(follow_up, follow_up.recipient)
-        message = {field: getattr(follow_up, field) for field in sending.EMAIL_FIELDS}
-        self.assertEqual(sending.send_one(message, sending.smtp_config(), sending.Mailer(sending.smtp_config()))[0], "skipped")
-        self.assertEqual(self.smtp.messages, [])
+        self.assertFalse(review.prospect_ready(follow_up))  # whatever sends it later must skip it
 
     def test_mark_replied_only_for_sent_emails(self):
         email = make_email(campaign=self.campaign)

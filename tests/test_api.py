@@ -8,7 +8,6 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from pipeline.models import BusinessContact, DiscoveryCampaign, Email, PipelineRun, Prospect
-from tests.fake_smtp import FakeSmtpServer
 from tests.support import BASE, make_business, make_campaign, make_contact, make_email, review_env
 from tests.test_generate_emails import FakeLLM
 
@@ -19,11 +18,9 @@ KEY = "test-api-key-0123456789"
 @override_settings(AUTH_TOKEN=KEY)
 class ApiCase(TestCase):
     def setUp(self):
-        self.smtp = FakeSmtpServer()
         self.llm = FakeLLM()
-        self.addCleanup(self.smtp.close)
         self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.smtp, self.llm))
+        env = mock.patch.dict(os.environ, review_env(self.llm))
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_user("staff", "staff@example.org", "pw", is_staff=True)
@@ -52,7 +49,7 @@ class AuthTests(ApiCase):
         for path in self.PATHS:
             self.assertEqual(client.get(path).status_code, 200, path)
         with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
-            response = client.post("/api/runs/", {"command": "send_emails"}, format="json")
+            response = client.post("/api/runs/", {"command": "generate_emails"}, format="json")
         self.assertEqual(response.status_code, 202)
         self.assertIsNone(PipelineRun.objects.get().created_by)
 
@@ -68,7 +65,7 @@ class AuthTests(ApiCase):
         client = APIClient()
         client.credentials(HTTP_AUTH=KEY, HTTP_AUTHORIZATION=f"Token {token.key}")
         with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
-            client.post("/api/runs/", {"command": "send_emails"}, format="json")
+            client.post("/api/runs/", {"command": "generate_emails"}, format="json")
         self.assertEqual(PipelineRun.objects.get().created_by, self.user)
         client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")  # a user token without the header is refused
         self.assertEqual(client.get("/api/stats/").status_code, 401)
@@ -201,15 +198,12 @@ class EmailApiTests(ApiCase):
         self.assertIn("Idea for Clinic", response.json()["email"]["subject"])
         self.assertEqual(response.json()["email"]["tracking_token"], email.tracking_token)
 
-    def test_send_needs_confirmation(self):
+    def test_there_is_no_send_endpoint(self):
         email = make_email("approved")
-        self.assertEqual(self.api.post(f"/api/emails/{email.pk}/send/", {}, format="json").status_code, 400)
-        self.assertEqual(self.api.post(f"/api/emails/{email.pk}/send/", {"confirm": "x@y.org"}, format="json").status_code, 409)
-        self.assertEqual(self.smtp.messages, [])
         response = self.api.post(f"/api/emails/{email.pk}/send/", {"confirm": email.recipient}, format="json")
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json()["email"]["status"], "sent")
-        self.assertEqual(len(self.smtp.messages), 1)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "approved")
+        self.assertEqual(self.api.post("/api/runs/", {"command": "send_emails"}, format="json").status_code, 400)
 
     def test_bulk(self):
         a, b = make_email(), make_email(body="PLACEHOLDER")
@@ -242,7 +236,7 @@ class RunApiTests(ApiCase):
     def test_commands_lists_options(self):
         commands = {c["command"]: c for c in self.api.get("/api/runs/commands/").json()}
         self.assertEqual(set(commands), {"run_pipeline", "fetch_businesses", "refresh_businesses", "research_websites", "find_stakeholders",
-                                         "verify_emails", "generate_emails", "generate_followups", "send_emails"})
+                                         "verify_emails", "generate_emails", "generate_followups"})
         options = {o["name"]: o for o in commands["verify_emails"]["options"]}
         self.assertEqual(options["business_id"]["type"], "list")
         self.assertEqual(options["dry_run"]["type"], "flag")
@@ -260,7 +254,7 @@ class RunApiTests(ApiCase):
         self.assertEqual(response.json()["command_line"], "python manage.py verify_emails --limit 5 --dry-run --business-id 3 --business-id 4")
 
     def test_start_with_raw_arguments(self):
-        response, _ = self.start({"command": "send_emails", "arguments": ["--limit", "2"]})
+        response, _ = self.start({"command": "generate_emails", "arguments": ["--limit", "2"]})
         self.assertEqual(response.status_code, 202)
         self.assertEqual(PipelineRun.objects.get().arguments, ["--limit", "2"])
 
@@ -268,7 +262,7 @@ class RunApiTests(ApiCase):
         for payload in ({"command": "migrate"}, {"command": "verify_emails", "options": {"nope": 1}},
                         {"command": "verify_emails", "options": {"limit": "x"}},
                         {"command": "verify_emails", "options": {"dry_run": "yes"}},
-                        {"command": "send_emails", "arguments": ["--send", "--unknown"]}):
+                        {"command": "generate_emails", "arguments": ["--dry-run", "--unknown"]}):
             response, launch = self.start(payload)
             self.assertEqual(response.status_code, 400, payload)
             launch.assert_not_called()

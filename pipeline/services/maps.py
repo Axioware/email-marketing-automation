@@ -382,6 +382,16 @@ def locator_value(page, selector: str) -> str | None:
         return None
 
 
+# A Google place id inside a Maps link, e.g. ".../data=!4m7!3m6!...!19sChIJt1Zu96w4sz4R2EwodF7D35U?...". It follows
+# "!19s" or "!1s" with no word boundary, so the pattern must not require one.
+PLACE_ID_PATTERN = re.compile(r"ChIJ[A-Za-z0-9_-]{10,}")
+
+
+def place_id_from_url(url: str | None) -> str | None:
+    match = PLACE_ID_PATTERN.search(url or "")
+    return match.group(0) if match else None
+
+
 def extract_business_details(
     page, card: dict[str, str | None], target_country: str | None, headed: bool
 ):
@@ -433,7 +443,7 @@ def extract_business_details(
     except PlaywrightError:
         opening_hours = None
 
-    place_id_match = re.search(r"\bChIJ[A-Za-z0-9_-]+", page.url)
+    place_id = place_id_from_url(page.url)
     coordinates_match = re.search(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)", page.url)
     raw_data = {
         "search_result": card,
@@ -446,7 +456,7 @@ def extract_business_details(
         "review_labels": review_labels,
         "opening_hours": opening_hours,
         "google_maps_url": page.url,
-        "google_place_id": place_id_match.group(0) if place_id_match else None,
+        "google_place_id": place_id,
         "coordinates": coordinates_match.groups() if coordinates_match else None,
     }
     name = normalize_text(name)
@@ -477,7 +487,7 @@ def extract_business_details(
             "country": target_country,
             "latitude": float(coordinates_match.group(1)) if coordinates_match else None,
             "longitude": float(coordinates_match.group(2)) if coordinates_match else None,
-            "google_place_id": place_id_match.group(0) if place_id_match else None,
+            "google_place_id": place_id,
             "google_maps_url": page.url,
             "google_rating": google_rating,
             "google_review_count": google_review_count,

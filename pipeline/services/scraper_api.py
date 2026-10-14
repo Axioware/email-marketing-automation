@@ -128,7 +128,7 @@ def record_from_place(place: dict, target_country: str | None) -> dict | None:
             "country": country,
             "latitude": number(coordinates.get("latitude"), float),
             "longitude": number(coordinates.get("longitude"), float),
-            "google_place_id": maps.normalize_text(place.get("place_id")),
+            "google_place_id": maps.normalize_text(place.get("place_id")) or maps.place_id_from_url(maps_url),
             "google_maps_url": maps_url,
             "google_rating": number(rating, float),
             "google_review_count": number(reviews, int),

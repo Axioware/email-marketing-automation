@@ -117,7 +117,7 @@ class PipelineAdminSite(admin.AdminSite):
             PipelineRun,
             Prospect,
         )
-        from pipeline.services import generation, sending
+        from pipeline.services import generation
         from pipeline.services.llm import make_llm_client
 
         jobs.refresh_stale_runs()
@@ -170,9 +170,6 @@ class PipelineAdminSite(admin.AdminSite):
         due_followups = len(followups.find_due({}))
         if due_followups:
             steps.append((f"{due_followups} follow-up(s) are due.", "Write follow-ups", run_url("generate_followups")))
-        if emails["approved"]:
-            steps.append((f"{emails['approved']} approved email(s) are ready to send.", "Send approved",
-                          run_url("send_emails", "--send")))
         if ready_without_email:
             steps.append((f"{ready_without_email} verified prospect(s) have no email yet.", "Generate emails",
                           reverse("admin:pipeline_prospect_generate")))
@@ -202,9 +199,6 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("VERIFY_HELO is not set in .env, so email verification cannot run.")
         if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
             warnings.append("The open-tracking URL is unknown: set EMAIL_TRACKING_BASE_URL in .env.")
-        problems = sending.config_problems(sending.smtp_config())
-        if problems:
-            warnings.append("Sending is not set up: " + "; ".join(problems) + ".")
         leads = lead_sources()
         if leads["scraper_needed"] and leads["scraper_problem"]:
             warnings.append(f"A campaign gets its leads from the scraper container, but it is {leads['scraper_problem']} "

@@ -2,7 +2,7 @@
 
 Every pipeline step can be started from here: list actions and buttons open the "Run a pipeline step" form, pre-filled
 with the command and arguments (e.g. the selected businesses), where the run is confirmed and then followed live.
-Generated emails are reviewed on their own page: edit, preview, approve, reject, regenerate and send.
+Generated emails are reviewed on their own page: edit, preview, approve, reject and regenerate.
 """
 import json
 import shlex
@@ -22,7 +22,6 @@ from django.utils.text import Truncator
 
 from pipeline import jobs, review
 from pipeline.models import (
-    DEFAULT_SEND_TIMEZONE,
     VARIATIONS,
     Business,
     CampaignPrompt,
@@ -37,7 +36,7 @@ from pipeline.models import (
     PipelineRun,
     Prospect,
 )
-from pipeline.services import generation, sending
+from pipeline.services import generation
 
 
 # ---------------------------------------------------------------- helpers
@@ -140,8 +139,7 @@ class DiscoveryCampaignForm(forms.ModelForm):
 
     class Meta:
         model = DiscoveryCampaign
-        fields = ["name", "target_country", "target_locations", "search_terms", "lead_source", "campaign_prompt",
-                  "send_window_start", "send_window_end", "send_timezone"]
+        fields = ["name", "target_country", "target_locations", "search_terms", "lead_source", "campaign_prompt"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -153,9 +151,8 @@ class DiscoveryCampaignForm(forms.ModelForm):
                                                         "holds the email prompts that write its emails. Pick a free "
                                                         "prompt or create one with +. Without one, the campaign's "
                                                         "businesses are not researched and no emails are written.")
-        for field in ("send_timezone", "lead_source"):  # left out of a form post: the model's default
-            if field in self.fields:
-                self.fields[field].required = False
+        if "lead_source" in self.fields:  # left out of a form post: the model's default
+            self.fields["lead_source"].required = False
         for field in ("target_locations", "search_terms"):
             value = getattr(self.instance, field, None)
             if isinstance(value, list):
@@ -173,9 +170,6 @@ class DiscoveryCampaignForm(forms.ModelForm):
     def clean_lead_source(self):
         return self.cleaned_data.get("lead_source") or "browser"
 
-    def clean_send_timezone(self):
-        return (self.cleaned_data.get("send_timezone") or "").strip() or DEFAULT_SEND_TIMEZONE
-
     def clean_target_country(self):
         country = (self.cleaned_data.get("target_country") or "").strip()
         if "," in country:
@@ -186,9 +180,8 @@ class DiscoveryCampaignForm(forms.ModelForm):
 class FollowUpInline(admin.TabularInline):
     model = FollowUp
     extra = 0
-    fields = ["sequence", "days_after_previous", "send_window_start", "send_window_end"]
-    verbose_name_plural = ("follow-ups (the first email is step 0; each follow-up is written when due and reviewed; "
-                           "an empty send window uses the campaign's)")
+    fields = ["sequence", "days_after_previous"]
+    verbose_name_plural = "follow-ups (the first email is step 0; each follow-up is written when due and reviewed)"
 
 
 def prompt_problems(campaign) -> list[str]:
@@ -223,10 +216,6 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
                                   "8001 by default). Both save the same details. The fetch buttons above can use "
                                   "either one for a single run."}),
         ("Prompts", {"fields": ["campaign_prompt"]}),
-        ("Sending", {"fields": [("send_window_start", "send_window_end"), "send_timezone"],
-                     "description": "Approved emails go out between these times, spread evenly over the window "
-                                    "(e.g. 09:00 - 20:00). Sending must run every few minutes (cron) to send them on "
-                                    "time. Leave both empty to send as soon as sending runs."}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
     actions = ["run_pipeline", "fetch_businesses", "fetch_with_browser", "fetch_with_scraper"]
@@ -1012,18 +1001,18 @@ class OpenEventInline(ReadOnlyInline):
 class EmailAdmin(PipelineAdmin):
     form = EmailReviewForm
     list_display = ["id", "business", "recipient", "subject_short", "step", "variation", "status_badge",
-                    "generated_at", "scheduled_at", "sent_at", "open_count", "edited"]
+                    "generated_at", "sent_at", "open_count", "edited"]
     list_display_links = ["id", "subject_short"]
     list_filter = ["status", "sequence_step", "prospect__variation", "email_prompt", "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
     list_select_related = ["business", "prospect"]
-    actions = ["approve_selected", "reject_selected", "send_selected", "mark_replied_selected"]
+    actions = ["approve_selected", "reject_selected", "mark_replied_selected"]
     inlines = [OpenEventInline]
     change_form_template = "admin/pipeline/email/change_form.html"
     change_list_template = "admin/pipeline/email/change_list.html"
     details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by", "email_prompt",
                "generated_at", "reviewed_at", "review_note", "edited_at"]
-    delivery = ["scheduled_at", "sent_at", "sent_from", "message_id", "send_error", "open_count", "first_opened_at", "last_opened_at",
+    delivery = ["sent_at", "sent_from", "message_id", "send_error", "open_count", "first_opened_at", "last_opened_at",
                 "tracking_token"]
 
     def has_add_permission(self, request):
@@ -1144,14 +1133,6 @@ class EmailAdmin(PipelineAdmin):
         extra = f", {skipped} skipped (wrong status)" if skipped else ""
         self.message_user(request, f"{done} email(s) rejected{extra}.")
 
-    @admin.action(description="Send selected approved emails (opens the send run)")
-    def send_selected(self, request, queryset):
-        ids = list(queryset.filter(status="approved").values_list("pk", flat=True))
-        if not ids:
-            self.message_user(request, "None of the selected emails is approved.", messages.WARNING)
-            return None
-        return run_step("send_emails", ["--send", *ids_arguments("--email-id", ids)])
-
     # ------------------------------------------------------------ review page
 
     def get_urls(self):
@@ -1159,7 +1140,7 @@ class EmailAdmin(PipelineAdmin):
             path(f"<int:object_id>/{name}/", self.admin_site.admin_view(view), name=f"pipeline_email_{name}")
             for name, view in (("approve", self.approve_view), ("reject", self.reject_view),
                                ("reopen", self.reopen_view), ("regenerate", self.regenerate_view),
-                               ("send", self.send_view), ("replied", self.replied_view))
+                               ("replied", self.replied_view))
         ]
         return actions + super().get_urls()
 
@@ -1171,7 +1152,6 @@ class EmailAdmin(PipelineAdmin):
                 profile = email.business.website_profile
             except BusinessWebsiteProfile.DoesNotExist:
                 profile = None
-            smtp = sending.smtp_config()
             extra_context = {
                 **(extra_context or {}),
                 "email": email,
@@ -1182,8 +1162,6 @@ class EmailAdmin(PipelineAdmin):
                 "prospect_ready": review.prospect_ready(email),
                 "website_link": safe_url(email.business.website_url),
                 "has_placeholder": review.has_placeholder(email),
-                "smtp_problems": sending.config_problems(smtp),
-                "sender": smtp["from_email"],
                 "in_review_count": Email.objects.filter(status="in_review").count(),
                 "next_review": review.next_in_review(email.pk),
                 "email_prompts": EmailPrompt.objects.select_related("campaign_prompt"),
@@ -1224,9 +1202,6 @@ class EmailAdmin(PipelineAdmin):
 
     def replied_view(self, request, object_id):
         return self._review_action(request, object_id, review.mark_replied)
-
-    def send_view(self, request, object_id):
-        return self._review_action(request, object_id, lambda e: review.send(e, request.POST.get("confirm", "")))
 
 
 @admin.register(EmailOpenEvent)
