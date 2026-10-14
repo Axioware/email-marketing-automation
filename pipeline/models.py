@@ -11,13 +11,14 @@ from django.utils import timezone
 
 
 class CampaignPrompt(models.Model):
-    """How a campaign qualifies businesses: what the research agent looks for on each website and how it scores it.
-    Its email prompts (one to many) write the campaign's emails."""
+    """How a campaign qualifies businesses: the research agent's whole instructions (what to look for on each website
+    and how to score it), used exactly as stored. Its email prompts (one to many) write the campaign's emails."""
 
     name = models.CharField(max_length=255, unique=True)
-    prompt = models.TextField(help_text="Qualification criteria: what makes a business a good prospect for this "
-                                        "campaign, what to look for on its website and what each score range "
-                                        "(0-100) means. Businesses scoring 50+ go on to finding decision makers.")
+    prompt = models.TextField(help_text="The research agent's instructions, used exactly as written: what makes a "
+                                        "business a good prospect for this campaign, what to look for on its website "
+                                        "and what each score range (0-100) means. Businesses scoring 50+ go on to "
+                                        "finding decision makers. The answer format is set by the app.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -30,13 +31,6 @@ class CampaignPrompt(models.Model):
 
     def default_email_prompt(self, sequence: int = 0):
         return self.email_prompts.filter(sequence=sequence).order_by("-is_default", "id").first()
-
-    @property
-    def full_prompt(self) -> str:
-        """What the research agent receives: its browsing instructions followed by this prompt."""
-        from pipeline.services.research import research_prompt
-
-        return research_prompt(self.prompt)
 
 
 VARIATIONS = [("a", "A"), ("b", "B"), ("c", "C")]

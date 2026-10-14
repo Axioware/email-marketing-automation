@@ -48,8 +48,7 @@ class ModelTests(PromptCase):
         model received before 0008) in the email prompt."""
         seeded = CampaignPrompt.objects.get(name="Axioware - dental clinics")
         self.assertEqual(seeded.prompt, prompt_texts.QUALIFICATION_PROMPT)
-        self.assertIn("SCORING", seeded.full_prompt)
-        self.assertTrue(seeded.full_prompt.startswith(research.AGENT_INSTRUCTIONS))
+        self.assertFalse(hasattr(research, "AGENT_INSTRUCTIONS"))  # nothing is added in front of it
         self.assertEqual(seeded.default_email_prompt().prompt,
                          f"{prompt_texts.OLD_CAMPAIGN_PROMPT.strip()}\n\n{prompt_texts.OLD_EMAIL_PROMPT.strip()}")
 
@@ -212,8 +211,9 @@ class CampaignAdminTests(PromptCase):
                     reverse("admin:pipeline_emailprompt_add")):
             self.assertEqual(self.client.get(url).status_code, 200, url)
         detail = self.client.get(reverse("admin:pipeline_campaignprompt_change", args=[campaign_prompt.pk])).content.decode()
-        self.assertIn("What the research agent receives", detail)  # agent instructions + the criteria
-        self.assertIn("QUALIFICATION CRITERIA\nCAMPAIGN RULES Dental", detail)
+        self.assertIn("Answer format (set by the app)", detail)  # only the answer's shape comes from the app
+        self.assertIn("SCRAPE: read one more page", detail)
+        self.assertNotIn("QUALIFICATION CRITERIA", detail)
         detail = self.client.get(reverse("admin:pipeline_emailprompt_change", args=[first.pk])).content.decode()
         self.assertNotIn("CAMPAIGN RULES Dental", detail)  # the email prompt is used on its own
 
@@ -294,7 +294,8 @@ class PromptApiTests(PromptCase):
         self.assertEqual(response.status_code, 201, response.content)
         created = response.json()
         self.assertEqual(created["email_prompts"], [])  # nothing built in
-        self.assertTrue(created["full_prompt"].endswith("QUALIFICATION CRITERIA\nDay spas score high."))
+        self.assertEqual(created["prompt"], "Day spas score high.")
+        self.assertNotIn("full_prompt", created)
         first = self.api.post("/api/email-prompts/", {"campaign_prompt": created["id"], "name": "First",
                                                        "prompt": "Write to spas."}, format="json")
         self.assertEqual(first.status_code, 201, first.content)

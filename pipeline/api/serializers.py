@@ -67,12 +67,10 @@ class EmailPromptSerializer(serializers.ModelSerializer):
 class CampaignPromptSerializer(serializers.ModelSerializer):
     campaign = serializers.PrimaryKeyRelatedField(read_only=True)
     email_prompts = EmailPromptSerializer(many=True, read_only=True)
-    full_prompt = serializers.CharField(read_only=True, help_text="The research agent's instructions + this prompt (the "
-                                                                  "qualification criteria), as the model receives it.")
 
     class Meta:
         model = CampaignPrompt
-        fields = ["id", "name", "prompt", "full_prompt", "campaign", "email_prompts", "created_at", "updated_at"]
+        fields = ["id", "name", "prompt", "campaign", "email_prompts", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
 
 

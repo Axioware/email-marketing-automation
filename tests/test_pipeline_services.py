@@ -98,10 +98,7 @@ class ResearchTests(TestCase):
         rows = {row["id"]: row for row in research.load_businesses(None, None)}
         self.assertEqual(rows[prompted.pk]["qualification_prompt"], QUALIFICATION_PROMPT)
         self.assertIsNone(rows[bare.pk]["qualification_prompt"])
-        full = research.research_prompt(QUALIFICATION_PROMPT)
-        self.assertTrue(full.startswith(research.AGENT_INSTRUCTIONS))
-        self.assertTrue(full.endswith("QUALIFICATION CRITERIA\n" + QUALIFICATION_PROMPT))
-        self.assertEqual(prompted.discovery_campaign.campaign_prompt.full_prompt, full)
+        self.assertFalse(hasattr(research, "research_prompt"))  # the campaign prompt is used as stored
 
         researched = []
         fake = lambda client, model, page, business, jina, on_page=None: researched.append(business) or {

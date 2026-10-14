@@ -71,6 +71,8 @@ class AgentCallTests(unittest.TestCase):
             self.assertEqual(kwargs["model"], model)
             self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
             self.assertEqual(kwargs["messages"][0]["content"], "SYS")
+            schema = kwargs["response_format"]["json_schema"]["schema"]
+            self.assertIn("SCRAPE: read one more page", schema["properties"]["action"]["description"])
 
     def test_answer_refused_by_groqs_schema_check_is_used_when_only_a_null_field_is_missing(self):
         import httpx
@@ -108,7 +110,7 @@ class AgentCallTests(unittest.TestCase):
         self.assertTrue(retry.args[3])  # must score now
         self.assertEqual(retry.kwargs["score_note"], "no further useful page could be chosen")
         self.assertNotIn("qualification_prompt", retry.args[2]["business"])  # the criteria are in the system prompt only
-        self.assertTrue(retry.args[4].endswith("QUALIFICATION CRITERIA\nCRITERIA"))
+        self.assertEqual(retry.args[4], "CRITERIA")  # the campaign prompt exactly as stored, nothing added
 
 
 if __name__ == "__main__":
@@ -131,6 +133,5 @@ class PromptSizeTests(unittest.TestCase):
         self.assertEqual(set(payload["available_links"][0]), {"url", "text"})
         from pipeline.migrations._prompt_texts import QUALIFICATION_PROMPT
 
-        system_prompt = research_business_websites.research_prompt(QUALIFICATION_PROMPT)
-        size = len(json.dumps(payload)) + len(system_prompt)
+        size = len(json.dumps(payload)) + len(QUALIFICATION_PROMPT) + len(research_business_websites.answer_format())
         self.assertLess(size / 3.5, 7000)  # tokens, with margin under Groq's 8,000 per minute

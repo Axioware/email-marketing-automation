@@ -320,13 +320,14 @@ class CampaignPromptAdmin(PipelineAdmin):
     form = CampaignPromptForm
     list_display = ["name", "campaign_link", "email_prompt_count", "updated_at"]
     search_fields = ["name", "prompt"]
-    readonly_fields = ["campaign_link", "created_at", "updated_at", "full_prompt_display"]
+    readonly_fields = ["campaign_link", "created_at", "updated_at", "answer_format_display"]
     fieldsets = [
         (None, {"fields": ["name", "campaign_link", "prompt"],
-                "description": "The qualification criteria of a campaign: the research agent reads each business's "
-                               "website and scores it 0-100 against this text; businesses scoring 50+ go on to finding "
-                               "decision makers. The email prompts below write the campaign's emails."}),
-        ("What the research agent receives", {"fields": ["full_prompt_display"], "classes": ["collapse"]}),
+                "description": "The research agent's instructions, used exactly as written (nothing is added): it "
+                               "reads each business's website and scores it 0-100 by this text; businesses scoring 50+ "
+                               "go on to finding decision makers. Only the shape of its answer is set by the app (see "
+                               "Answer format). The email prompts below write the campaign's emails."}),
+        ("Answer format (set by the app)", {"fields": ["answer_format_display"], "classes": ["collapse"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
     inlines = [EmailPromptInline]
@@ -346,9 +347,11 @@ class CampaignPromptAdmin(PipelineAdmin):
     def email_prompt_count(self, obj):
         return changelist_link(EmailPrompt, obj.email_prompt_total, campaign_prompt__id__exact=obj.pk)
 
-    @admin.display(description="Full prompt")
-    def full_prompt_display(self, obj):
-        return format_html('<pre class="pipeline-pre">{}</pre>', obj.full_prompt) if obj.pk else "-"
+    @admin.display(description="JSON schema")
+    def answer_format_display(self, obj):
+        from pipeline.services.research import answer_format
+
+        return format_html('<pre class="pipeline-pre">{}</pre>', answer_format())
 
     def save_related(self, request, form, formsets, change):
         super().save_related(request, form, formsets, change)
