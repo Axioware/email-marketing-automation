@@ -33,11 +33,11 @@
   </form>
   {% if prompts %}
   <div class="module pipeline-help">
-    <h2>Email prompts</h2>
+    <h2>Initial-email prompts</h2>
     <table>
-      <thead><tr><th>Email prompt</th><th>Campaign prompt</th><th>Default</th></tr></thead>
+      <thead><tr><th>Prompt</th><th>Used by campaigns</th></tr></thead>
       <tbody>{% for prompt in prompts %}
-        <tr><td><a href="{% url 'admin:pipeline_emailprompt_change' prompt.pk %}">{{ prompt.name }}</a></td><td>{{ prompt.campaign_prompt.name }}</td><td>{% if prompt.is_default %}Yes{% endif %}</td></tr>
+        <tr><td><a href="{% url 'admin:pipeline_emailprompt_change' prompt.pk %}">{{ prompt.name }}</a></td><td>{{ prompt.initial_for_campaigns.all|join:", "|default:"-" }}</td></tr>
       {% endfor %}</tbody>
     </table>
   </div>

@@ -51,7 +51,7 @@ class PipelineCommandTests(TestCase):
         fetched = Business.objects.get(name="Fetched").pk
         for step in ("research", "stakeholders", "verify", "generate"):
             self.assertEqual(self.options(step)["business_id"], [fetched], step)  # never the other campaign's
-        self.assertEqual(self.options("stakeholders")["min_score"], 50)
+        self.assertIsNone(self.options("stakeholders")["min_score"])  # each campaign's own minimum score
         self.assertIn("Nothing is sent", result.stdout)
         self.assertIn("Next: review the new emails", result.stdout)
 

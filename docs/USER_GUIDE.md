@@ -1,6 +1,6 @@
 # User guide
 
-This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email for each person, and lets you review and approve every email. **It does not send emails**: approved emails wait for the sending method you choose.
+This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. Approved emails are scheduled and **GoHighLevel sends them**.
 
 You do everything from the **admin** in your browser. Nothing is ever sent without your approval.
 
@@ -21,7 +21,7 @@ Then open **http://127.0.0.1:8000/admin/** and log in. Keep the terminal open wh
 
 The home page shows the whole pipeline at a glance:
 
-- **The counters** follow a business from left to right: found on Google Maps, website researched, qualified, contact found, verified prospect, email in review, sent, opened. Click any counter to see those records.
+- **The counters** follow a business from left to right: found on Google Maps, website researched, qualified, contact found, ready to email, email in review, scheduled, sent. Click any counter to see those records.
 - **Get leads** lists your campaigns with two buttons each, one per way of finding businesses on Google Maps: **Built-in browser** and **Scraper container**. It also shows whether the scraper container is running. See [Step 2](#step-2-fetch-businesses).
 - **What to do next** lists the jobs that are waiting, with a button for each, e.g. "3 emails are waiting for your review: Start reviewing".
 - **Recent pipeline runs** shows the jobs you started and whether they finished.
@@ -38,8 +38,12 @@ The left sidebar lists the pages in pipeline order (its **Jump to a page** box o
 | 3. Research | An AI reads each business's website and scores it 0-100 | Businesses > **Research websites** |
 | 4. Find the decision maker | The owner or manager is found, and likely email addresses are guessed | Businesses > **Find decision makers** |
 | 5. Verify emails | Each guessed address is checked and saved with its result; only real ones are ready to email | Businesses > **Verify contact emails** |
-| 6. Write emails | The AI writes one email per prospect | Prospects > **Generate outreach emails** |
-| 7. Review | You read, edit, approve or reject each email | Emails |
+| 3b. Review low scores | Businesses below the campaign's minimum score (or not researchable) wait for you | Businesses > **Needs your review** |
+| 5b. Review unverified addresses | Addresses verification could not confirm wait for you | Prospects > Needs review |
+| 6. Write emails | The AI writes one email per prospect; each becomes a GoHighLevel contact | Prospects > **Generate outreach emails** |
+| 7. Review | You read, edit, approve or reject each email; approving schedules it | Emails |
+| 8. Send | GoHighLevel sends each email at its time | Automatic |
+| 9. Follow-ups | Written for review after each email is sent, sent the same way | Emails |
 
 Each step only processes what still needs it, so it is always safe to run a step again.
 
@@ -65,7 +69,11 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Target locations**: cities or areas, separated by commas, e.g. `Lahore, DHA, Gulberg`.
    - **Search terms**: what you would type into Google Maps, separated by commas, e.g. `dental clinic, dentist`.
    - **Lead source** (under Leads): how businesses are found on Google Maps: **Built-in browser** (default) or **Scraper container**. You can still pick the other one for a single fetch.
-   - **Campaign prompt** (under Prompts): what makes a good prospect for this campaign. The AI scores each business's website against it, and its email prompts write the campaign's emails. Pick one from the list, or click **+** to write a new one. Each prompt belongs to one campaign. **Without one, the campaign's businesses are not researched and no emails are written**; the campaign page warns you. See [Prompts](#prompts).
+   - **Minimum score** (under Leads, default 50): businesses scoring at least this go straight on to finding decision makers; the rest wait for you to approve or reject them.
+   - **Campaign prompt** (under Prompts): what makes a good prospect; the AI scores each business's website against it. Pick one, or click **+** to write a new one. Several campaigns can share one. Without one, the campaign's businesses are not researched.
+   - **Initial-email prompts** (under Prompts): tick one or more. With several, prospects are split equally between them (an A/B test) and each person keeps their prompt.
+   - **Sending** (optional): the gap between two sends (default 2 minutes fixed plus a random 3-5 minutes), the **daily cap** (default 40), and a **send window** (e.g. 09:00 to 18:00) with its time zone. See [Sending](#step-8-sending-through-gohighlevel).
+   - **Follow-ups** table (bottom): one row per follow-up with its days and its prompt. See [Follow-ups](#follow-ups).
 3. Click **Save**.
 
 Every search term is searched in every location, so 2 terms and 3 locations means 6 searches. The campaign's **Status** (Pending, Running, Completed, Failed) is set automatically when businesses are fetched; you cannot edit it.
@@ -97,7 +105,7 @@ Each business gets its category, Google rating, number of reviews, opening hours
 
 ### Finding businesses: filters
 
-On **Businesses**, click one of the **quick filter boxes** above the list (Not researched, Qualified, Score 80+, 100+ reviews, Rated 4.5+, No contacts yet, Ready to email, Email sent), or type in the **search box**: it matches name, category, city, address, phone and website. The **Filter** panel on the right narrows the list further, and filters combine: by campaign, website, website research (not researched, researched, failed), qualification score (80+, 50-79, below 50), decision-maker search, contacts, prospects (ready, needs review, contacted, none), emails (in review, approved, sent, opened, none), Google rating, number of Google reviews, category, country and city. Select the filtered rows and run any action on them, e.g. "score 80 and above" + "Not searched yet" → **Find decision makers**.
+On **Businesses**, click one of the **quick filter boxes** above the list (Not researched, Needs your review, Qualified, Score 80+, 100+ reviews, Rated 4.5+, No contacts yet, Ready to email, Email sent), or type in the **search box**: it matches name, category, city, address, phone and website. The **Filter** panel on the right narrows the list further, and filters combine: by campaign, qualification (needs your review, qualified, approved, rejected), website, website research (not researched, researched, failed), qualification score (80+, 50-79, below 50), decision-maker search, contacts, prospects (ready, needs review, contacted, none), emails (in review, approved, sent, opened, none), Google rating, number of Google reviews, category, country and city. Select the filtered rows and run any action on them, e.g. "score 80 and above" + "Not searched yet" → **Find decision makers**.
 
 ### Step 3: Research websites
 
@@ -107,11 +115,13 @@ On **Businesses**, click one of the **quick filter boxes** above the list (Not r
 
 For each business the AI reads up to 5 pages of its website and scores it 0-100 against its campaign's **campaign prompt** (the qualification criteria; see [Prompts](#prompts)), with reasons. Businesses whose campaign has no campaign prompt are skipped and the run says so. The score and status show in the Businesses list; click a business and then its **Website research** link to see what the AI read and why it scored it that way.
 
+**Below the minimum score?** Businesses scoring under their campaign's minimum score, those whose research failed and those without a website wait for you: on **Businesses** click **Needs your review**, tick them, and choose **Approve** (they go on to finding decision makers) or **Reject** (they never do). The dashboard shows how many are waiting.
+
 Businesses you select are researched even if they were researched before (the new score replaces the old one). The **Research websites** button on the dashboard only does businesses that have not been researched yet. Businesses without a website are skipped. If research fails for one (the site was down, for example), run it again later; **Retry failed** on the dashboard does this.
 
 ### Step 4: Find decision makers
 
-1. Sidebar > **Businesses**, tick the businesses (only those with a score of 50 or more are processed).
+1. Sidebar > **Businesses**, tick the businesses (only qualified ones are processed: a score of at least their campaign's minimum, or approved by you; rejected ones never).
 2. Action **Find decision makers (Module 3)** > **Go** > **Start run**.
 
 This opens Firefox in the background. It looks at the business's own pages first, then Google's AI answer, then DuckDuckGo. The people it finds are listed under **Contacts**, with their job title and every email address that might be theirs (for example `ali@clinic.pk`, `ali.khan@clinic.pk`).
@@ -136,29 +146,27 @@ Each address is checked with the mail server, **without sending anything**, and 
 
 On the Prospects list, use the **By email status** and **By verdict** filters on the right, e.g. to see every catch-all address. Hover over a verdict to see the reason in words; open a prospect to see the details Reacher found. Only **Ready** prospects are ever emailed.
 
-> **Sure a risky address is real?** Open the prospect, set **Email status** to **Deliverable** and **Outreach status** to **Ready**, and save. It will then get an email like any other. (Running Verify with `--recheck` later would put it back to its checked result.)
+> **Sure a risky or unknown address is real?** On **Prospects**, filter **Needs review**, tick it and choose **Approve**: it gets emails and becomes a GoHighLevel contact like a verified one. **Reject** means it is never emailed. Undeliverable addresses cannot be approved.
 
 ### Step 6: Generate emails
 
 1. Sidebar > **Prospects** (or **Businesses**), tick the rows, choose **Generate outreach emails (Module 5)** and click **Go**. To write emails for every ready prospect, click **Generate emails** on the dashboard instead.
 2. The **Generate emails** page opens:
-   - **Email prompt**: which instructions to use. Leave it on "Each campaign's default email prompt", or pick one (e.g. a follow-up). Click **+** to write a new email prompt or the pencil to edit the selected one, without leaving the page.
+   - **Email prompt**: leave it on "Each campaign's initial-email prompts (A/B split)", or pick one prompt for all of them. Click **+** to write a new email prompt or the pencil to edit the selected one, without leaving the page.
    - **Rewrite emails that are in review or rejected**: tick to replace those drafts. Approved and sent emails are never changed.
    - **Limit** and **Dry run** work like everywhere else.
 3. Click **Start generating**.
 
-The AI writes one short email per prospect, based only on what was found about the business. Every new email starts as **In review**, and records which email prompt wrote it. Nothing is sent.
+The AI writes one short email per prospect, based only on what was found about the business. Every new email starts as **In review**, and records which email prompt wrote it. Nothing is sent until you approve it.
 
 ### Prompts
 
-Both kinds of prompt are edited in the admin; nothing is built into the code.
+Both kinds of prompt are edited in the admin; nothing is built into the code. Campaigns choose their prompts, and several campaigns can share a prompt.
 
-- **Campaign prompts** (sidebar) **qualify businesses**. They describe what you sell, what a good and a poor prospect look like, and what each score range means. In step 3 the AI reads each business's website and scores it 0-100 against its campaign's campaign prompt; businesses scoring 50+ go on to finding decision makers. Each campaign uses one campaign prompt. The AI receives **exactly what you write** there, nothing added, so edit it in the admin to change how businesses are qualified. Only the shape of the AI's answer (read another page, give the score with reasons, or stop) is set by the app; expand **Answer format (set by the app)** on the prompt's page to see it. An output format you write in the prompt is overridden by it.
-- **Email prompts** (sidebar, or inside a campaign prompt's page) **write emails**. Each is complete on its own: who we are and what we offer, the rules, structure, call to action, length and style. The AI receives exactly that text, plus the facts about the prospect. A campaign prompt can have many (the first email, follow-ups, A/B variations); for the first email the one marked **Default** is used unless you choose another.
+- **Campaign prompts** (sidebar) **qualify businesses**. They describe what you sell, what a good and a poor prospect look like, and what each score range means. In step 3 the AI reads each business's website and scores it 0-100 against its campaign's campaign prompt. The AI receives **exactly what you write** there. Only the shape of its answer (read another page, give the score with reasons, or stop) is set by the app; expand **Answer format (set by the app)** on the prompt's page to see it. An output format you write in the prompt is overridden by it.
+- **Email prompts** (sidebar) **write emails**. Each has a **Kind**: **Initial email** or **Follow-up**. Each is complete on its own: who we are and what we offer, the rules, structure, call to action, length and style. The AI receives exactly that text, plus the facts about the prospect (follow-ups also get the emails already sent). A campaign picks one or more initial-email prompts (several = A/B test, split equally) and one follow-up prompt per follow-up step. An email prompt's page shows which campaigns use it.
 
-- New prompts start empty. Saving a campaign prompt without a first-email prompt (step 0) shows a warning: no emails are written for that campaign until you add one.
-- Your first campaign uses **Axioware - dental clinics**: its campaign prompt holds starting qualification criteria for Axioware (edit them to match who you want to reach), and its **First-touch email** holds the full email instructions.
-- A campaign without a campaign prompt is not researched and gets no emails; a prospect whose campaign has no email prompt for the first email is skipped and the run says so.
+- New prompts start empty. The campaign page warns when it has no campaign prompt, no initial-email prompt, or a follow-up step without a prompt.
 - Every email prompt should ask for a subject and a body: the app reads the AI's answer as those two fields.
 
 ### Step 7: Review emails
@@ -175,10 +183,10 @@ What you can do:
 
 | Button | What it does |
 |---|---|
-| **Approve** | Marks the email approved and jumps to the next email in review |
+| **Approve** | Approves and **schedules** it (the page then shows its send time), and jumps to the next email in review |
 | **Reject** | Puts it aside; add a reason so you remember why |
 | **Regenerate with AI** | Writes a new version (it stays in review). The menu next to it lets you pick a different email prompt; by default it uses the same one |
-| **Back to review** | Undoes Approve or Reject |
+| **Back to review** | Undoes Approve or Reject; a scheduled email loses its send time |
 | **Save** | Saves your edits to the subject or body |
 
 Editing:
@@ -190,29 +198,33 @@ Editing:
 
 To approve or reject many emails at once: on the Emails list tick them, choose **Approve selected emails** or **Reject selected emails** in the Action menu, and click **Go**. Emails that still contain the word `PLACEHOLDER` cannot be approved.
 
-### After approval
+### Step 8: Sending (through GoHighLevel)
 
-This app does not send emails. Approved emails stay under **Emails > Approved** until a sending method is chosen; the email page says so. Their delivery fields (sent, opened, replied) are kept for that sender to fill in.
+GoHighLevel sends the emails from your connected mailbox; this app decides what and when.
+
+- **Contacts:** every prospect ready to email (verified, or approved by you) is created in GoHighLevel with the tags `outreach-app` and `campaign-<name>`. Your GHL workflow turns them into **New Lead** opportunities.
+- **Approve = schedule.** Each approved email gets a send time: the campaign's previous one plus the gap (default 2 minutes plus a random 3-5 minutes), only inside the send window, at most the daily cap per day. A follow-up never goes before its days after the previous email. Its contact gets **Email Due At** (the date) and, for an initial email, **Initial Email Type** (the prompt's name).
+- **At the send time** the app writes the email into the contact (**Email Subject**, **Email Body**, **Follow-up Count**), and the GHL workflow sends it at once and reports back. The email becomes **Sent**.
+- **Changed your mind?** Edit, reject or send a scheduled email back to review before its time: it loses its slot and is not sent.
+- **Replies:** when someone replies (or you move their opportunity by hand), GHL tells the app: that person's sequence stops and anything not sent yet is cancelled. Other people at the same business are not affected. **Mark replied** in the app does the same.
+
+Statuses: In review → Approved → **Scheduled** → **Handed to GoHighLevel** → **Sent** (→ Replied). The dashboard warns if GoHighLevel is not set up, if an email was handed over 30 minutes ago and never reported sent (check the GHL workflow), or if a GHL update failed (retried every minute).
 
 ### Follow-ups
 
-A campaign can have follow-up emails for people who did not reply, written a set number of days after the previous email was sent. Follow-ups become due from the previous email's **sent** date, so they start once emails are marked sent by the sending method you choose.
+A campaign can have follow-up emails for people who did not reply.
 
-**1. Set the schedule.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** 1 for the first follow-up, 2 for the second, and **Days after previous** (e.g. 3, then 7). The number of rows is the number of follow-ups. The first email is step 0.
+**1. Set the steps.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** (1, 2, ...), **Days after previous** (e.g. 3, then 7) and **Email prompt** (a follow-up prompt). The first email is step 0.
 
-**2. Write the prompts.** In **Email prompts** (or inside the campaign prompt) add a prompt for each follow-up step with **Sequence** set to its number. Write it in full, like the first email's prompt (who we are, the rules, how to write the follow-up); the AI also receives `follow_up` and `previous_emails`, the emails already sent. Optional:
-- **Variation** (A, B, C): A/B testing. When a prospect's first email is written, the prospect joins the variation with the fewest prospects and stays in it for every follow-up, so you compare whole sequences.
-- **Opened** (Any / Previous email opened / Previous email not opened): a different message for people who opened, or did not open, the previous email.
+**2. Written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next follow-up is written for review (automatically every 10 minutes, or the **Write follow-ups** button on the dashboard). You have the days in between to review it. The AI sees the emails already sent.
 
-For each step the prompt is chosen in this order: the prospect's variation with the matching "opened" setting, the prospect's variation with "any", the step's **default** prompt, any prompt of the step. If a follow-up step has no prompt at all, that follow-up is skipped and the run says so; the campaign page warns you about such steps.
+**3. Review and approve** like first emails. Approving schedules it for no earlier than the previous email's send time plus its days.
 
-**3. Write due follow-ups.** The dashboard shows "N follow-ups are due" with a **Write follow-ups** button (or run **Write due follow-ups** as a pipeline step; the full pipeline does it as its last step). A follow-up is written only when the previous email was sent at least the set number of days ago, that follow-up does not exist yet, nobody at the business has replied and the prospect is not do-not-contact. The AI sees the emails already sent, and whether the last one was opened.
+**4. The end.** After the last follow-up is sent, the contact's **Follow-up Count** is emptied, which tells GoHighLevel the sequence is over (Quota Exhausted). A follow-up step without a prompt also ends the sequence there.
 
-**4. Review and approve** exactly like first emails (Emails > In review). The email page shows "Follow-up 1", "Follow-up 2", ... and the prospect's variation.
+No follow-up is written once the person replied, their sequence was stopped, or they are do-not-contact.
 
-**5. Mark replies.** When someone replies, click **Mark replied** on that email (or use the **Mark replied** action on Emails, Prospects or Businesses). The email becomes **Replied** and **nobody at that business gets more follow-ups**; a follow-up already written or approved for it is not sent. **Clear replied** on Businesses undoes it.
-
-**Results:** the dashboard's **Results by step and variation** table shows, for the first email and each follow-up, per variation: emails sent, open rate, replies and reply rate. The Emails list can be filtered by step, variation and status (including Replied).
+**Results:** the dashboard's **Results by step and initial-email prompt (A/B)** table shows, for the first email and each follow-up, per initial-email prompt: emails sent, replies and reply rate.
 
 ## 5. Pipeline runs
 
@@ -256,7 +268,6 @@ Open tracking is **switched off**: emails are sent without any image, so nobody'
 
 What this means in the admin:
 - The open rate shows as "off" on the dashboard and the Emails list, and emails stay **Sent** (they never become Opened).
-- Follow-up prompts set to "Previous email opened" or "Previous email not opened" are not used; the prompts set to "Any" are.
 
 Tracking can be switched back on later by a developer (see the README); everything it needs is still in place.
 
@@ -291,6 +302,9 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) and writing emails (step 6) |
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
 | `SENDER_NAME` | Optional: the name in each email's sign-off (empty: "The Axioware team") |
+| `GHL_API_KEY`, `GHL_LOCATION_ID` | Sending: the GoHighLevel sub-account's Private Integration token and location id |
+| `GHL_WEBHOOK_SECRET` | Sending: GoHighLevel sends it with its webhooks (header `X-Webhook-Secret`) |
+| `CRON_SECRET` | The cron endpoints (Vercel Cron sends it) |
 | `MAPS_SCRAPER_URL` | Optional: where the scraper container answers (default `http://127.0.0.1:8001`) |
 
 ## 10. Troubleshooting
@@ -301,6 +315,9 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | A run failed | Open it under **Pipeline runs**; the last lines of the output say why |
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
 | Verify: "Cannot reach Reacher" | Docker is not running; start Docker and run again |
+| "No worker is running" | Start `python manage.py run_worker` on the machine with the browsers and Docker (only when the app runs on Vercel) |
+| "handed to GoHighLevel ... never reported sent" | The GHL sending workflow is not published, or its webhook to `/api/ghl/email-sent/` fails (check the URL and the `X-Webhook-Secret` header) |
+| An email shows a GoHighLevel error | Check `GHL_API_KEY`/`GHL_LOCATION_ID` and the custom fields; it is retried every minute |
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
 | Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
 | Find decision makers: "Google presented a CAPTCHA" | Run again later, or add `--headed` and solve it in the window. DuckDuckGo is used meanwhile |

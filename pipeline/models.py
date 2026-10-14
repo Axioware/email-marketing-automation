@@ -4,7 +4,10 @@ Table and column names are the ones the database already uses (they were created
 `manage.py migrate --fake-initial` adopts an existing database without changing it. The Supabase open-tracking edge
 function writes to `emails` and `email_open_events` through the `record_email_open` database function.
 """
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Now
 from django.utils import timezone
@@ -12,13 +15,14 @@ from django.utils import timezone
 
 class CampaignPrompt(models.Model):
     """How a campaign qualifies businesses: the research agent's whole instructions (what to look for on each website
-    and how to score it), used exactly as stored. Its email prompts (one to many) write the campaign's emails."""
+    and how to score it), used exactly as stored. Campaigns choose one; several campaigns may share it."""
 
     name = models.CharField(max_length=255, unique=True)
     prompt = models.TextField(help_text="The research agent's instructions, used exactly as written: what makes a "
                                         "business a good prospect for this campaign, what to look for on its website "
-                                        "and what each score range (0-100) means. Businesses scoring 50+ go on to "
-                                        "finding decision makers. The answer format is set by the app.")
+                                        "and what each score range (0-100) means. Businesses scoring at least the "
+                                        "campaign's minimum score go on to finding decision makers. The answer "
+                                        "format is set by the app.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -29,54 +33,37 @@ class CampaignPrompt(models.Model):
     def __str__(self):
         return self.name
 
-    def default_email_prompt(self, sequence: int = 0):
-        return self.email_prompts.filter(sequence=sequence).order_by("-is_default", "id").first()
-
-
-VARIATIONS = [("a", "A"), ("b", "B"), ("c", "C")]
-
 
 class EmailPrompt(models.Model):
-    """Instructions for one email of a campaign's sequence: which step, which A/B variation, and whether it is meant
-    for prospects who opened the previous email."""
+    """Instructions that write one kind of email: an initial email (a campaign can pick several, split equally as an
+    A/B test) or a follow-up (a campaign picks one per follow-up step). Reusable across campaigns."""
 
-    campaign_prompt = models.ForeignKey(CampaignPrompt, on_delete=models.CASCADE, related_name="email_prompts")
-    name = models.CharField(max_length=255)
-    sequence = models.PositiveIntegerField(default=0, help_text="0 = the first email, 1 = the first follow-up, ...")
-    variation = models.CharField(max_length=1, choices=VARIATIONS, default="a",
-                                 help_text="A/B variation. Each prospect stays in one variation for the whole sequence.")
-    opened = models.BooleanField(null=True, blank=True,
-                                 help_text="Follow-ups only: use this prompt when the previous email was opened (Yes), "
-                                           "not opened (No), or either (Unknown/any).")
+    class Kind(models.TextChoices):
+        INITIAL = "initial", "Initial email"
+        FOLLOW_UP = "follow_up", "Follow-up"
+
+    name = models.CharField(max_length=255, unique=True)
+    kind = models.CharField(max_length=16, choices=Kind.choices, default=Kind.INITIAL, db_default=Kind.INITIAL,
+                            help_text="Initial emails can be A/B tested on a campaign; follow-ups are picked per step.")
     prompt = models.TextField(help_text="Everything the model needs to write this email: who we are and what we "
                                         "offer, the rules, structure, call to action, length and style. The model "
-                                        "receives exactly this text, with the prospect's details as input.")
-    is_default = models.BooleanField(default=False, help_text="Used for this step when no variation matches.")
+                                        "receives exactly this text, with the prospect's details as input (follow-ups "
+                                        "also get follow_up and previous_emails).")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "email_prompts"
-        ordering = ["campaign_prompt__name", "sequence", "variation", "-is_default", "name"]
-        constraints = [
-            models.UniqueConstraint(fields=["campaign_prompt", "name"], name="uq_email_prompts_name"),
-            models.UniqueConstraint(fields=["campaign_prompt", "sequence"], condition=models.Q(is_default=True),
-                                    name="uq_email_prompts_one_default"),
-            models.UniqueConstraint(fields=["campaign_prompt", "sequence", "variation", "opened"],
-                                    nulls_distinct=False, name="uq_email_prompts_step_variation"),
-        ]
+        ordering = ["kind", "name"]
+        constraints = [models.CheckConstraint(condition=models.Q(kind__in=["initial", "follow_up"]),
+                                              name="ck_email_prompts_kind")]
 
     def __str__(self):
-        return f"{self.campaign_prompt.name} / {self.name}"
-
-    def save(self, *args, **kwargs):
-        if self.is_default:  # only one default per step of a campaign prompt
-            EmailPrompt.objects.filter(campaign_prompt_id=self.campaign_prompt_id, sequence=self.sequence,
-                                       is_default=True).exclude(pk=self.pk).update(is_default=False)
-        super().save(*args, **kwargs)
+        return self.name
 
 
 LEAD_SOURCES = [("browser", "Built-in browser"), ("scraper_api", "Scraper container")]
+DEFAULT_SEND_TIMEZONE = "Asia/Karachi"
 
 
 class FollowUp(models.Model):
@@ -85,6 +72,9 @@ class FollowUp(models.Model):
     campaign = models.ForeignKey("DiscoveryCampaign", on_delete=models.CASCADE, related_name="follow_ups")
     sequence = models.PositiveIntegerField(help_text="1 = the first follow-up (the first email is 0).")
     days_after_previous = models.PositiveIntegerField(default=3, help_text="Days after the previous email was sent.")
+    email_prompt = models.ForeignKey(EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True,
+                                     related_name="follow_up_steps", limit_choices_to={"kind": "follow_up"},
+                                     help_text="The prompt that writes this follow-up.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -117,15 +107,31 @@ class DiscoveryCampaign(models.Model):
     target_locations = models.JSONField(null=True, blank=True, default=list, help_text='List of places, e.g. ["Lahore", "Karachi"].')
     search_terms = models.JSONField(null=True, blank=True, default=list, help_text='List of searches, e.g. ["dental clinic"].')
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
-    campaign_prompt = models.OneToOneField(
-        CampaignPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="campaign",
-        help_text="Qualifies this campaign's businesses and holds the email prompts that write its emails. Each "
-                  "prompt belongs to one campaign. Without one, the campaign's businesses are not researched.",
+    campaign_prompt = models.ForeignKey(
+        CampaignPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="campaigns",
+        help_text="Qualifies this campaign's businesses (website research). Without one, they are not researched.",
     )
+    initial_email_prompts = models.ManyToManyField(
+        EmailPrompt, blank=True, related_name="initial_for_campaigns", limit_choices_to={"kind": "initial"},
+        help_text="Prompts that write the initial email. With several, prospects are split equally between them "
+                  "(A/B test) and each keeps its prompt.")
+    min_score = models.PositiveSmallIntegerField(
+        default=50, db_default=50, help_text="Businesses scoring at least this go on to finding decision makers; lower ones wait "
+                              "for a person to approve or reject them.")
+    gap_fixed_seconds = models.PositiveIntegerField(default=120, db_default=120, help_text="Fixed gap between two sends, in seconds.")
+    gap_random_min_seconds = models.PositiveIntegerField(default=180, db_default=180, help_text="Plus a random gap of at least this "
+                                                                                "many seconds...")
+    gap_random_max_seconds = models.PositiveIntegerField(default=300, db_default=300, help_text="...and at most this many seconds.")
+    daily_cap = models.PositiveIntegerField(default=40, db_default=40, help_text="Most emails this campaign sends in one day.")
+    send_window_start = models.TimeField(null=True, blank=True, help_text="Send only between these times (campaign "
+                                                                          "time zone); empty: any time of day.")
+    send_window_end = models.TimeField(null=True, blank=True)
+    send_timezone = models.CharField(max_length=64, default=DEFAULT_SEND_TIMEZONE, db_default=DEFAULT_SEND_TIMEZONE,
+                                     help_text="Time zone of the send window, e.g. Asia/Karachi.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     lead_source = models.CharField(
-        max_length=20, choices=LEAD_SOURCES, default="browser",
+        max_length=20, choices=LEAD_SOURCES, default="browser", db_default="browser",
         help_text="How businesses are found on Google Maps: the built-in browser, or the Google Maps scraper container "
                   "(MAPS_SCRAPER_URL in .env).")
     started_at = models.DateTimeField(null=True, blank=True)
@@ -142,10 +148,37 @@ class DiscoveryCampaign(models.Model):
             ),
             models.CheckConstraint(condition=models.Q(lead_source__in=["browser", "scraper_api"]),
                                    name="ck_discovery_campaigns_lead_source"),
+            models.CheckConstraint(condition=models.Q(min_score__lte=100), name="ck_discovery_campaigns_min_score"),
+            models.CheckConstraint(condition=models.Q(gap_random_min_seconds__lte=models.F("gap_random_max_seconds")),
+                                   name="ck_discovery_campaigns_gap"),
+            models.CheckConstraint(condition=models.Q(daily_cap__gte=1), name="ck_discovery_campaigns_daily_cap"),
+            models.CheckConstraint(
+                condition=models.Q(send_window_start__isnull=True, send_window_end__isnull=True)
+                | models.Q(send_window_start__isnull=False, send_window_end__isnull=False,
+                           send_window_start__lt=models.F("send_window_end")),
+                name="ck_discovery_campaigns_send_window"),
         ]
 
     def __str__(self):
         return self.name
+
+    def clean(self):
+        errors = {}
+        if self.gap_random_min_seconds is not None and self.gap_random_max_seconds is not None \
+                and self.gap_random_min_seconds > self.gap_random_max_seconds:
+            errors["gap_random_max_seconds"] = "Must be at least the minimum random gap."
+        if self.min_score is not None and self.min_score > 100:
+            errors["min_score"] = "Scores go from 0 to 100."
+        if (self.send_window_start is None) != (self.send_window_end is None):
+            errors["send_window_end"] = "Set both the start and the end of the send window, or neither."
+        elif self.send_window_start is not None and self.send_window_start >= self.send_window_end:
+            errors["send_window_end"] = "The end must be later than the start (same day, e.g. 09:00 - 18:00)."
+        try:
+            ZoneInfo(self.send_timezone or "")
+        except (ZoneInfoNotFoundError, ValueError):
+            errors["send_timezone"] = "Unknown time zone; use a name like Asia/Karachi."
+        if errors:
+            raise ValidationError(errors)
 
 
 class Business(models.Model):
@@ -176,6 +209,10 @@ class Business(models.Model):
     last_discovered_at = models.DateTimeField(null=True, blank=True)
     replied_at = models.DateTimeField(null=True, blank=True,
                                       help_text="Set when someone at the business replied: no more follow-ups go to it.")
+    review_status = models.CharField(
+        max_length=16, choices=[("approved", "Approved"), ("rejected", "Rejected")], null=True, blank=True,
+        db_index=True, help_text="A person's decision for a business below the campaign's minimum score (or not "
+                                 "researched): approved ones go on to finding decision makers, rejected ones never do.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -349,8 +386,16 @@ class Prospect(models.Model):
     qualification_score = models.IntegerField(null=True, blank=True)
     outreach_status = models.CharField(max_length=32, choices=OutreachStatus.choices, default=OutreachStatus.PENDING, db_index=True)
     outreach_priority = models.CharField(max_length=16, null=True, blank=True)
-    variation = models.CharField(max_length=1, choices=VARIATIONS, null=True, blank=True,
-                                 help_text="A/B variation, set when the first email is written; kept for every follow-up.")
+    initial_email_prompt = models.ForeignKey(
+        EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+        help_text="The initial-email prompt this prospect got (A/B group), set when its first email is written.")
+    approved_by_person = models.BooleanField(
+        default=False, db_default=False, help_text="A person approved emailing this address although verification did not confirm it.")
+    ghl_contact_id = models.CharField(max_length=64, null=True, blank=True, db_index=True,
+                                      help_text="Its contact in GoHighLevel.")
+    sequence_stopped_at = models.DateTimeField(null=True, blank=True,
+                                               help_text="No more emails to this prospect (reply or a manual stage move).")
+    sequence_stop_reason = models.CharField(max_length=64, null=True, blank=True)
     outreach_facts = models.JSONField(default=list, blank=True)
     research_summary = models.TextField(null=True, blank=True)
     do_not_contact = models.BooleanField(default=False)
@@ -368,7 +413,8 @@ class Prospect(models.Model):
 
     @property
     def is_ready(self) -> bool:
-        return self.email_status == "deliverable" and self.outreach_status == "ready" and not self.do_not_contact
+        return ((self.email_status == "deliverable" or self.approved_by_person) and self.outreach_status == "ready"
+                and not self.do_not_contact)
 
 
 class Email(models.Model):
@@ -377,8 +423,9 @@ class Email(models.Model):
     class Status(models.TextChoices):
         IN_REVIEW = "in_review", "In review"
         APPROVED = "approved", "Approved"
+        SCHEDULED = "scheduled", "Scheduled"
         REJECTED = "rejected", "Rejected"
-        SENDING = "sending", "Sending"
+        SENDING = "sending", "Handed to GoHighLevel"
         SENT = "sent", "Sent"
         OPENED = "opened", "Opened"
         FAILED = "failed", "Failed"
@@ -403,6 +450,11 @@ class Email(models.Model):
     reviewed_at = models.DateTimeField(null=True, blank=True)
     review_note = models.TextField(null=True, blank=True)
     edited_at = models.DateTimeField(null=True, blank=True)
+    scheduled_at = models.DateTimeField(null=True, blank=True, db_index=True,
+                                        help_text="When it goes out: the slot given when it was approved.")
+    released_at = models.DateTimeField(null=True, blank=True,
+                                       help_text="When it was written into the GoHighLevel contact for sending.")
+    ghl_error = models.TextField(null=True, blank=True, help_text="The last GoHighLevel error for this email.")
     sent_at = models.DateTimeField(null=True, blank=True)
     sent_from = models.CharField(max_length=320, null=True, blank=True)
     message_id = models.CharField(max_length=255, null=True, blank=True)
@@ -419,8 +471,8 @@ class Email(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["prospect", "sequence_step"], name="uq_emails_prospect_step"),
             models.CheckConstraint(
-                condition=models.Q(status__in=["in_review", "approved", "rejected", "sending", "sent", "opened", "failed",
-                                               "replied"]),
+                condition=models.Q(status__in=["in_review", "approved", "scheduled", "rejected", "sending", "sent",
+                                               "opened", "failed", "replied"]),
                 name="ck_emails_status",
             ),
         ]
@@ -465,6 +517,7 @@ class PipelineRun(models.Model):
     output = models.TextField(blank=True, default="")
     exit_code = models.IntegerField(null=True, blank=True)
     pid = models.IntegerField(null=True, blank=True)
+    cancel_requested = models.BooleanField(default=False, db_default=False, help_text="Stop asked for; the worker running it stops it.")
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -486,3 +539,19 @@ class PipelineRun(models.Model):
         import shlex
 
         return " ".join(["python manage.py", self.command, *(shlex.quote(str(a)) for a in self.arguments)])
+
+
+class WorkerHeartbeat(models.Model):
+    """The worker that runs queued pipeline runs (when the web app is hosted on Vercel) reports in here."""
+
+    name = models.CharField(max_length=128, primary_key=True)
+    last_seen = models.DateTimeField()
+    info = models.JSONField(default=dict, blank=True, help_text="e.g. whether the scraper container answers.")
+
+    class Meta:
+        db_table = "worker_heartbeats"
+        ordering = ["-last_seen"]
+        verbose_name = "worker"
+
+    def __str__(self):
+        return self.name

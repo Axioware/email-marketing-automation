@@ -1,4 +1,4 @@
-"""Test runner that never touches the real database.
+"""Test runner that never touches the real database or real external services.
 
 Tests run against TEST_DATABASE_URL when it is set, otherwise against a throwaway Postgres in Docker that is removed
 afterwards. The DATABASE_URL in .env (Supabase) is ignored while testing.
@@ -23,8 +23,19 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+# Real external services must never be reached from a test: .env is loaded by the settings, so these are removed
+# before any test runs (tests that need one set a fake value themselves).
+EXTERNAL_SERVICE_ENV = ("GHL_API_KEY", "GHL_LOCATION_ID", "GHL_WEBHOOK_SECRET", "GHL_BASE_URL", "CRON_SECRET",
+                        "GROQ_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "RUN_MODE", "VERCEL")
+
+
 class PostgresDockerRunner(DiscoverRunner):
     container = None
+
+    def setup_test_environment(self, **kwargs):
+        for name in EXTERNAL_SERVICE_ENV:
+            os.environ.pop(name, None)
+        super().setup_test_environment(**kwargs)
 
     def setup_databases(self, **kwargs):
         url = os.environ.get("TEST_DATABASE_URL", "").strip()

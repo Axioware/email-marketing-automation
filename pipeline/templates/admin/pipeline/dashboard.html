@@ -27,6 +27,10 @@
       {% endif %}
     </div>
 
+    {% if worker %}
+    <p class="pipeline-source-status">Worker: {% if worker.alive %}<span class="pipeline-badge pipeline-succeeded">running</span> on {{ worker.name }}{% else %}<span class="pipeline-badge pipeline-failed">not running</span>{% if worker.last_seen %} (last seen {{ worker.last_seen|timesince }} ago){% endif %}{% endif %}. Pipeline runs started here execute on the worker.</p>
+    {% endif %}
+
     <div class="module">
       <h2>Get leads</h2>
       <p class="pipeline-source-status">
@@ -58,11 +62,11 @@
 
     {% if results %}
     <div class="module">
-      <h2>Results by step and variation</h2>
+      <h2>Results by step and initial-email prompt (A/B)</h2>
       <table>
-        <thead><tr><th>Step</th><th>Variation</th><th>Sent</th><th>Open rate</th><th>Replies</th><th>Reply rate</th></tr></thead>
+        <thead><tr><th>Step</th><th>Initial-email prompt</th><th>Sent</th><th>Replies</th><th>Reply rate</th></tr></thead>
         <tbody>{% for row in results %}
-          <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.open_rate }}</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
+          <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
         {% endfor %}</tbody>
       </table>
     </div>

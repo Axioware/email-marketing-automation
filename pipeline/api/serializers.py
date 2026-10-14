@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from pipeline import jobs, review
@@ -30,8 +31,17 @@ def string_list(value, field):
 class FollowUpSerializer(serializers.ModelSerializer):
     class Meta:
         model = FollowUp
-        fields = ["id", "campaign", "sequence", "days_after_previous", "created_at", "updated_at"]
+        fields = ["id", "campaign", "sequence", "days_after_previous", "email_prompt", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
+
+    def validate_email_prompt(self, value):
+        if value is not None and value.kind != "follow_up":
+            raise serializers.ValidationError("Choose a follow-up prompt (kind follow_up).")
+        return value
+
+
+CAMPAIGN_SETTINGS = ["min_score", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds", "daily_cap",
+                     "send_window_start", "send_window_end", "send_timezone"]
 
 
 class DiscoveryCampaignSerializer(serializers.ModelSerializer):
@@ -41,8 +51,28 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
     class Meta:
         model = DiscoveryCampaign
         fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "lead_source",
-                  "campaign_prompt", "follow_ups", "business_count", "created_at", "updated_at", "started_at", "completed_at"]
+                  "campaign_prompt", "initial_email_prompts", *CAMPAIGN_SETTINGS, "follow_ups", "business_count",
+                  "created_at", "updated_at", "started_at", "completed_at"]
         read_only_fields = ["status", "created_at", "updated_at", "started_at", "completed_at"]
+
+    def validate_initial_email_prompts(self, value):
+        wrong = [prompt.name for prompt in value if prompt.kind != "initial"]
+        if wrong:
+            raise serializers.ValidationError(f"Not initial-email prompts: {', '.join(wrong)}.")
+        return value
+
+    def validate(self, attrs):
+        """The model's rules (gap range, send window, time zone, score range)."""
+        instance = DiscoveryCampaign(**{field: getattr(self.instance, field) for field in CAMPAIGN_SETTINGS}) \
+            if self.instance else DiscoveryCampaign()
+        for field in CAMPAIGN_SETTINGS:
+            if field in attrs:
+                setattr(instance, field, attrs[field])
+        try:
+            instance.clean()
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(error.message_dict) from error
+        return attrs
 
     def validate_target_locations(self, value):
         return string_list(value, "target_locations")
@@ -59,18 +89,16 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
 class EmailPromptSerializer(serializers.ModelSerializer):
     class Meta:
         model = EmailPrompt
-        fields = ["id", "campaign_prompt", "name", "sequence", "variation", "opened", "prompt", "is_default",
-                  "created_at", "updated_at"]
+        fields = ["id", "name", "kind", "prompt", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
 
 
 class CampaignPromptSerializer(serializers.ModelSerializer):
-    campaign = serializers.PrimaryKeyRelatedField(read_only=True)
-    email_prompts = EmailPromptSerializer(many=True, read_only=True)
+    campaigns = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
 
     class Meta:
         model = CampaignPrompt
-        fields = ["id", "name", "prompt", "campaign", "email_prompts", "created_at", "updated_at"]
+        fields = ["id", "name", "prompt", "campaigns", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
 
 
@@ -108,7 +136,8 @@ class ProspectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Prospect
         fields = "__all__"
-        read_only_fields = ["variation", "email_verification_provider", "email_verified_at", "verdict", "verification_note",
+        read_only_fields = ["initial_email_prompt", "ghl_contact_id", "sequence_stopped_at", "sequence_stop_reason",
+                            "email_verification_provider", "email_verified_at", "verdict", "verification_note",
                             "verification_details", "last_contacted_at", "created_at", "updated_at"]
 
 
@@ -129,7 +158,8 @@ class EmailSerializer(serializers.ModelSerializer):
         fields = ["id", "prospect", "business", "contact", "sequence_step", "recipient", "subject", "body",
                   "body_text", "body_html", "status", "prospect_ready", "generation_provider", "generation_model",
                   "email_prompt",
-                  "generated_at", "reviewed_at", "review_note", "edited_at", "sent_at", "sent_from", "message_id",
+                  "generated_at", "reviewed_at", "review_note", "edited_at", "scheduled_at", "released_at",
+                  "ghl_error", "sent_at", "sent_from", "message_id",
                   "send_error", "open_count", "first_opened_at", "last_opened_at", "tracking_token", "created_at",
                   "updated_at"]
         read_only_fields = [field for field in fields if field not in ("subject", "body")]

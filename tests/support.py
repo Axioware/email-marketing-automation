@@ -38,21 +38,29 @@ EMAIL_PROMPT = "TEST EMAIL RULES: write a short first-touch email; return subjec
 _unset = object()
 
 
-def make_prompts(name=None, qualification=QUALIFICATION_PROMPT, email=EMAIL_PROMPT):
-    """A campaign prompt with one default first-email prompt."""
-    from pipeline.models import CampaignPrompt, EmailPrompt
+def make_prompts(name=None, qualification=QUALIFICATION_PROMPT):
+    """A campaign prompt (qualification)."""
+    from pipeline.models import CampaignPrompt
 
-    campaign_prompt = CampaignPrompt.objects.create(name=name or f"Prompts {CampaignPrompt.objects.count() + 1}",
-                                                    prompt=qualification)
-    EmailPrompt.objects.create(campaign_prompt=campaign_prompt, name="First email", prompt=email, is_default=True)
-    return campaign_prompt
+    return CampaignPrompt.objects.create(name=name or f"Prompts {CampaignPrompt.objects.count() + 1}",
+                                         prompt=qualification)
 
 
-def make_campaign(campaign_prompt=_unset, **fields) -> DiscoveryCampaign:
-    """A campaign with its own campaign prompt and first-email prompt (pass campaign_prompt=None for none)."""
+def make_email_prompt(name=None, prompt=EMAIL_PROMPT, kind="initial"):
+    from pipeline.models import EmailPrompt
+
+    return EmailPrompt.objects.create(name=name or f"Email prompt {EmailPrompt.objects.count() + 1}", prompt=prompt,
+                                      kind=kind)
+
+
+def make_campaign(campaign_prompt=_unset, initial_prompts=_unset, **fields) -> DiscoveryCampaign:
+    """A campaign with its own campaign prompt and one initial-email prompt (pass campaign_prompt=None or
+    initial_prompts=[] for none)."""
     if campaign_prompt is _unset:
         campaign_prompt = make_prompts()
-    return DiscoveryCampaign.objects.create(**{"name": "test", "campaign_prompt": campaign_prompt, **fields})
+    campaign = DiscoveryCampaign.objects.create(**{"name": "test", "campaign_prompt": campaign_prompt, **fields})
+    campaign.initial_email_prompts.set([make_email_prompt()] if initial_prompts is _unset else initial_prompts)
+    return campaign
 
 
 def make_business(campaign=None, name="Business", score=None, **fields) -> Business:

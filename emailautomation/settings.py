@@ -11,6 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 TESTING = len(sys.argv) > 1 and sys.argv[1] == "test"
+ON_VERCEL = bool(os.environ.get("VERCEL"))  # set by Vercel on every deployment
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -34,8 +35,11 @@ def database_from_url(url: str) -> dict:
         "HOST": parts.hostname or "",
         "PORT": str(parts.port or ""),
         "OPTIONS": dict(parse_qsl(parts.query)),
-        "CONN_MAX_AGE": 60,
+        # Serverless functions do not live long enough to reuse a connection; Supabase's pooler (port 6543,
+        # transaction mode) does that, and it cannot keep server-side cursors open between transactions.
+        "CONN_MAX_AGE": 0 if ON_VERCEL else 60,
         "CONN_HEALTH_CHECKS": True,
+        "DISABLE_SERVER_SIDE_CURSORS": parts.port == 6543 or env_bool("DATABASE_POOLER"),
     }
 
 
@@ -51,6 +55,14 @@ if not SECRET_KEY:
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
+if ON_VERCEL:  # the deployment's own addresses, so a fresh deployment works without listing them
+    for name in ("VERCEL_URL", "VERCEL_BRANCH_URL", "VERCEL_PROJECT_PRODUCTION_URL"):
+        host = os.environ.get(name, "").strip()
+        if host and host not in ALLOWED_HOSTS:
+            ALLOWED_HOSTS.append(host)
+            CSRF_TRUSTED_ORIGINS.append(f"https://{host}")
+    os.environ.setdefault("RUN_MODE", "queue")  # no background processes on Vercel: a worker runs pipeline steps
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
     "pipeline",  # first, so its admin templates take precedence
@@ -130,7 +142,7 @@ CSRF_COOKIE_HTTPONLY = True
 X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"  # "no-referrer" makes browsers send Origin: null, which fails CSRF
-if env_bool("DJANGO_SECURE_COOKIES"):
+if env_bool("DJANGO_SECURE_COOKIES") or ON_VERCEL:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
 

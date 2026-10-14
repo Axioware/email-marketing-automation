@@ -1,6 +1,6 @@
 # Email Marketing Automation
 
-Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email for each and lets you review and approve them. It does not send emails: approved emails wait for the sending method you choose. It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each and lets you review and approve them. Approved emails are scheduled and **GoHighLevel sends them** (see [Sending through GoHighLevel](#sending-through-gohighlevel)); the web app can run on **Vercel** with the pipeline steps on a worker machine (see [Deploying on Vercel](#deploying-on-vercel-web-app--worker)). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
 
 **Using the admin day to day:** see the [user guide](docs/USER_GUIDE.md), also available in the admin under **Guide** (top right).
 
@@ -11,7 +11,7 @@ Finds local businesses, researches and scores them, finds the decision maker and
 ```sh
 cd email-marketing-automation
 python -m venv .venv && source .venv/bin/activate    # skip if .venv already exists
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-worker.txt    # everything (requirements.txt alone = the web app, for Vercel)
 python -m playwright install chromium               # Modules 1 and 2
 cp .env.example .env                                # then fill it in (see below)
 python manage.py migrate                            # creates / updates every table
@@ -27,7 +27,8 @@ Also needed:
 
 - **Docker**: email verification (Module 4) runs Reacher in a container (see "Docker setup" below).
 - **Firefox and geckodriver**: contact discovery (Module 3).
-- **Supabase**: only for open tracking (Module 5). Deploy the edge function and upload the footer image once (see "Open tracking").
+- **Supabase**: the database; the open-tracking edge function is optional (open tracking is off).
+- **GoHighLevel**: sends the emails (see [Sending through GoHighLevel](#sending-through-gohighlevel)).
 
 ### Docker setup (Reacher, for email verification)
 
@@ -84,6 +85,9 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 | Research and email writing | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
 | Email sign-off | `SENDER_NAME` (optional; empty: "The Axioware team") |
+| Sending through GoHighLevel | `GHL_API_KEY` (sub-account Private Integration token), `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET` (the workflows send it) |
+| Cron endpoints | `CRON_SECRET` (Vercel Cron sends it as `Authorization: Bearer ...`) |
+| Pipeline runs | `RUN_MODE` (`local`, default; `queue` on Vercel, set automatically there) |
 
 ### Docker setup (Google Maps scraper, optional second lead source)
 
@@ -116,9 +120,12 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 3. Research and score | Businesses > action **Research websites** | `python manage.py research_websites` |
 | 4. Find owners | Businesses > action **Find decision makers** | `python manage.py find_stakeholders --headed` |
 | 5. Verify emails | Businesses or Contacts > action **Verify emails** | `python manage.py verify_emails` |
-| 6. Write emails | Prospects or Businesses > action **Generate outreach emails** (choose an email prompt) | `python manage.py generate_emails [--email-prompt-id N]` |
-| 7. Review | Emails: edit, Approve, Reject, Regenerate | - |
-| 8. Follow-ups | Campaign > **Follow-ups** table; dashboard **Write follow-ups**; **Mark replied** on replies | `python manage.py generate_followups` |
+| 3b. Review low scores | Businesses > filter **Needs your review** > **Approve** / **Reject** | - |
+| 5b. Review unverified addresses | Prospects > filter Needs review > **Approve** / **Reject** | - |
+| 6. Write emails | Prospects or Businesses > action **Generate outreach emails** | `python manage.py generate_emails [--email-prompt-id N]` |
+| 7. Review | Emails: edit, Approve (= schedule), Reject, Regenerate | - |
+| 8. Send | GoHighLevel, once each email's time comes | `python manage.py ghl_sync` every minute (or the cron endpoints) |
+| 9. Follow-ups | Campaign > **Follow-ups** table (days + prompt per step); written for review once the previous email is sent | `python manage.py generate_followups` |
 
 Every command has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
 
@@ -145,9 +152,11 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 
 | Endpoint | What |
 |---|---|
-| `/api/campaigns/` | list, create, edit, delete (`lead_source`: `browser` or `scraper_api`); `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20, "source": "scraper_api"}` (`source` optional: the campaign's lead source) |
-| `/api/follow-ups/` | a campaign's follow-up schedule (sequence, days after previous); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops follow-ups to that business |
-| `/api/campaign-prompts/`, `/api/email-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored), email prompts write emails; a campaign links to one campaign prompt (`campaign_prompt`), which has many email prompts |
+| `/api/campaigns/` | list, create, edit, delete: `lead_source`, `campaign_prompt`, `initial_email_prompts` (ids; several = A/B), `min_score`, `gap_fixed_seconds`, `gap_random_min_seconds`, `gap_random_max_seconds`, `daily_cap`, `send_window_start`/`send_window_end`, `send_timezone`; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20, "source": "scraper_api"}` |
+| `/api/follow-ups/` | a campaign's follow-up steps (sequence, days after previous, `email_prompt`); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops that prospect's sequence |
+| `/api/campaign-prompts/`, `/api/email-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored; shared by campaigns); email prompts write emails (`kind`: `initial` or `follow_up`) |
+| `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/` | GoHighLevel webhooks (header `X-Webhook-Secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
+| `/api/cron/release/`, `/api/cron/followups/` | cron endpoints (header `Authorization: Bearer <CRON_SECRET>`) |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
 | `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |
 | `/api/emails/` | list, view, `PATCH` `subject`/`body` (goes back to review), delete |
@@ -202,7 +211,7 @@ python manage.py research_websites --limit 5
 
 The script processes businesses with websites that do not yet have a completed profile. Failed profiles are skipped on normal runs; pass `--retry-failed` to retry them. Use `--limit N` for a bounded batch or `--business-id ID` (repeatable) for specific businesses; in the admin, select businesses and use the **Research websites** action. It asks the agent to SCORE, SCRAPE, or EXIT after each page, enforces a maximum of five unique page visits per business, and stores compact page summaries/findings, discovered links, emails, and URLs in `business_website_profiles`. Only the current page's full cleaned text is sent on each agent turn; raw HTML is not saved.
 
-**What it scores against** is the business's campaign's **campaign prompt** (table `campaign_prompts`, edited in the admin under Campaign prompts): what you sell, what a good and a poor prospect look like and what each score range means. The agent receives **exactly that text** as its instructions; nothing is added in front of it, so everything about qualifying lives in the database. The app only fixes the shape of each answer: a strict JSON schema (`AgentResponse` in `pipeline/services/research.py`) whose field descriptions say how to ask for another page (`SCRAPE` + a URL from `available_links`), score (`SCORE` + `score`, `reasons`, `reasoning`) or stop (`EXIT`); the campaign prompt's page shows it under **Answer format (set by the app)**. An output format written inside the prompt is overridden by that schema. Businesses whose campaign has no campaign prompt are skipped and reported (they stay unresearched); if none of the selected businesses has one, the run stops.
+**What it scores against** is the business's campaign's **campaign prompt** (table `campaign_prompts`, edited in the admin under Campaign prompts): what you sell, what a good and a poor prospect look like and what each score range means. The agent receives **exactly that text** as its instructions; nothing is added in front of it, so everything about qualifying lives in the database. The app only fixes the shape of each answer: a strict JSON schema (`AgentResponse` in `pipeline/services/research.py`) whose field descriptions say how to ask for another page (`SCRAPE` + a URL from `available_links`), score (`SCORE` + `score`, `reasons`, `reasoning`) or stop (`EXIT`); the campaign prompt's page shows it under **Answer format (set by the app)**. An output format written inside the prompt is overridden by that schema. Businesses whose campaign has no campaign prompt are skipped and reported (they stay unresearched); if none of the selected businesses has one, the run stops. Businesses scoring below their campaign's **minimum score** (`min_score`, default 50), whose research failed, or without a website wait for a person: Businesses > **Needs your review** > **Approve** (they go on to finding decision makers) or **Reject**.
 
 ## Find decision makers and contact emails (Module 3)
 
@@ -212,7 +221,7 @@ Needs Firefox and [geckodriver](https://github.com/mozilla/geckodriver/releases)
 python manage.py find_stakeholders --limit 5 --headed
 ```
 
-For each qualified business (completed profile, score >= `--min-score`, default 50) it runs a waterfall:
+For each qualified business (research score at least its campaign's **minimum score**, or approved by a person; rejected ones never; `--min-score` overrides the campaign's minimum) it runs a waterfall:
 
 1. **Module 2 data:** scraped page text, findings, emails and LinkedIn links are mined for people and job titles.
 2. **Rendered site crawl** (only if no target-role person yet; `--max-pages`, default 6): team/about/contact pages are opened in Firefox so JavaScript-built pages are read as a visitor sees them. Pages Module 2 already read are skipped.
@@ -295,19 +304,19 @@ Options: `--business-id`, `--contact-id` (both repeatable), `--limit` (contacts)
 
 ### Generate emails
 
-`python manage.py generate_emails` (admin: select prospects or businesses, action **Generate outreach emails**) writes one email per prospect that is ready for outreach (`email_status = 'deliverable'`, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`pipeline/services/llm.py`).
+`python manage.py generate_emails` (admin: select prospects or businesses, action **Generate outreach emails**) writes one email per prospect that is ready for outreach (`email_status = 'deliverable'` or approved by a person, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`pipeline/services/llm.py`).
 
-The model's instructions are one **email prompt** (table `email_prompts`, edited in the admin), used as is: it belongs to the campaign's campaign prompt and is chosen per step and A/B variation (default for the first email, or `--email-prompt-id`). There is no built-in prompt: a prospect whose campaign has no email prompt for the first email is skipped and reported. The seeded **First-touch email** writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SENDER_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
+The model's instructions are one **email prompt** (table `email_prompts`, edited in the admin), used as is. A campaign chooses its **initial-email prompts** (several are an A/B test: prospects are split equally and each keeps its prompt, `prospects.initial_email_prompt`) and one **follow-up prompt per follow-up step**; `--email-prompt-id` overrides. Prompts are reusable across campaigns. There is no built-in prompt: a prospect whose campaign has no initial-email prompt is skipped and reported. The seeded **First-touch email** writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SENDER_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
 
 ```sh
 python manage.py generate_emails --limit 1 --dry-run
 ```
 
-Options: `--prospect-id`, `--business-id` (both repeatable), `--email-prompt-id` (default: each campaign's default email prompt), `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
+Options: `--prospect-id`, `--business-id` (both repeatable), `--email-prompt-id` (default: each campaign's initial-email prompts), `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
 
 ### Open tracking (switched off)
 
-**Open tracking is off: emails contain no image, and opens are not recorded.** Emails carry the body and the footer text (company details and unsubscribe line) only. Everything tracking needs is kept as a placeholder so it can be turned back on: each email's tracking token and open fields (`open_count`, `first_opened_at`, `last_opened_at`, status `opened`), the `email_open_events` table, the `record_email_open` database function and the Supabase edge function. While it is off, the dashboard and the Emails list show the open rate as "off", `EMAIL_TRACKING_BASE_URL` is not needed, and follow-up prompts set to "previous email opened / not opened" are not chosen (opens are unknown).
+**Open tracking is off: emails contain no image, and opens are not recorded.** Emails carry the body and the footer text (company details and unsubscribe line) only. Everything tracking needs is kept as a placeholder so it can be turned back on: each email's tracking token and open fields (`open_count`, `first_opened_at`, `last_opened_at`, status `opened`), the `email_open_events` table, the `record_email_open` database function and the Supabase edge function. While it is off, the dashboard and the Emails list show the open rate as "off" and `EMAIL_TRACKING_BASE_URL` is not needed.
 
 To turn it back on, set `OPEN_TRACKING = True` in `pipeline/services/generation.py`: new emails then carry the tracked footer image again. How it works when on:
 
@@ -343,10 +352,40 @@ Opens are rate limited in the database: at most 10 recorded opens per email per 
 Every generated email starts in `in_review`. Review them in the admin under **Emails**:
 
 - **List**: counts per status and the open rate at the top (click one to filter), search by business, recipient or subject, and the actions **Approve selected**, **Reject selected** and **Mark replied**.
-- **Email page**: edit the subject and body (the footer and tracking image are added automatically), see a preview (which loads the footer directly, so viewing never counts as an open), and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (then jumps to the next email in review), **Reject** with an optional note, **Back to review**, and **Regenerate with AI**.
+- **Email page**: edit the subject and body (the footer is added automatically), see a preview, and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (schedules it, then jumps to the next email in review), **Reject** with an optional note, **Back to review**, and **Regenerate with AI**. A scheduled email shows its send time; editing, rejecting or sending it back to review frees its slot.
 - Editing an approved email sends it back to review. Emails with `PLACEHOLDER` text cannot be approved. Sent emails are read-only and show their opens.
 
-Statuses: `in_review` -> `approved`, plus `rejected`. **This app does not send emails** (SMTP sending was removed): approved emails wait for whichever sending method is chosen. The later statuses (`sent`, `opened`, `replied`, `failed`) and the delivery fields (`sent_at`, `message_id`, ...) stay for that sender to fill in; follow-ups become due from an email's `sent_at`, so they start once emails are marked sent.
+Statuses: `in_review` -> `approved` -> `scheduled` (send time given) -> `sending` (written into the GoHighLevel contact) -> `sent` (GoHighLevel reported it) -> `replied`; plus `rejected`. `failed` and `opened` are kept for older data and open tracking.
+
+## Sending through GoHighLevel
+
+GoHighLevel sends every email from your connected mailbox; this app decides what and when.
+
+1. **Contacts.** Every ready prospect (deliverable, or approved by a person; one address per person) becomes a GHL contact tagged `outreach-app` and `campaign-<name>` (`ghl_sync`, also the last step of `run_pipeline`). A GHL workflow turns new tagged contacts into **New Lead** opportunities.
+2. **Approval = schedule.** Approving an email gives it a send time: the campaign's previous slot + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day; a follow-up never before "previous email sent + its days". The contact's **Email Due At** (date) and, for an initial email, **Initial Email Type** (the prompt's name) are written at once, so a workflow can move the lead to **Ready to Send**.
+3. **Release.** GHL date fields hold no time of day (checked against the API), so GHL cannot wait for the minute; this app does. Every minute (`ghl_sync`, `GET /api/cron/release/`, or `run_worker --cron`) emails whose time has come are written into the contact: **Email Subject**, **Email Body** (HTML incl. footer), **Follow-up Count** (0 = initial, n = follow-up n), **Email Due At**. The GHL sending workflow, triggered by Email Body becoming non-empty, sends at once.
+4. **Sent.** The workflow calls `POST /api/ghl/email-sent/`. The app marks the email sent and, before answering, empties Subject, Body and Due At and sets **Follow-up Count** to the next follow-up's number, or empties it when the sequence is over (the workflow then moves the lead to **Quota Exhausted**). The next follow-up is written for review by `/api/cron/followups/` (or `generate_followups`) and released the same way once approved. GHL may retry the webhook; a repeat changes nothing.
+5. **Stop.** On a reply or a manual stage move the workflow calls `POST /api/ghl/stop-sequence/`: the prospect's sequence ends, emails not sent yet are cancelled and its fields are emptied, so a later release can never re-trigger sending. Each prospect has its own sequence; colleagues at the same business are not affected.
+
+Contact custom fields the app writes (create them in GHL; their keys must be exactly these): `contact.email_subject` (text), `contact.email_body` (large text), `contact.email_due_at` (date), `contact.followup_count` (number), `contact.initial_email_type` (text).
+
+Webhooks (header `X-Webhook-Secret: <GHL_WEBHOOK_SECRET>`, JSON body):
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `POST /api/ghl/email-sent/` | `{"contact_id": "{{contact.id}}", "followup_count": "{{contact.followup_count}}"}` | `200` `{"email", "outcome", "next"}`; `401` wrong secret, `404` unknown contact, `409` nothing was handed to GHL, `502` GHL error (safe to retry) |
+| `POST /api/ghl/stop-sequence/` | `{"contact_id": "{{contact.id}}", "reason": "replied"}` (any reason; `replied...` also marks the last email replied) | `200` `{"prospect", "reason", "cancelled"}` |
+
+Cron (header `Authorization: Bearer <CRON_SECRET>` or the API's `Auth` header): `GET /api/cron/release/` every minute (contacts + release; at most 25 of each per call), `GET /api/cron/followups/` every 10 minutes (writes up to 5 follow-ups for review, `?limit=` up to 20). The dashboard warns when GHL is not set up, when an email was handed to GHL over 30 minutes ago without the email-sent webhook, and when a GHL update failed (retried every minute).
+
+## Deploying on Vercel (web app + worker)
+
+Vercel runs short web requests only: no background processes, browsers or Docker. So the **web app** (admin, API, webhooks, cron endpoints) runs on Vercel, and the **pipeline steps** (fetching, research, decision makers, verification, writing emails) run on a **worker**: a machine with Chromium, Firefox, Docker (Reacher, the scraper container) and the same `DATABASE_URL`.
+
+- `vercel.json` routes every request to `api/index.py` (the Django WSGI app), allows 60 s per request, and schedules the two cron endpoints (every-minute crons need a Vercel Pro plan; on Hobby use `run_worker --cron` or any external scheduler calling the endpoints). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
+- Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `CRON_SECRET`, `SENDER_NAME`. On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
+- Run `python manage.py migrate` from your machine (not on deploy).
+- On the worker: `python manage.py run_worker` (add `--cron` to also release emails and write follow-ups there). Runs started in the admin or the API wait in the queue until the worker picks them up; **Stop** reaches the worker through the database. The dashboard shows when the worker was last seen. Run one worker.
 
 ### Placeholders to fill
 
@@ -361,7 +400,7 @@ python manage.py test
 npx deno test supabase/functions/email/handler_test.ts
 ```
 
-Tests never use the `.env` database: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set). Reacher, the scraper container and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
+Tests never use the `.env` database or real services: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set), the test runner removes the GoHighLevel, cron and LLM keys from the environment, and the GHL client refuses the real API during tests. Reacher, the scraper container, GoHighLevel and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
 
 ## Project layout
 
@@ -369,7 +408,8 @@ Tests never use the `.env` database: they run against a throwaway Postgres conta
 |---|---|
 | `emailautomation/` | Django settings and URLs |
 | `pipeline/models.py` | one model per table |
-| `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups) |
+| `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` + `ghl.py` (scheduling and GoHighLevel) |
+| `api/index.py`, `vercel.json` | the Vercel entry point and configuration |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |
 | `pipeline/api/` | the REST API |

@@ -14,13 +14,14 @@
 <div class="pipeline-review">
   <div class="pipeline-card">
     <h2>{% if email.sequence_step > 1 %}Follow-up {{ email.sequence_step|add:"-1" }}{% else %}First email{% endif %}
-      {% if email.prospect.variation %}· variation {{ email.prospect.variation|upper }}{% endif %}
+      {% if email.email_prompt %}· {{ email.email_prompt.name }}{% endif %}
       <span class="pipeline-badge pipeline-{{ email.status }}">{{ email.get_status_display }}</span>
       {% if in_review_count %}<small>({{ in_review_count }} in review)</small>{% endif %}</h2>
-    {% if email.business.replied_at %}<p class="pipeline-note">{{ email.business.name }} replied on {{ email.business.replied_at|date:"Y-m-d" }}: no more emails go to this business.</p>{% endif %}
+    {% if email.prospect.sequence_stopped_at %}<p class="pipeline-note">This prospect's sequence was stopped on {{ email.prospect.sequence_stopped_at|date:"Y-m-d" }} ({{ email.prospect.sequence_stop_reason }}): no more emails go to them.</p>{% endif %}
     {% if email.review_note %}<p class="pipeline-note">Review note: {{ email.review_note }}</p>{% endif %}
     {% if email.send_error %}<p class="pipeline-error">Last send error: {{ email.send_error }}</p>{% endif %}
-    {% if not prospect_ready and email.status in "in_review approved" %}<p class="pipeline-error">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</p>{% endif %}
+    {% if email.ghl_error %}<p class="pipeline-error">GoHighLevel: {{ email.ghl_error }}</p>{% endif %}
+    {% if not prospect_ready and email.status in "in_review approved scheduled" %}<p class="pipeline-error">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</p>{% endif %}
     {% if has_placeholder %}<p class="pipeline-error">Contains placeholder text; edit it before approving.</p>{% endif %}
 
     <div class="pipeline-actions">
@@ -28,12 +29,12 @@
         <form method="post" action="{{ approve_url }}">{% csrf_token %}
           <input type="submit" class="default" value="Approve" {% if has_placeholder %}disabled{% endif %}></form>
       {% endif %}
-      {% if email.status == "in_review" or email.status == "approved" %}
+      {% if email.status == "in_review" or email.status == "approved" or email.status == "scheduled" %}
         <form method="post" action="{{ reject_url }}">{% csrf_token %}
           <input type="text" name="note" placeholder="Reason (optional)" maxlength="2000">
           <input type="submit" class="danger" value="Reject"></form>
       {% endif %}
-      {% if email.status == "rejected" or email.status == "approved" %}
+      {% if email.status == "rejected" or email.status == "approved" or email.status == "scheduled" %}
         <form method="post" action="{{ reopen_url }}">{% csrf_token %}<input type="submit" value="Back to review"></form>
       {% endif %}
       {% if email.status == "sent" or email.status == "opened" %}
@@ -42,15 +43,17 @@
       {% if email.status == "in_review" or email.status == "rejected" %}
         <form method="post" action="{{ regenerate_url }}">{% csrf_token %}
           <select name="email_prompt" aria-label="Email prompt">
-            <option value="">{% if email.email_prompt %}Same prompt ({{ email.email_prompt.name }}){% else %}Campaign default prompt{% endif %}</option>
+            <option value="">{% if email.email_prompt %}Same prompt ({{ email.email_prompt.name }}){% else %}The campaign's prompt{% endif %}</option>
             {% for prompt in email_prompts %}<option value="{{ prompt.pk }}">{{ prompt }}</option>{% endfor %}
           </select>
           <input type="submit" value="Regenerate with AI"></form>
       {% endif %}
     </div>
 
-    {% if email.status == "approved" %}
-      <p class="pipeline-note">Approved. This app does not send emails; it waits here for the sending method you choose.</p>
+    {% if email.status == "scheduled" %}
+      <p class="pipeline-note">Scheduled for {{ email.scheduled_at|date:"Y-m-d H:i T" }}. At that time it is written into the GoHighLevel contact and GoHighLevel sends it. Editing, rejecting or sending it back to review cancels the slot.</p>
+    {% elif email.status == "sending" %}
+      <p class="pipeline-note">Handed to GoHighLevel on {{ email.released_at|date:"Y-m-d H:i T" }}; waiting for GoHighLevel to report it sent.</p>
     {% endif %}
 
     <h3>What we know about them</h3>

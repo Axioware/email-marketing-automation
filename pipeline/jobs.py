@@ -1,8 +1,13 @@
 """Pipeline runs: start any pipeline command from the admin or the API and run it in a background process.
 
-A run is a row in `pipeline_runs`. Starting one spawns `manage.py run_pipeline_job <id>`, which executes the
-command exactly as the CLI would and streams everything it prints into the row, so the admin and the API can show
-progress while it works. Long steps (scraping, verification, sending) therefore never block a web request.
+A run is a row in `pipeline_runs`. It executes as `manage.py run_pipeline_job <id>`, which runs the command exactly
+as the CLI would and streams everything it prints into the row, so the admin and the API can show progress while it
+works. Long steps (scraping, research, verification) therefore never block a web request.
+
+RUN_MODE=local (default): starting a run spawns that process on this machine.
+RUN_MODE=queue (the web app on Vercel, which cannot run background processes, browsers or Docker): starting a run
+only stores it; `manage.py run_worker` on a machine with the browsers and Docker picks queued runs up, and a stop
+request is passed to it through the database.
 """
 import argparse
 import os
@@ -34,7 +39,8 @@ COMMANDS = {
     "find_stakeholders": "Module 3 - find decision makers and candidate emails",
     "verify_emails": "Module 4 - verify emails with Reacher (creates prospects)",
     "generate_emails": "Module 5 - generate outreach emails for review",
-    "generate_followups": "Follow-ups - write the follow-ups that are due, for review",
+    "generate_followups": "Follow-ups - write the next follow-ups for review",
+    "ghl_sync": "GoHighLevel - create contacts and hand due emails to GoHighLevel",
 }
 # Options every Django command has; they are not pipeline options.
 DJANGO_OPTIONS = {"help", "version", "verbosity", "settings", "pythonpath", "traceback", "no_color", "force_color",
@@ -129,11 +135,18 @@ def build_arguments(command: str, options: dict | None = None, arguments: list |
 # ---------------------------------------------------------------- starting and stopping
 
 
+def queue_mode() -> bool:
+    """Runs wait for a worker instead of starting here (RUN_MODE=queue, e.g. on Vercel)."""
+    return os.environ.get("RUN_MODE", "local").strip().lower() == "queue"
+
+
 def start_run(command: str, arguments: list[str], user=None) -> PipelineRun:
-    """Record a run and start it in the background once the surrounding transaction commits."""
+    """Record a run and start it in the background once the surrounding transaction commits (in queue mode a
+    worker starts it)."""
     run = PipelineRun.objects.create(command=command, arguments=arguments,
                                      created_by=user if getattr(user, "is_authenticated", False) else None)
-    transaction.on_commit(lambda: launch(run.pk))
+    if not queue_mode():
+        transaction.on_commit(lambda: launch(run.pk))
     return run
 
 
@@ -161,7 +174,12 @@ def cancel_run(run: PipelineRun) -> str:
     ):
         return "Cancelled before it started."
     run.refresh_from_db()
-    if run.status != PipelineRun.Status.RUNNING or not run.pid:
+    if run.status != PipelineRun.Status.RUNNING:
+        return "This run is not running."
+    if queue_mode():  # it runs on the worker's machine: the worker sees the request and stops it
+        PipelineRun.objects.filter(pk=run.pk).update(cancel_requested=True)
+        return "Stop requested; the worker stops the run within a few seconds."
+    if not run.pid:
         return "This run is not running."
     if not process_alive(run.pid):
         refresh_stale_runs()
@@ -187,7 +205,16 @@ def process_alive(pid: int) -> bool:
 
 
 def refresh_stale_runs() -> None:
-    """Mark runs failed whose process died without recording a result (e.g. the machine restarted)."""
+    """Mark runs failed whose process died without recording a result (e.g. the machine restarted). In queue mode the
+    processes live on the worker's machine, so the worker does this itself (run_worker)."""
+    if queue_mode():
+        return
+    fail_dead_runs(queued_too=True)
+
+
+def fail_dead_runs(queued_too: bool = False) -> None:
+    """Running runs whose process (on this machine) is gone are marked failed; with `queued_too`, also runs that
+    never started within QUEUED_TIMEOUT."""
     now = timezone.now()
     for run in PipelineRun.objects.filter(status=PipelineRun.Status.RUNNING).exclude(pid=None):
         if not process_alive(run.pid):
@@ -195,6 +222,8 @@ def refresh_stale_runs() -> None:
                 status=PipelineRun.Status.FAILED, finished_at=now,
                 output=run.output + "\n[The process stopped without recording a result.]\n" + _log_tail(run.pk),
             )
+    if not queued_too:
+        return
     for run in PipelineRun.objects.filter(status=PipelineRun.Status.QUEUED, created_at__lt=now - QUEUED_TIMEOUT):
         PipelineRun.objects.filter(pk=run.pk, status=PipelineRun.Status.QUEUED).update(
             status=PipelineRun.Status.FAILED, finished_at=now,

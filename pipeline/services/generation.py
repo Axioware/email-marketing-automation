@@ -1,13 +1,14 @@
 """Generate one outreach email per prospect and store it in `emails` for review.
 
-For every prospect that is ready for outreach (deliverable email, `outreach_status = 'ready'`, not
-`do_not_contact`) the LLM writes a subject and body from what earlier modules learned about the business and the
-contact, following the campaign's email prompt (no email prompt for the first email: the prospect is skipped). Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below): the email
+For every prospect that is ready for outreach (deliverable email or approved by a person, `outreach_status =
+'ready'`, not `do_not_contact`) the LLM writes a subject and body from what earlier modules learned about the
+business and the contact, following one of the campaign's initial-email prompts (several: split equally as an A/B
+test; none: the prospect is skipped). Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below): the email
 carries no image. When it is on, the HTML footer image points at the tracking edge function
 (`/email/footer/{token}`), which records opens once the email has been sent.
 
 Nothing is sent here: emails are stored with status `in_review`; approve or edit them in the admin
-(Pipeline > Emails) or through the API. The LLM is Groq when its key is set, otherwise OpenAI (see `llm.py`).
+(Pipeline > Emails) or through the API. Approved emails are scheduled and handed to GoHighLevel (see outreach.py). The LLM is Groq when its key is set, otherwise OpenAI (see `llm.py`).
 """
 import html
 import json
@@ -23,11 +24,11 @@ from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from pipeline.models import CampaignPrompt, Email, EmailPrompt, Prospect
+from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, FollowUp, Prospect
 from pipeline.services.llm import make_llm_client, rejected_output
 
 # The model's instructions are one email prompt (email_prompts table, edited in the admin), chosen per campaign, step and
-# A/B variation; it receives the JSON built by `prospect_context` as the user message. There is no built-in prompt.
+# A/B group; it receives the JSON built by `prospect_context` as the user message. There is no built-in prompt.
 SENDER_NAME_ENV = "SENDER_NAME"  # name used in the sign-off; empty -> "The Axioware team"
 MAX_WEBSITE_FINDINGS = 12
 
@@ -217,69 +218,61 @@ def prospect_context(row: dict) -> dict:
     }
 
 
-def pick_email_prompt(prompts: list, variation: str | None, previous_opened: bool | None):
-    """The prompt for one step, first match wins: the prospect's variation with the matching "opened" setting; the
-    prospect's variation with opened = any; the step's default; any prompt of the step. None if the step has none."""
-    if previous_opened is not None:
-        for prompt in prompts:
-            if prompt.variation == variation and prompt.opened is previous_opened:
-                return prompt
-    for prompt in prompts:
-        if prompt.variation == variation and prompt.opened is None:
-            return prompt
-    for prompt in prompts:
-        if prompt.is_default:
-            return prompt
-    return prompts[0] if prompts else None
+def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None,
+                   sequence: int = 0) -> tuple[str, int] | None:
+    """(system prompt, email prompt id) for one prospect and step (sequence 0 = the initial email, n = follow-up n).
 
-
-def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None, sequence: int = 0,
-                   previous_opened: bool | None = None) -> tuple[str, int] | None:
-    """(system prompt, email prompt id) for one prospect and step (sequence 0 = the first email).
-
-    A chosen email prompt wins. Otherwise the prompt comes from the campaign's prompt for that step and the
-    prospect's variation (see pick_email_prompt). None when the campaign has no email prompt for the step: that email
-    is skipped.
+    A chosen email prompt wins. Otherwise the initial email uses the prospect's initial-email prompt (its A/B group,
+    see assign_initial_prompt) and follow-up n the prompt of the campaign's follow-up step n. None when there is
+    none: that email is skipped.
     """
     if chosen is not None:
         return chosen.prompt, chosen.pk
     cache = {} if cache is None else cache
-    campaign_id = row.get("campaign_id")
-    key = (campaign_id, sequence)
-    if key not in cache:
-        campaign_prompt = CampaignPrompt.objects.filter(campaign__id=campaign_id).first() if campaign_id else None
-        prompts = list(campaign_prompt.email_prompts.filter(sequence=sequence).select_related("campaign_prompt")
-                       .order_by("id")) if campaign_prompt else []
-        cache[key] = (campaign_prompt, prompts)
-    campaign_prompt, prompts = cache[key]
-    prompt = pick_email_prompt(prompts, row.get("variation"), previous_opened)
+    if sequence == 0:
+        prompt_id = row.get("initial_email_prompt_id")
+        key = ("prompt", prompt_id)
+        if key not in cache:
+            cache[key] = EmailPrompt.objects.filter(pk=prompt_id).first() if prompt_id else None
+        prompt = cache[key]
+    else:
+        key = ("follow_up", row.get("campaign_id"), sequence)
+        if key not in cache:
+            step = FollowUp.objects.select_related("email_prompt").filter(
+                campaign_id=row.get("campaign_id"), sequence=sequence).first()
+            cache[key] = step.email_prompt if step else None
+        prompt = cache[key]
     return (prompt.prompt, prompt.pk) if prompt is not None else None
 
 
 def missing_prompt_reason(row: dict, sequence: int = 0) -> str:
-    step = "the first email" if sequence == 0 else f"follow-up {sequence}"
-    if not CampaignPrompt.objects.filter(campaign__id=row.get("campaign_id")).exists():
-        return f"its campaign has no campaign prompt, so no email prompt for {step}"
-    return f"its campaign prompt has no email prompt for {step} (add one with step {sequence})"
+    if sequence == 0:
+        return "its campaign has no initial-email prompt (choose one on the campaign)"
+    if not FollowUp.objects.filter(campaign_id=row.get("campaign_id"), sequence=sequence).exists():
+        return f"its campaign has no follow-up {sequence}"
+    return f"follow-up {sequence} of its campaign has no email prompt (choose one on the campaign)"
 
 
-def assign_variation(row: dict, save: bool = True) -> str:
-    """The prospect's A/B variation: kept if it has one, else the variation with the fewest prospects in its campaign
-    among the campaign's first-email prompts (equal split). Stored on the prospect unless `save` is False."""
-    if row.get("variation"):
-        return row["variation"]
-    campaign_id = row.get("campaign_id")
-    available = sorted(set(EmailPrompt.objects.filter(campaign_prompt__campaign__id=campaign_id, sequence=0)
-                           .values_list("variation", flat=True))) if campaign_id else []
+def assign_initial_prompt(row: dict, save: bool = True) -> int | None:
+    """The prospect's initial-email prompt (its A/B group): kept if it has one, else the campaign's initial-email
+    prompt with the fewest prospects of the campaign so far (equal split). Stored on the prospect unless `save` is
+    False. None when the campaign has no initial-email prompt."""
+    if row.get("initial_email_prompt_id"):
+        return row["initial_email_prompt_id"]
+    available = sorted(DiscoveryCampaign.initial_email_prompts.through.objects
+                       .filter(discoverycampaign_id=row.get("campaign_id")).values_list("emailprompt_id", flat=True))
     if not available:
-        available = ["a"]
-    counts = dict(Prospect.objects.filter(business__discovery_campaign_id=campaign_id, variation__in=available)
-                  .values_list("variation").annotate(n=Count("id")).values_list("variation", "n"))
-    variation = min(available, key=lambda value: (counts.get(value, 0), value))
+        return None
+    counts = dict(Prospect.objects.filter(business__discovery_campaign_id=row.get("campaign_id"),
+                                          initial_email_prompt_id__in=available)
+                  .values_list("initial_email_prompt_id").annotate(n=Count("id"))
+                  .values_list("initial_email_prompt_id", "n"))
+    prompt_id = min(available, key=lambda value: (counts.get(value, 0), value))
     if save:
-        Prospect.objects.filter(pk=row["prospect_id"], variation__isnull=True).update(variation=variation)
-    row["variation"] = variation
-    return variation
+        Prospect.objects.filter(pk=row["prospect_id"], initial_email_prompt__isnull=True).update(
+            initial_email_prompt_id=prompt_id)
+    row["initial_email_prompt_id"] = prompt_id
+    return prompt_id
 
 
 def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str) -> EmailDraft:
@@ -326,7 +319,12 @@ def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str
 # ---------------------------------------------------------------- database
 
 
-PROSPECT_COLUMNS = ("business_id", "contact_id", "qualification_score", "outreach_facts", "research_summary", "variation")
+# A prospect that may get emails: verified deliverable (or approved by a person), ready, not stopped.
+READY_PROSPECT = (Q(email_status="deliverable") | Q(approved_by_person=True)) & Q(
+    outreach_status="ready", do_not_contact=False, sequence_stopped_at__isnull=True)
+
+PROSPECT_COLUMNS = ("business_id", "contact_id", "qualification_score", "outreach_facts", "research_summary",
+                    "initial_email_prompt_id")
 PROSPECT_FIELDS = {
     "campaign_id": F("business__discovery_campaign_id"),
     "prospect_id": F("id"),
@@ -350,20 +348,24 @@ PROSPECT_FIELDS = {
 }
 
 
-def load_prospects(options: dict) -> list[dict]:
-    """Ready prospects (deliverable, outreach_status ready, not do-not-contact) that need a first email, with the
-    facts the model may use. With `regenerate`, prospects whose email is in review or rejected are included too.
-
-    One person gets one email: several addresses of a contact can be deliverable (each checked guess is stored), so
-    only the contact's first ready address (candidate order: its own email, then the likeliest guesses) is used, and
-    none once any address of the contact has an email or is marked do-not-contact."""
-    ready = dict(email_status="deliverable", outreach_status="ready", do_not_contact=False)
+def ready_prospects():
+    """Prospects that may get emails, one address per person: several addresses of a contact can be deliverable
+    (each checked guess is stored), so only the contact's first ready address (candidate order: its own email, then
+    the likeliest guesses) counts, and none once another address of the contact has an email or is do-not-contact."""
     same_contact = Prospect.objects.filter(contact_id=OuterRef("contact_id")).exclude(pk=OuterRef("pk"))
-    queryset = (
-        Prospect.objects.filter(**ready)
+    return (
+        Prospect.objects.filter(READY_PROSPECT)
         .exclude(Exists(Email.objects.filter(contact_id=OuterRef("contact_id")).exclude(prospect_id=OuterRef("pk"))))
         .exclude(Exists(same_contact.filter(do_not_contact=True)))
-        .exclude(Exists(same_contact.filter(**ready, id__lt=OuterRef("pk"))))
+        .exclude(Exists(same_contact.filter(READY_PROSPECT, id__lt=OuterRef("pk"))))
+    )
+
+
+def load_prospects(options: dict) -> list[dict]:
+    """Ready prospects (see ready_prospects) that need an initial email, with the facts the model may use. With
+    `regenerate`, prospects whose email is in review or rejected are included too."""
+    queryset = (
+        ready_prospects()
         .annotate(step_email=FilteredRelation("emails", condition=Q(emails__sequence_step=SEQUENCE_STEP)))
         .order_by(F("qualification_score").desc(nulls_last=True), "id")
     )
@@ -455,7 +457,7 @@ def run(options: dict) -> int:
     client, model, provider = llm
     chosen = None
     if options.get("email_prompt_id") is not None:
-        chosen = EmailPrompt.objects.select_related("campaign_prompt").filter(pk=options["email_prompt_id"]).first()
+        chosen = EmailPrompt.objects.filter(pk=options["email_prompt_id"]).first()
         if chosen is None:
             raise CommandError(f"Email prompt {options['email_prompt_id']} does not exist.")
         print(f"Using email prompt: {chosen}")
@@ -474,11 +476,10 @@ def run(options: dict) -> int:
         prompts: dict = {}
         for row in queue:
             token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
-            if resolve_prompt(row, chosen, prompts) is None:  # checked before a variation is given to the prospect
+            if chosen is None and assign_initial_prompt(row, save=not options["dry_run"]) is None:
                 skipped += 1
                 print(f"  Prospect {row['prospect_id']} <{row['recipient']}> skipped: {missing_prompt_reason(row)}.")
                 continue
-            assign_variation(row, save=not options["dry_run"])
             system_prompt, email_prompt_id = resolve_prompt(row, chosen, prompts)
             try:
                 draft = generate_draft(client, model, prospect_context(row), system_prompt)
@@ -487,8 +488,7 @@ def run(options: dict) -> int:
                 print(f"  Prospect {row['prospect_id']} <{row['recipient']}> failed ({type(error).__name__}): {error}")
                 continue
             body_html = render_html(draft.body, footer_image_url(token))
-            print(f"  Prospect {row['prospect_id']} <{row['recipient']}> (variation {row['variation'].upper()}): "
-                  f"{draft.subject}")
+            print(f"  Prospect {row['prospect_id']} <{row['recipient']}> (prompt #{email_prompt_id}): {draft.subject}")
             if options["dry_run"]:
                 print("    " + draft.body.replace("\n", "\n    "))
             else:

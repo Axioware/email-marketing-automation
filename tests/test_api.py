@@ -182,7 +182,8 @@ class EmailApiTests(ApiCase):
         email = make_email()
         response = self.api.post(f"/api/emails/{email.pk}/approve/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["email"]["status"], "approved")
+        self.assertEqual(response.json()["email"]["status"], "scheduled")
+        self.assertIsNotNone(response.json()["email"]["scheduled_at"])
         self.assertEqual(self.api.post(f"/api/emails/{email.pk}/approve/").status_code, 409)  # not in review any more
         self.api.post(f"/api/emails/{email.pk}/reject/", {"note": "Too long"}, format="json")
         email.refresh_from_db()
@@ -236,7 +237,7 @@ class RunApiTests(ApiCase):
     def test_commands_lists_options(self):
         commands = {c["command"]: c for c in self.api.get("/api/runs/commands/").json()}
         self.assertEqual(set(commands), {"run_pipeline", "fetch_businesses", "refresh_businesses", "research_websites", "find_stakeholders",
-                                         "verify_emails", "generate_emails", "generate_followups"})
+                                         "verify_emails", "generate_emails", "generate_followups", "ghl_sync"})
         options = {o["name"]: o for o in commands["verify_emails"]["options"]}
         self.assertEqual(options["business_id"]["type"], "list")
         self.assertEqual(options["dry_run"]["type"], "flag")

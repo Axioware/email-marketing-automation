@@ -13,8 +13,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-import phonenumbers
-
 from pipeline.services import maps
 
 DEFAULT_URL = "http://127.0.0.1:8001"
@@ -80,7 +78,8 @@ def search(query: str, max_places: int, url: str | None = None, lang: str = DEFA
 def normalize_phone(value, country: str | None) -> str | None:
     """The container gives digits with the country code and no "+" (923001234567); read them as international first."""
     text = maps.normalize_text(str(value)) if value is not None else None
-    if text and text.isdecimal() and not text.startswith("0"):
+    phonenumbers = maps.phonenumbers
+    if text and text.isdecimal() and not text.startswith("0") and phonenumbers is not None:
         try:
             parsed = phonenumbers.parse(f"+{text}", None)
             if phonenumbers.is_valid_number(parsed):

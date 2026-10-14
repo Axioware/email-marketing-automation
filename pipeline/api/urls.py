@@ -1,7 +1,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from pipeline.api import views
+from pipeline.api import hooks, views
 
 router = DefaultRouter()
 router.register("campaigns", views.DiscoveryCampaignViewSet)
@@ -20,4 +20,8 @@ router.register("runs", views.PipelineRunViewSet)
 urlpatterns = [
     path("", include(router.urls)),
     path("stats/", views.StatsView.as_view(), name="api-stats"),
+    path("ghl/email-sent/", hooks.EmailSentView.as_view(), name="ghl-email-sent"),
+    path("ghl/stop-sequence/", hooks.StopSequenceView.as_view(), name="ghl-stop-sequence"),
+    path("cron/release/", hooks.ReleaseCronView.as_view(), name="cron-release"),
+    path("cron/followups/", hooks.FollowupsCronView.as_view(), name="cron-followups"),
 ]

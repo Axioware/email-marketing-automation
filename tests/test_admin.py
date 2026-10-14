@@ -275,8 +275,9 @@ class EmailReviewTests(AdminCase):
         response = self.post_action(first, "approve", follow=False)
         self.assertEqual(response["Location"], self.change_url(second))
         row = self.row(first)
-        self.assertEqual(row["status"], "approved")
+        self.assertEqual(row["status"], "scheduled")  # approving gives it its send time
         self.assertIsNotNone(row["reviewed_at"])
+        self.assertIsNotNone(row["scheduled_at"])
 
     def test_placeholder_text_blocks_approval(self):
         eid = self.email(body="Hi PLACEHOLDER NAME")
@@ -307,7 +308,7 @@ class EmailReviewTests(AdminCase):
         url = reverse("admin:pipeline_email_changelist")
         page = self.client.post(url, {"action": "approve_selected", "_selected_action": [a, b]}, follow=True)
         self.assertContains(page, "1 email(s) approved, 1 skipped")
-        self.assertEqual([self.row(i)["status"] for i in (a, b, c)], ["approved", "in_review", "in_review"])
+        self.assertEqual([self.row(i)["status"] for i in (a, b, c)], ["scheduled", "in_review", "in_review"])
         self.client.post(url, {"action": "reject_selected", "_selected_action": [b, c]})
         self.assertEqual([self.row(i)["status"] for i in (b, c)], ["rejected", "rejected"])
 
@@ -328,13 +329,14 @@ class EmailReviewTests(AdminCase):
         self.assertEqual(self.row(eid)["subject"], "Hello there")
 
     def test_approved_email_has_no_send_button(self):
-        eid = self.email("approved")
+        eid = self.email()
+        self.post_action(eid, "approve")
         page = self.client.get(self.change_url(eid)).content.decode()
-        self.assertIn("This app does not send emails", page)
+        self.assertIn("GoHighLevel sends it", page)
         self.assertNotIn("Send now", page)
         self.assertNotIn("/send/", page)
         self.client.post(self.change_url(eid).replace("change/", "send/"), {"confirm": self.row(eid)["recipient"]})
-        self.assertEqual(self.row(eid)["status"], "approved")  # no send view: the admin just redirects
+        self.assertEqual(self.row(eid)["status"], "scheduled")  # no send view: the admin just redirects
 
     @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
     def test_opens_are_shown(self):

@@ -12,15 +12,33 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit, urlunsplit
 
-import phonenumbers
-import pycountry
 from django.core.management.base import CommandError
 from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone as django_timezone
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+
+# Worker-only libraries (requirements-worker.txt): the web app on Vercel imports this module without them.
+try:
+    import phonenumbers
+    import pycountry
+except ImportError:
+    phonenumbers = pycountry = None
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    class PlaywrightError(Exception):
+        """Stands in for playwright's error where playwright is not installed."""
+
+    PlaywrightTimeoutError = PlaywrightError
+    sync_playwright = None
+
+
+def require_worker_libraries() -> None:
+    if sync_playwright is None or phonenumbers is None or pycountry is None:
+        raise CommandError("This step needs the browser libraries (pip install -r requirements-worker.txt); run it "
+                           "on the worker.")
 
 from pipeline.models import Business, BusinessSource, DiscoveryCampaign
 from pipeline.services.console import interactive, wait_for_person
@@ -666,6 +684,7 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
+    require_worker_libraries()
     if options["delay"] < 0:
         raise CommandError("--delay cannot be negative")
     if options["limit"] is not None and options["limit"] < 1:
@@ -806,6 +825,7 @@ def add_refresh_arguments(parser) -> None:
 
 
 def run_refresh(options: dict) -> int:
+    require_worker_libraries()
     if options["delay"] < 0:
         raise CommandError("--delay cannot be negative")
     if options["limit"] is not None and options["limit"] < 1:

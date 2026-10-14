@@ -1,14 +1,12 @@
-"""Follow-ups: further emails to a prospect, a campaign-defined number of days after the previous one.
+"""Follow-ups: further emails to a prospect after the previous one was sent.
 
-A campaign's `follow_ups` rows define the schedule (follow-up 1, 2, ... and the days after the previous email). A
-follow-up is due when the campaign has the next step, the prospect's latest email was sent (or opened) long enough
-ago, that follow-up does not exist yet, nobody at the business has replied and the prospect is not do-not-contact.
-
-Each due follow-up is written with the prompt for its step and the prospect's A/B variation (see
-generation.resolve_prompt: a prompt can be meant for prospects who opened, or did not open, the previous email), with
-the previous emails as context, and saved In review like every email. Nothing is sent here.
+A campaign's `follow_ups` rows define the sequence: follow-up 1, 2, ..., each with its email prompt and the days to
+wait after the previous email. A follow-up is written (In review) as soon as the previous email is sent, so a person
+has those days to review it; approving it schedules it no earlier than "previous email sent + days" (outreach.py).
+Nothing is written once the prospect replied, was stopped (sequence_stopped_at) or is do-not-contact; each prospect
+has its own sequence.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from django.core.management.base import CommandError
 from django.db import DatabaseError
@@ -23,13 +21,14 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def find_due(options: dict, at: datetime | None = None) -> list[dict]:
-    """The follow-ups due now. Each item: prospect_id, step (emails.sequence_step to write), sequence (follow-up
-    number), previous (the latest sent Email) and follow_up (the FollowUp step)."""
-    at = at or now()
+def find_due(options: dict) -> list[dict]:
+    """The follow-ups to write now: the prospect's latest email was sent, its campaign has a next follow-up step, and
+    that follow-up does not exist yet. Each item: prospect_id, step (emails.sequence_step to write), sequence
+    (follow-up number), previous (the latest sent Email) and follow_up (the FollowUp step)."""
     prospects = (
-        Prospect.objects.filter(do_not_contact=False, business__replied_at__isnull=True,
+        Prospect.objects.filter(do_not_contact=False, sequence_stopped_at__isnull=True,
                                 emails__status__in=SENT_STATUSES)
+        .exclude(emails__status="replied")
         .select_related("business")
         .order_by("id")
         .distinct()
@@ -48,13 +47,13 @@ def find_due(options: dict, at: datetime | None = None) -> list[dict]:
             schedules[campaign_id] = {f.sequence: f for f in FollowUp.objects.filter(campaign_id=campaign_id)}
         latest = prospect.emails.order_by("-sequence_step").first()
         if latest is None or latest.status not in SENT_STATUSES or latest.sent_at is None:
-            continue  # the latest email is still in review/approved/failed/replied, or the next one exists already
+            continue  # the latest email is not sent yet, failed or replied, or the next one exists already
         sequence = latest.sequence_step  # step s is follow-up s - 1, so the next follow-up is number s
         follow_up = schedules[campaign_id].get(sequence)
         if follow_up is None:
             continue  # the campaign's sequence is finished for this prospect
-        if latest.sent_at + timedelta(days=follow_up.days_after_previous) > at:
-            continue
+        if follow_up.email_prompt_id is None and not options.get("any_prompt"):
+            continue  # nothing can write it (the sequence ends there; see outreach.sequence_state)
         due.append({"prospect_id": prospect.pk, "step": latest.sequence_step + 1, "sequence": sequence,
                     "previous": latest, "follow_up": follow_up})
     if options.get("limit") is not None:
@@ -67,8 +66,7 @@ def thread_context(prospect_id: int, before_step: int) -> list[dict]:
     emails = Email.objects.filter(prospect_id=prospect_id, sequence_step__lt=before_step, sent_at__isnull=False)
     return [
         {"step": email.sequence_step, "subject": email.subject, "body": generation.editable_body(email.body_text),
-         "sent_on": email.sent_at.date().isoformat(),
-         **({"opened": email.open_count > 0} if generation.OPEN_TRACKING else {})}  # unknown while tracking is off
+         "sent_on": email.sent_at.date().isoformat()}
         for email in emails.order_by("sequence_step")
     ]
 
@@ -81,16 +79,13 @@ def write_followup(item: dict, llm: tuple, chosen: EmailPrompt | None = None, dr
     if not rows:
         return "skipped", "the prospect no longer exists"
     row = rows[0]
-    generation.assign_variation(row, save=not dry_run)
-    # Without open tracking nobody's opens are known, so "opened"/"not opened" prompts are not chosen.
-    previous_opened = item["previous"].open_count > 0 if generation.OPEN_TRACKING else None
-    resolved = generation.resolve_prompt(row, chosen, cache, sequence=item["sequence"], previous_opened=previous_opened)
+    resolved = generation.resolve_prompt(row, chosen, cache, sequence=item["sequence"])
     if resolved is None:
         return "skipped", generation.missing_prompt_reason(row, item["sequence"])
     system_prompt, email_prompt_id = resolved
     context = {
         **generation.prospect_context(row),
-        "follow_up": {"number": item["sequence"], "previous_email_opened": previous_opened},
+        "follow_up": {"number": item["sequence"]},
         "previous_emails": thread_context(item["prospect_id"], item["step"]),
     }
     draft = generation.generate_draft(client, model, context, system_prompt)
@@ -111,7 +106,7 @@ def add_arguments(parser) -> None:
     parser.add_argument("--prospect-id", type=int, action="append", help="Only this prospect (repeatable).")
     parser.add_argument("--limit", type=int, help="Write at most this many follow-ups.")
     parser.add_argument("--email-prompt-id", type=int,
-                        help="Write every follow-up with this email prompt (default: chosen per step and variation).")
+                        help="Write every follow-up with this email prompt (default: the prompt of each step).")
     parser.add_argument("--dry-run", action="store_true", help="Show the follow-ups without saving them.")
 
 
@@ -120,11 +115,11 @@ def run(options: dict) -> int:
         raise CommandError("--limit must be a positive integer")
     chosen = None
     if options.get("email_prompt_id") is not None:
-        chosen = EmailPrompt.objects.select_related("campaign_prompt").filter(pk=options["email_prompt_id"]).first()
+        chosen = EmailPrompt.objects.filter(pk=options["email_prompt_id"]).first()
         if chosen is None:
             raise CommandError(f"Email prompt {options['email_prompt_id']} does not exist.")
     try:
-        due = find_due(options)
+        due = find_due({**options, "any_prompt": chosen is not None})
         if not due:
             print("No follow-ups are due.")
             return 0

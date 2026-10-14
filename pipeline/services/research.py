@@ -18,12 +18,17 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-import trafilatura
-from bs4 import BeautifulSoup
 from django.core.management.base import CommandError
 from django.db.models import F, Q
 from openai import OpenAI
-from playwright.sync_api import sync_playwright
+
+# Worker-only libraries (requirements-worker.txt): the web app on Vercel imports this module without them.
+try:
+    import trafilatura
+    from bs4 import BeautifulSoup
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    trafilatura = BeautifulSoup = sync_playwright = None
 
 from pipeline.models import Business, BusinessWebsiteProfile
 from pipeline.services.llm import make_llm_client, rejected_output
@@ -643,6 +648,9 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
+    if sync_playwright is None or trafilatura is None:
+        raise CommandError("Website research needs the browser libraries (pip install -r requirements-worker.txt); "
+                           "run it on the worker.")
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
     llm = make_llm_client()

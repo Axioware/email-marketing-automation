@@ -17,15 +17,25 @@ from django.conf import settings
 from django.core.management.base import CommandError
 from django.db import DatabaseError, transaction
 from django.db.models import F, Q
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.firefox.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
+
+# Worker-only libraries (requirements-worker.txt): the web app on Vercel imports this module without them.
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.firefox.service import Service
+    from selenium.webdriver.support.ui import WebDriverWait
+except ImportError:
+    class WebDriverException(Exception):
+        """Stands in for selenium's error where selenium is not installed."""
+
+    TimeoutException = WebDriverException
+    webdriver = By = FirefoxProfile = Options = Service = WebDriverWait = None
 
 from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile
+from pipeline.services import qualify
 from pipeline.services.console import wait_for_person
 from pipeline.services.research import is_public_http_url
 
@@ -968,17 +978,13 @@ def run_search(driver, query: str, headed: bool, blocked: dict, evidence: Eviden
 # ---------------------------------------------------------------- database
 
 
-def load_businesses(min_score: int, limit: int | None, business_ids: list[int] | None, redo: bool) -> list[dict]:
+def load_businesses(min_score: int | None, limit: int | None, business_ids: list[int] | None, redo: bool) -> list[dict]:
     queryset = (
-        Business.objects.filter(
-            website_profile__status="completed",
-            website_profile__qualification_score__gte=min_score,
-            name__isnull=False,
-        )
-        .order_by("-website_profile__qualification_score", "id")
+        Business.objects.filter(qualify.qualified(min_score), name__isnull=False)
+        .order_by(F("website_profile__qualification_score").desc(nulls_last=True), "id")
     )
     if not redo:
-        queryset = queryset.filter(website_profile__contact_discovery_status__isnull=True)
+        queryset = queryset.filter(Q(website_profile__isnull=True) | Q(website_profile__contact_discovery_status__isnull=True))
     if business_ids:
         queryset = queryset.filter(id__in=business_ids)
     if limit is not None:
@@ -1003,8 +1009,9 @@ def save_contacts(business_id: int, rows: list[dict]) -> None:
             Q(email_source__in=OWN_EMAIL_SOURCES) | Q(email_source__isnull=True)
         ).delete()
         BusinessContact.objects.bulk_create([BusinessContact(**row) for row in rows])
-        BusinessWebsiteProfile.objects.filter(business_id=business_id).update(
-            contact_discovery_status=status, contact_discovery_at=datetime.now(timezone.utc)
+        BusinessWebsiteProfile.objects.update_or_create(  # an approved business without a website has no profile yet
+            business_id=business_id,
+            defaults={"contact_discovery_status": status, "contact_discovery_at": datetime.now(timezone.utc)},
         )
 
 
@@ -1022,7 +1029,9 @@ def collect_site_evidence(business: dict, evidence: Evidence, roles: RoleConfig)
 
 
 def add_arguments(parser) -> None:
-    parser.add_argument("--min-score", type=int, default=50, help="Minimum qualification score (default: 50).")
+    parser.add_argument("--min-score", type=int,
+                        help="Minimum qualification score (default: each campaign's minimum score). Businesses a "
+                             "person approved are always included, rejected ones never.")
     parser.add_argument("--limit", type=int, help="Maximum number of businesses in this run.")
     parser.add_argument("--business-id", type=int, action="append", help="Process this business only (repeatable).")
     parser.add_argument("--redo", action="store_true", help="Reprocess businesses that were already processed.")
@@ -1038,9 +1047,12 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
+    if webdriver is None:
+        raise CommandError("Finding decision makers needs selenium (pip install -r requirements-worker.txt); run it on "
+                           "the worker.")
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
-    if not 0 <= options["min_score"] <= 100:
+    if options["min_score"] is not None and not 0 <= options["min_score"] <= 100:
         raise CommandError("--min-score must be between 0 and 100")
     if options["max_searches"] < 0 or options["delay"] < 0 or options["max_pages"] < 0:
         raise CommandError("--max-searches, --max-pages and --delay cannot be negative")
@@ -1056,7 +1068,8 @@ def run(options: dict) -> int:
             print("No qualified businesses need contact discovery (use --redo to reprocess finished ones).")
             return 0
 
-        print(f"Discovering contacts for {len(queue)} businesses (score >= {options['min_score']}).")
+        threshold = options["min_score"] if options["min_score"] is not None else "the campaign's minimum"
+        print(f"Discovering contacts for {len(queue)} businesses (score >= {threshold}, or approved by a person).")
         blocked = {"google": False, "duckduckgo": False}
         stored = empty = deferred = searches_used = 0
         for business in queue:

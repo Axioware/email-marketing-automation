@@ -66,9 +66,9 @@ class DiscoveryCampaignViewSet(viewsets.ModelViewSet):
 
 
 class CampaignPromptViewSet(viewsets.ModelViewSet):
-    """Campaign prompts (qualification criteria for website research), each with the email prompts that write emails."""
+    """Campaign prompts: the research agent's instructions (qualification), shared by the campaigns that choose them."""
 
-    queryset = CampaignPrompt.objects.prefetch_related("email_prompts").select_related("campaign")
+    queryset = CampaignPrompt.objects.prefetch_related("campaigns")
     serializer_class = s.CampaignPromptSerializer
     search_fields = ["name", "prompt"]
 
@@ -81,14 +81,17 @@ class FollowUpViewSet(viewsets.ModelViewSet):
     filterset_fields = ["campaign"]
 
 
-def replied_response(message: str):
-    return Response({"detail": message})
+def replied_response(mark, *args, **kwargs):
+    try:
+        return Response({"detail": mark(*args, **kwargs)})
+    except review.ReviewError as error:
+        return Response({"detail": str(error)}, status=status.HTTP_409_CONFLICT)
 
 
 class EmailPromptViewSet(viewsets.ModelViewSet):
-    queryset = EmailPrompt.objects.select_related("campaign_prompt")
+    queryset = EmailPrompt.objects.all()
     serializer_class = s.EmailPromptSerializer
-    filterset_fields = ["campaign_prompt", "is_default"]
+    filterset_fields = ["kind"]
     search_fields = ["name", "prompt"]
 
 
@@ -106,8 +109,8 @@ class BusinessViewSet(viewsets.ModelViewSet):
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     @action(detail=True, methods=["post"], url_path="mark-replied")
     def mark_replied(self, request, pk=None):
-        """Someone at the business replied: no more follow-ups go to it."""
-        return replied_response(review.mark_business_replied(self.get_object()))
+        """Someone at the business replied: its latest sent email becomes Replied; that prospect gets no more emails."""
+        return replied_response(review.mark_business_replied, self.get_object())
 
 
 class BusinessSourceViewSet(viewsets.ReadOnlyModelViewSet):
@@ -136,14 +139,15 @@ class BusinessContactViewSet(viewsets.ModelViewSet):
 class ProspectViewSet(viewsets.ModelViewSet):
     queryset = Prospect.objects.all()
     serializer_class = s.ProspectSerializer
-    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "variation", "do_not_contact"]
+    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "initial_email_prompt",
+                        "approved_by_person", "do_not_contact"]
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     @action(detail=True, methods=["post"], url_path="mark-replied")
     def mark_replied(self, request, pk=None):
-        """The prospect replied: its latest sent email becomes Replied and its business gets no more follow-ups."""
+        """The prospect replied: its latest sent email becomes Replied and it gets no more emails."""
         prospect = self.get_object()
-        return replied_response(review.mark_business_replied(prospect.business, prospect_id=prospect.pk))
+        return replied_response(review.mark_business_replied, prospect.business, prospect_id=prospect.pk)
     search_fields = ["email", "business__name", "contact__name"]
     ordering_fields = ["id", "qualification_score", "email_verified_at", "last_contacted_at"]
 
@@ -154,8 +158,8 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
 
     queryset = Email.objects.select_related("prospect").all()
     serializer_class = s.EmailSerializer
-    filterset_fields = ["status", "business", "prospect", "contact", "sequence_step", "prospect__variation",
-                        "generation_provider", "email_prompt"]
+    filterset_fields = ["status", "business", "prospect", "contact", "sequence_step", "email_prompt",
+                        "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
     ordering_fields = ["id", "generated_at", "sent_at", "open_count"]
 

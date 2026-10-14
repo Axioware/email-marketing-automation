@@ -1,5 +1,5 @@
 """The complete pipeline for one campaign: fetch -> research -> decision makers -> verify -> write emails ->
-write due follow-ups.
+write due follow-ups -> create GoHighLevel contacts.
 
 Each step runs exactly as its own command would, on the campaign's businesses, and only processes what still needs
 it, so rerunning the pipeline continues where it stopped. It never sends: emails end up In review for a person to
@@ -18,6 +18,7 @@ STEPS = {
     "verify": "Verify emails",
     "generate": "Write emails for review",
     "followups": "Write due follow-ups for review",
+    "ghl": "Create GoHighLevel contacts",
 }
 PARTIAL_FAILURE = "Finished with errors"  # how a step reports that only some items failed
 
@@ -31,10 +32,11 @@ def add_arguments(parser) -> None:
     parser.add_argument("--source", choices=["browser", "scraper_api"],
                         help="Lead source for fetching: browser or scraper_api (default: the campaign's lead source).")
     parser.add_argument("--skip", action="append", choices=list(STEPS), help="Skip this step (repeatable).")
-    parser.add_argument("--min-score", type=int, default=50,
-                        help="Qualification score needed to look for decision makers (default: 50).")
+    parser.add_argument("--min-score", type=int,
+                        help="Qualification score needed to look for decision makers (default: each campaign's "
+                             "minimum score).")
     parser.add_argument("--email-prompt-id", type=int,
-                        help="Write emails with this email prompt (default: the campaign's default).")
+                        help="Write emails with this email prompt (default: the campaign's initial-email prompts).")
     parser.add_argument("--headed", action="store_true", help="Show the browsers (useful for Google consent pages).")
 
 
@@ -50,7 +52,7 @@ def run(options: dict) -> int:
     skip = set(options["skip"] or [])
     if options["fetch_limit"] < 0:
         raise CommandError("--fetch-limit cannot be negative")
-    if not 0 <= options["min_score"] <= 100:
+    if options["min_score"] is not None and not 0 <= options["min_score"] <= 100:
         raise CommandError("--min-score must be between 0 and 100")
     if campaign_id is not None and not DiscoveryCampaign.objects.filter(pk=campaign_id).exists():
         raise CommandError(f"Campaign {campaign_id} does not exist.")
@@ -68,23 +70,27 @@ def run(options: dict) -> int:
         if step == "research":
             return [*businesses, *headed]
         if step == "stakeholders":
-            return ["--min-score", str(options["min_score"]), *businesses, *headed]
+            minimum = ["--min-score", str(options["min_score"])] if options["min_score"] is not None else []
+            return [*minimum, *businesses, *headed]
         if step == "verify":
             return businesses
-        if step == "followups":  # follow-ups use their own prompts per step and variation
+        if step == "followups":  # follow-ups use the prompt of each step
             return ["--campaign-id", str(campaign_id)] if campaign_id is not None else []
+        if step == "ghl":  # every ready prospect without a GHL contact, whichever campaign
+            return []
         prompt = ["--email-prompt-id", str(options["email_prompt_id"])] if options["email_prompt_id"] else []
         return [*businesses, *prompt]
 
     commands = {"fetch": "fetch_businesses", "research": "research_websites", "stakeholders": "find_stakeholders",
-                "verify": "verify_emails", "generate": "generate_emails", "followups": "generate_followups"}
+                "verify": "verify_emails", "generate": "generate_emails", "followups": "generate_followups",
+                "ghl": "ghl_sync"}
     planned = [step for step in STEPS if step not in skip]
     scope = f"campaign {campaign_id}" if campaign_id is not None else "all businesses"
     print(f"Full pipeline for {scope}: " + " -> ".join(STEPS[step] for step in planned) + ". Nothing is sent.")
     partial = []
     for number, step in enumerate(planned, start=1):
         args = arguments(step)
-        if step not in ("fetch", "followups") and campaign_id is not None and "--business-id" not in args:
+        if step not in ("fetch", "followups", "ghl") and campaign_id is not None and "--business-id" not in args:
             # Without business ids a step would process every business, not just this campaign's.
             print("\nThe campaign has no businesses yet; nothing more to do.")
             return 1 if partial else 0

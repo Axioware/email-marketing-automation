@@ -1,0 +1,9 @@
+# Everything, for the machine that runs the pipeline steps (and for local development and tests).
+-r requirements.txt
+playwright>=1.40
+phonenumbers>=8.13
+pycountry>=24.6
+beautifulsoup4>=4.12
+trafilatura>=1.12
+lxml_html_clean>=0.4
+selenium>=4.20

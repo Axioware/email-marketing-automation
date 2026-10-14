@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 
 import markdown
+from datetime import timedelta
+
 from django.conf import settings
 from django.contrib import admin
 from django.db.models import Count, Q
@@ -11,7 +13,7 @@ from django.urls import path, reverse
 from django.utils.safestring import mark_safe
 
 GUIDE_PATH = Path(settings.BASE_DIR) / "docs" / "USER_GUIDE.md"
-QUALIFIED_SCORE = 50  # find_stakeholders' default --min-score
+WORKER_STALE_AFTER = timedelta(minutes=2)  # no heartbeat for this long: the worker is shown as not running
 
 # Sidebar order: the pipeline's own order, then the supporting tables.
 MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
@@ -41,7 +43,14 @@ def lead_sources() -> dict:
         return run_url("fetch_businesses", f"--campaign-id {pk} --limit 20 --source {source}")
 
     campaigns = DiscoveryCampaign.objects.annotate(business_total=Count("businesses")).order_by("-created_at")[:8]
-    problem = scraper_api.status(timeout=1.5)
+    from pipeline import jobs
+
+    if jobs.queue_mode():  # fetching runs on the worker, so the worker's view of the container counts
+        worker = worker_status()
+        problem = (worker["info"].get("scraper") if worker["alive"] else "not known (no worker running)")
+        problem = None if problem == "running" else problem
+    else:
+        problem = scraper_api.status(timeout=1.5)
     return {
         "campaigns": [{"campaign": campaign, "browser_url": fetch(campaign.pk, "browser"),
                        "scraper_url": fetch(campaign.pk, "scraper_api"),
@@ -53,19 +62,32 @@ def lead_sources() -> dict:
     }
 
 
+def worker_status() -> dict:
+    """The most recent worker heartbeat (queue mode: runs execute on a worker machine)."""
+    from django.utils import timezone
+
+    from pipeline.models import WorkerHeartbeat
+
+    beat = WorkerHeartbeat.objects.order_by("-last_seen").first()
+    if beat is None:
+        return {"alive": False, "name": None, "last_seen": None, "info": {}}
+    return {"alive": timezone.now() - beat.last_seen < WORKER_STALE_AFTER, "name": beat.name,
+            "last_seen": beat.last_seen, "info": beat.info or {}}
+
+
 def sequence_results() -> list[dict]:
-    """Sent emails per step and A/B variation, with open and reply rates."""
+    """Sent emails per step and initial-email prompt (the A/B group), with reply rates."""
     from pipeline.models import Email
     from pipeline.services.generation import OPEN_TRACKING as tracking
 
     rows = (Email.objects.filter(sent_at__isnull=False)
-            .values("sequence_step", "prospect__variation")
+            .values("sequence_step", "prospect__initial_email_prompt__name")
             .annotate(sent=Count("id"), opened=Count("id", filter=Q(open_count__gt=0) | Q(status="opened")),
                       replied=Count("id", filter=Q(status="replied")))
-            .order_by("sequence_step", "prospect__variation"))
+            .order_by("sequence_step", "prospect__initial_email_prompt__name"))
     return [{
         "step": "First email" if row["sequence_step"] == 1 else f"Follow-up {row['sequence_step'] - 1}",
-        "variation": (row["prospect__variation"] or "-").upper(),
+        "variation": row["prospect__initial_email_prompt__name"] or "-",
         "sent": row["sent"],
         "open_rate": f"{round(100 * row['opened'] / row['sent'])}%" if tracking else "off",
         "replied": row["replied"],
@@ -114,10 +136,11 @@ class PipelineAdminSite(admin.AdminSite):
             BusinessContact,
             BusinessWebsiteProfile,
             DiscoveryCampaign,
+            Email,
             PipelineRun,
             Prospect,
         )
-        from pipeline.services import generation
+        from pipeline.services import generation, ghl, outreach, qualify
         from pipeline.services.llm import make_llm_client
 
         jobs.refresh_stale_runs()
@@ -130,29 +153,32 @@ class PipelineAdminSite(admin.AdminSite):
         profiles = BusinessWebsiteProfile.objects.aggregate(
             researched=Count("id", filter=Q(status="completed")),
             failed=Count("id", filter=Q(status="failed")),
-            qualified=Count("id", filter=Q(status="completed", qualification_score__gte=QUALIFIED_SCORE)),
             discovered=Count("id", filter=Q(contact_discovery_status="completed")),
-            to_discover=Count("id", filter=Q(status="completed", qualification_score__gte=QUALIFIED_SCORE,
-                                             contact_discovery_status__isnull=True)),
         )
+        qualified = Business.objects.filter(qualify.QUALIFIED)
+        profiles["qualified"] = qualified.count()
+        profiles["to_discover"] = qualified.filter(Q(website_profile__isnull=True)
+                                                   | Q(website_profile__contact_discovery_status__isnull=True)).count()
+        business_reviews = Business.objects.filter(qualify.NEEDS_REVIEW).count()
         to_research = Business.objects.filter(website_url__isnull=False).exclude(website_url="").filter(
             Q(website_profile__isnull=True) | Q(website_profile__status="pending")).count()
         unchecked_contacts = BusinessContact.objects.filter(
             Q(email_status__isnull=True) | Q(email_status__in=["unverified", "unknown"])).count()
-        ready = Prospect.objects.filter(email_status="deliverable", outreach_status="ready", do_not_contact=False)
+        ready = generation.ready_prospects()
         ready_without_email = ready.filter(emails__isnull=True).count()
+        prospect_reviews = Prospect.objects.filter(outreach_status="needs_review", do_not_contact=False).count()
+        scheduled = emails["scheduled"] + emails["sending"]
 
         funnel = [
             ("Businesses found", businesses["total"], changelist("business"), "Module 1"),
             ("Websites researched", profiles["researched"], changelist("businesswebsiteprofile", status__exact="completed"), "Module 2"),
-            (f"Qualified (score {QUALIFIED_SCORE}+)", profiles["qualified"], changelist("business"), "Module 2"),
+            ("Qualified", profiles["qualified"], changelist("business", qualification="qualified"), "Module 2"),
             ("Contacts found", BusinessContact.objects.count(), changelist("businesscontact"), "Module 3"),
             ("Ready to email", ready.count(), changelist("prospect", outreach_status__exact="ready"), "Module 4"),
             ("Emails in review", emails["in_review"], changelist("email", status__exact="in_review"), "Module 5"),
-            ("Sent", sent, changelist("email", status__exact="sent"), "Delivery"),
-            ("Opened", emails["opened"], changelist("email", status__exact="opened"),
-             "Open tracking off" if not generation.OPEN_TRACKING
-             else (f"{review.open_rate(emails)}% open rate" if sent else "Open rate -")),
+            ("Scheduled", scheduled, changelist("email", status__exact="scheduled"), "GoHighLevel sends them"),
+            ("Sent", sent, changelist("email", status__exact="sent"),
+             f"{emails['replied']} replied" if emails["replied"] else "Delivery"),
         ]
 
         steps = []
@@ -169,7 +195,15 @@ class PipelineAdminSite(admin.AdminSite):
 
         due_followups = len(followups.find_due({}))
         if due_followups:
-            steps.append((f"{due_followups} follow-up(s) are due.", "Write follow-ups", run_url("generate_followups")))
+            steps.append((f"{due_followups} follow-up(s) can be written for review.", "Write follow-ups",
+                          run_url("generate_followups")))
+        if business_reviews:
+            steps.append((f"{business_reviews} business(es) scored below their campaign's minimum or could not be "
+                          "researched: approve or reject them.", "Review businesses",
+                          changelist("business", qualification="review")))
+        if prospect_reviews:
+            steps.append((f"{prospect_reviews} prospect address(es) could not be verified: approve or reject them.",
+                          "Review prospects", changelist("prospect", outreach_status__exact="needs_review")))
         if ready_without_email:
             steps.append((f"{ready_without_email} verified prospect(s) have no email yet.", "Generate emails",
                           reverse("admin:pipeline_prospect_generate")))
@@ -195,8 +229,25 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("The API is disabled: set AUTH_TOKEN in .env.")
         if make_llm_client() is None:
             warnings.append("No LLM key: set GROQ_API_KEY or OPENAI_API_KEY in .env (needed to research and write emails).")
-        if not os.environ.get("VERIFY_HELO"):
+        if not os.environ.get("VERIFY_HELO") and not jobs.queue_mode():
             warnings.append("VERIFY_HELO is not set in .env, so email verification cannot run.")
+        if not ghl.configured():
+            warnings.append("GoHighLevel is not set up: add GHL_API_KEY and GHL_LOCATION_ID to .env, or approved emails "
+                            "are never sent.")
+        if not os.environ.get("GHL_WEBHOOK_SECRET"):
+            warnings.append("GHL_WEBHOOK_SECRET is not set: GoHighLevel cannot report sent emails or replies.")
+        stuck = outreach.stuck_emails().count()
+        if stuck:
+            warnings.append(f"{stuck} email(s) were handed to GoHighLevel over 30 minutes ago and never reported sent: "
+                            "check the sending workflow and its email-sent webhook.")
+        ghl_errors = Email.objects.filter(status="scheduled", ghl_error__isnull=False).count()
+        if ghl_errors:
+            warnings.append(f"{ghl_errors} scheduled email(s) could not be updated in GoHighLevel; see the error on "
+                            "each email (retried every minute).")
+        worker = worker_status()
+        if jobs.queue_mode() and not worker["alive"]:
+            warnings.append("No worker is running: queued runs wait until `python manage.py run_worker` is started on "
+                            "the machine with the browsers and Docker.")
         if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
             warnings.append("The open-tracking URL is unknown: set EMAIL_TRACKING_BASE_URL in .env.")
         leads = lead_sources()
@@ -205,6 +256,7 @@ class PipelineAdminSite(admin.AdminSite):
                             f"at {leads['scraper_url']}: start it, or set MAPS_SCRAPER_URL in .env.")
 
         return {
+            "worker": worker if jobs.queue_mode() else None,
             "leads": leads,
             "results": sequence_results(),
             "funnel": funnel,

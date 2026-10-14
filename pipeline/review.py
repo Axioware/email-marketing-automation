@@ -1,18 +1,19 @@
 """Reviewing generated emails: edit, approve, reject, reopen, regenerate. Used by the admin and the API.
 
 Every change is a conditional update on the email's current status, so two reviewers can never move an email through
-an invalid transition. Editing always sends an email back to review. This app does not send emails: approved ones
-wait for whichever sending method is chosen.
+an invalid transition. Editing always sends an email back to review. Approving schedules the email; GoHighLevel sends
+it when its time comes (pipeline/services/outreach.py).
 """
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from django.db.models import Count, Q
 
 from pipeline.models import Business, Email, EmailPrompt
-from pipeline.services import generation
+from pipeline.services import generation, ghl, outreach
 
-EDITABLE = ("in_review", "approved", "rejected")
-STATUS_ORDER = ("in_review", "approved", "rejected", "sent", "opened", "replied", "failed", "sending")
+EDITABLE = ("in_review", "approved", "scheduled", "rejected")
+STATUS_ORDER = ("in_review", "approved", "scheduled", "sending", "rejected", "sent", "opened", "replied", "failed")
 MAX_SUBJECT = generation.MAX_SUBJECT_CHARS
 MAX_BODY = generation.MAX_BODY_CHARS
 
@@ -30,34 +31,34 @@ def _transition(email_id: int, allowed_from: tuple[str, ...], **values) -> bool:
 
 
 def prospect_ready(email: Email) -> bool:
-    """Whether this email may still be sent to its prospect (a follow-up also goes to an already contacted one)."""
+    """Whether this email may still go to its prospect (a follow-up also goes to an already contacted one)."""
     prospect = email.prospect
     statuses = ("ready",) if email.sequence_step == generation.SEQUENCE_STEP else ("ready", "contacted")
-    return (prospect.email_status == "deliverable" and prospect.outreach_status in statuses
-            and not prospect.do_not_contact and email.business.replied_at is None)
+    return ((prospect.email_status == "deliverable" or prospect.approved_by_person)
+            and prospect.outreach_status in statuses and not prospect.do_not_contact
+            and prospect.sequence_stopped_at is None)
 
 
 def mark_replied(email: Email) -> str:
-    """Record a reply to a sent email: the email becomes Replied and its business gets no more follow-ups."""
+    """Record a reply to a sent email: the email becomes Replied and its prospect gets no more emails (each prospect
+    has its own sequence; others at the same business are not affected)."""
     if email.status == "replied":
         return "Already marked as replied."
     if not _transition(email.pk, ("sent", "opened"), status="replied"):
         raise ReviewError("Only sent or opened emails can be marked replied.")
-    Business.objects.filter(pk=email.business_id, replied_at__isnull=True).update(replied_at=_now())
-    return "Marked replied. No more follow-ups go to this business."
+    outreach.stop_prospect(email.prospect, "replied")
+    return "Marked replied. No more emails go to this prospect."
 
 
 def mark_business_replied(business: Business, prospect_id: int | None = None) -> str:
-    """Mark the latest sent email of a business (or of one of its prospects) as replied; with no sent email, just
-    stop follow-ups for the business."""
+    """Mark the latest sent email of a business (or of one of its prospects) as replied."""
     emails = Email.objects.filter(business=business, status__in=("sent", "opened"))
     if prospect_id is not None:
         emails = emails.filter(prospect_id=prospect_id)
     latest = emails.order_by("-sent_at", "-id").first()
-    if latest is not None:
-        return mark_replied(latest)
-    Business.objects.filter(pk=business.pk, replied_at__isnull=True).update(replied_at=_now())
-    return "Marked replied. No more follow-ups go to this business."
+    if latest is None:
+        raise ReviewError("No sent email to mark as replied.")
+    return mark_replied(latest)
 
 
 PLACEHOLDER_MARKER = "PLACEHOLDER"
@@ -112,31 +113,52 @@ def save_edit(email: Email, subject: str, body: str) -> str:
         body_text=generation.render_text(body),
         body_html=generation.render_html(body, generation.footer_image_url(email.tracking_token)),
         edited_at=_now(),
-        status="in_review", reviewed_at=None,  # an edited email always needs a fresh approval
+        status="in_review", reviewed_at=None, scheduled_at=None,  # an edited email always needs a fresh approval
     )
     if not changed:
         raise ReviewError("This email can no longer be edited.")
+    if email.status == "scheduled":
+        outreach.withdraw_schedule(email)
     return "Saved." + (" It went back to review." if email.status != "in_review" else "")
 
 
 def approve(email: Email) -> str:
+    """Approve and schedule: the email gets its send time, and GoHighLevel is told the date (and, for an initial
+    email, its type) so the lead can move to Ready to Send."""
     if has_placeholder(email):
         raise ReviewError("This email still contains placeholder text; edit it first.")
+    if not prospect_ready(email):
+        raise ReviewError("The prospect can no longer be emailed (do-not-contact, stopped or not verified).")
     if not _transition(email.pk, ("in_review",), status="approved", reviewed_at=_now(), review_note=None):
         raise ReviewError("Only emails in review can be approved.")
-    return "Approved."
+    try:
+        slot = outreach.schedule(email)
+    except outreach.OutreachError as error:
+        _transition(email.pk, ("approved",), status="in_review", reviewed_at=None)
+        raise ReviewError(f"Not approved: {error}") from error
+    if ghl.configured():
+        outreach.announce_schedule(Email.objects.select_related(
+            "prospect__contact", "prospect__business__discovery_campaign", "business__discovery_campaign",
+            "email_prompt").get(pk=email.pk))
+    local = slot.astimezone(ZoneInfo(email.business.discovery_campaign.send_timezone))
+    return f"Approved; scheduled for {local.strftime('%Y-%m-%d %H:%M')} ({email.business.discovery_campaign.send_timezone})."
 
 
 def reject(email: Email, note: str = "") -> str:
-    if not _transition(email.pk, ("in_review", "approved"), status="rejected", reviewed_at=_now(),
-                       review_note=(note or "").strip()[:2000] or None):
-        raise ReviewError("Only emails in review or approved can be rejected.")
+    if not _transition(email.pk, ("in_review", "approved", "scheduled"), status="rejected", reviewed_at=_now(),
+                       review_note=(note or "").strip()[:2000] or None, scheduled_at=None):
+        raise ReviewError("Only emails in review, approved or scheduled can be rejected.")
+    if email.status == "scheduled":
+        outreach.withdraw_schedule(email)
     return "Rejected."
 
 
 def reopen(email: Email) -> str:
-    if not _transition(email.pk, ("rejected", "approved"), status="in_review", reviewed_at=None):
-        raise ReviewError("Only rejected or approved emails can go back to review.")
+    if not _transition(email.pk, ("rejected", "approved", "scheduled"), status="in_review", reviewed_at=None,
+                       scheduled_at=None):
+        raise ReviewError("Only rejected, approved or scheduled emails can go back to review.")
+    if email.status == "scheduled":
+        outreach.withdraw_schedule(email)
     return "Back in review."
 
 
@@ -163,7 +185,8 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
     if not rows:
         raise ReviewError("The prospect is no longer ready for outreach (check its status).")
     row = rows[0]
-    generation.assign_variation(row)
+    if email_prompt is None and email.email_prompt is None and generation.assign_initial_prompt(row) is None:
+        raise ReviewError(f"Cannot regenerate: {generation.missing_prompt_reason(row)}.")
     resolved = generation.resolve_prompt(row, email_prompt or email.email_prompt)
     if resolved is None:
         raise ReviewError(f"Cannot regenerate: {generation.missing_prompt_reason(row)}.")
