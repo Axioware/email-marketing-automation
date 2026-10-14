@@ -120,3 +120,10 @@ body.dashboard #content-main { width: 100%; float: none; }
 @media (max-width: 900px) { .pipeline-funnel { grid-template-columns: repeat(2, 1fr); } }
 .pipeline-dash table.pipeline-runs th:first-child, .pipeline-dash table.pipeline-runs td:first-child { width: 60px; }
 .pipeline-dash table.pipeline-runs th:nth-child(2), .pipeline-dash table.pipeline-runs td:nth-child(2) { width: 55%; }
+
+/* Get leads */
+.pipeline-source-status { padding: 10px 12px; margin: 0; color: var(--body-fg); }
+.pipeline-leads-actions { white-space: nowrap; }
+.pipeline-leads-actions a.button { padding: 5px 10px; margin-right: 6px; }
+.pipeline-leads-actions a.pipeline-disabled { opacity: 0.55; }
+@media (max-width: 700px) { .pipeline-leads-actions a.button { display: inline-block; margin: 2px 0; } }

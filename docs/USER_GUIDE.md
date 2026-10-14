@@ -22,6 +22,7 @@ Then open **http://127.0.0.1:8000/admin/** and log in. Keep the terminal open wh
 The home page shows the whole pipeline at a glance:
 
 - **The counters** follow a business from left to right: found on Google Maps, website researched, qualified, contact found, verified prospect, email in review, sent, opened. Click any counter to see those records.
+- **Get leads** lists your campaigns with two buttons each, one per way of finding businesses on Google Maps: **Built-in browser** and **Scraper container**. It also shows whether the scraper container is running. See [Step 2](#step-2-fetch-businesses).
 - **What to do next** lists the jobs that are waiting, with a button for each, e.g. "3 emails are waiting for your review: Start reviewing".
 - **Recent pipeline runs** shows the jobs you started and whether they finished.
 - **Yellow warnings** at the top mean something in the settings is missing (for example the email account for sending). See [Settings](#9-settings).
@@ -52,7 +53,7 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
 - Each step only does what is still needed, so running the pipeline again continues where it left off.
 - If a few items fail (one website is down, for example), the pipeline carries on with the next step.
 - If a step cannot run at all (no LLM key, Docker/Reacher not running, Google CAPTCHA), the pipeline stops and tells you why. Everything done so far is kept; fix the problem and run it again.
-- Options: `--fetch-limit 0` skips fetching new businesses, `--skip verify` skips a step (fetch, research, stakeholders, verify, generate), `--min-score 60`, `--email-prompt-id N`, `--headed`.
+- Options: `--source scraper_api` (or `browser`) fetches through that source instead of the campaign's own, `--fetch-limit 0` skips fetching new businesses, `--skip verify` skips a step (fetch, research, stakeholders, verify, generate), `--min-score 60`, `--email-prompt-id N`, `--headed`.
 
 ## 4. Step by step
 
@@ -65,6 +66,7 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Target locations**: cities or areas, separated by commas, e.g. `Lahore, DHA, Gulberg`.
    - **Search terms**: what you would type into Google Maps, separated by commas, e.g. `dental clinic, dentist`.
    - **Send window** (under Sending, optional): e.g. **09:00** to **20:00**, with the **time zone** (default Asia/Karachi). Approved emails go out between these times, spread evenly; see [Send windows](#send-windows). Leave empty to send as soon as sending runs.
+   - **Lead source** (under Leads): how businesses are found on Google Maps: **Built-in browser** (default) or **Scraper container**. You can still pick the other one for a single fetch.
    - **Campaign prompt** (under Prompts): what makes a good prospect for this campaign. The AI scores each business's website against it, and its email prompts write the campaign's emails. Pick one from the list, or click **+** to write a new one. Each prompt belongs to one campaign. **Without one, the campaign's businesses are not researched and no emails are written**; the campaign page warns you. See [Prompts](#prompts).
 3. Click **Save**.
 
@@ -72,11 +74,24 @@ Every search term is searched in every location, so 2 terms and 3 locations mean
 
 ### Step 2: Fetch businesses
 
-1. Open the campaign and click **Fetch businesses** (top right).
-2. The run form opens with `--limit 20`. Change the number to fetch more or fewer businesses.
+There are two ways to find businesses, and both save exactly the same details:
+
+| | Built-in browser | Scraper container |
+|---|---|---|
+| What does the browsing | This app's own Chromium | The Google Maps scraper running in Docker (port 8001) |
+| Needs | Chromium installed | The container running (`docker compose up -d` in its folder) |
+| Speed | One place at a time | Several places at once (`--concurrency`, default 5) |
+| Google consent page | `--headed` lets you click through it | Handled inside the container |
+
+1. On the dashboard's **Get leads** panel, click **Built-in browser** or **Scraper container** next to the campaign. Or open the campaign and click **Fetch with built-in browser** / **Fetch with scraper container** (top right).
+2. The run form opens with `--limit 20` and the source. Change the number to fetch more or fewer businesses.
 3. Click **Start run** and watch the progress (see [Pipeline runs](#5-pipeline-runs)).
 
+The campaign's **Lead source** decides which one is used when nothing else is chosen, e.g. by **Run full pipeline** or a scheduled job. With the scraper container, each search asks for at most 40 places so it finishes within the container's 5-minute limit; a search that runs out of time is skipped and the run says so.
+
 The campaign's status changes to **Completed** when it finishes. The businesses appear under **Businesses**.
+
+**No duplicates, even across campaigns.** A business that is already saved (in this campaign or any other) is skipped, and the run says which campaign has it, e.g. `Skipped DH Dental Clinic: already in campaign "Lahore clinics"`. So one business is researched once and gets one email sequence, even when two campaigns search overlapping areas.
 
 Each business gets its category, Google rating, number of reviews, opening hours, phone, website and address, and its city, state/province and postal code are worked out from the address (no AI is used for any of this).
 
@@ -237,6 +252,8 @@ Useful arguments:
 | `--dry-run` | most steps | Show what would happen, save nothing |
 | `--limit 5` | all steps | Process at most 5 items |
 | `--headed` | Fetch, Research, Find decision makers | Show the browser window |
+| `--source scraper_api` | Fetch, Run full pipeline | Find businesses through the scraper container (`browser` for the built-in one); default: the campaign's lead source |
+| `--concurrency 3` | Fetch (scraper container) | Places the container opens at once (1-20, default 5; lower if Google starts blocking) |
 | `--all` | Refresh Google Maps details | Refresh every business, not only those missing details |
 | `--address-only` | Refresh Google Maps details | Only fill city, state and postal code from the address (no browser) |
 | `--retry-failed` | Research | Also retry businesses whose research failed |
@@ -297,6 +314,7 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
 | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` | Sending (step 8); `SMTP_FROM_NAME` is also the name in each email's sign-off |
 | `SMTP_REPLY_TO` | Optional: where replies and unsubscribe requests go |
+| `MAPS_SCRAPER_URL` | Optional: where the scraper container answers (default `http://127.0.0.1:8001`) |
 
 ## 10. Troubleshooting
 
@@ -307,6 +325,8 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | A run failed | Open it under **Pipeline runs**; the last lines of the output say why |
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
 | Verify: "Cannot reach Reacher" | Docker is not running; start Docker and run again |
+| Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
+| Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
 | Find decision makers: "Google presented a CAPTCHA" | Run again later, or add `--headed` and solve it in the window. DuckDuckGo is used meanwhile |
 | Find decision makers: "Could not start Firefox" | Install Firefox and geckodriver |
 | Generate: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to rewrite those in review |

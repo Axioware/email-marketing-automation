@@ -27,6 +27,35 @@
       {% endif %}
     </div>
 
+    <div class="module">
+      <h2>Get leads</h2>
+      <p class="pipeline-source-status">
+        Two ways to find businesses on Google Maps: the <b>built-in browser</b> (this app's own Chromium) or the
+        <b>scraper container</b> at <code>{{ leads.scraper_url }}</code>:
+        {% if leads.scraper_problem %}<span class="pipeline-badge pipeline-failed">{{ leads.scraper_problem }}</span>
+        {% else %}<span class="pipeline-badge pipeline-succeeded">running</span>{% endif %}
+      </p>
+      {% if leads.campaigns %}
+        <table class="pipeline-leads">
+          <thead><tr><th>Campaign</th><th>Lead source</th><th>Businesses</th><th>Fetch 20 more with</th></tr></thead>
+          <tbody>{% for row in leads.campaigns %}
+            <tr>
+              <td><a href="{{ row.url }}">{{ row.campaign.name }}</a></td>
+              <td>{{ row.campaign.get_lead_source_display }}</td>
+              <td>{{ row.campaign.business_total }}</td>
+              <td class="pipeline-leads-actions">
+                <a class="button" href="{{ row.browser_url }}">Built-in browser</a>
+                <a class="button{% if leads.scraper_problem %} pipeline-disabled{% endif %}" href="{{ row.scraper_url }}"
+                   {% if leads.scraper_problem %}title="The scraper container is {{ leads.scraper_problem }}"{% endif %}>Scraper container</a>
+              </td>
+            </tr>
+          {% endfor %}</tbody>
+        </table>
+      {% else %}
+        <p class="pipeline-empty">No campaigns yet. <a href="{% url 'admin:pipeline_discoverycampaign_add' %}">Create one</a> to start finding businesses.</p>
+      {% endif %}
+    </div>
+
     {% if results %}
     <div class="module">
       <h2>Results by step and variation</h2>

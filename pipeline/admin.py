@@ -90,6 +90,12 @@ def run_form_url(command: str, arguments: list) -> str:
     return f"{reverse('admin:pipeline_pipelinerun_add')}?{query}"
 
 
+def fetch_url(campaign_id: int, source: str | None = None, limit: int = 20) -> str:
+    """The run form for fetching a campaign's businesses, with a lead source or the campaign's own."""
+    return run_form_url("fetch_businesses", ["--campaign-id", str(campaign_id), "--limit", str(limit),
+                                             *(["--source", source] if source else [])])
+
+
 def ids_arguments(flag: str, ids) -> list[str]:
     return [item for pk in sorted(set(ids)) for item in (flag, str(pk))]
 
@@ -134,8 +140,8 @@ class DiscoveryCampaignForm(forms.ModelForm):
 
     class Meta:
         model = DiscoveryCampaign
-        fields = ["name", "target_country", "target_locations", "search_terms", "campaign_prompt", "send_window_start",
-                  "send_window_end", "send_timezone"]
+        fields = ["name", "target_country", "target_locations", "search_terms", "lead_source", "campaign_prompt",
+                  "send_window_start", "send_window_end", "send_timezone"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -147,8 +153,9 @@ class DiscoveryCampaignForm(forms.ModelForm):
                                                         "holds the email prompts that write its emails. Pick a free "
                                                         "prompt or create one with +. Without one, the campaign's "
                                                         "businesses are not researched and no emails are written.")
-        if "send_timezone" in self.fields:
-            self.fields["send_timezone"].required = False
+        for field in ("send_timezone", "lead_source"):  # left out of a form post: the model's default
+            if field in self.fields:
+                self.fields[field].required = False
         for field in ("target_locations", "search_terms"):
             value = getattr(self.instance, field, None)
             if isinstance(value, list):
@@ -162,6 +169,9 @@ class DiscoveryCampaignForm(forms.ModelForm):
 
     def clean_search_terms(self):
         return self._split("search_terms")
+
+    def clean_lead_source(self):
+        return self.cleaned_data.get("lead_source") or "browser"
 
     def clean_send_timezone(self):
         return (self.cleaned_data.get("send_timezone") or "").strip() or DEFAULT_SEND_TIMEZONE
@@ -200,12 +210,18 @@ def prompt_problems(campaign) -> list[str]:
 @admin.register(DiscoveryCampaign)
 class DiscoveryCampaignAdmin(PipelineAdmin):
     form = DiscoveryCampaignForm
-    list_display = ["name", "target_country", "locations", "terms", "status_badge", "business_count", "created_at"]
-    list_filter = ["status", "target_country"]
+    list_display = ["name", "target_country", "locations", "terms", "lead_source", "status_badge", "business_count",
+                    "created_at"]
+    list_filter = ["status", "lead_source", "target_country"]
     search_fields = ["name"]
     readonly_fields = ["status", "created_at", "updated_at", "started_at", "completed_at", "businesses_link"]
     fieldsets = [
         (None, {"fields": ["name", "target_country", "target_locations", "search_terms"]}),
+        ("Leads", {"fields": ["lead_source"],
+                   "description": "Built-in browser: this app opens Google Maps in its own Chromium. Scraper "
+                                  "container: the Google Maps scraper Docker service does it (MAPS_SCRAPER_URL, port "
+                                  "8001 by default). Both save the same details. The fetch buttons above can use "
+                                  "either one for a single run."}),
         ("Prompts", {"fields": ["campaign_prompt"]}),
         ("Sending", {"fields": [("send_window_start", "send_window_end"), "send_timezone"],
                      "description": "Approved emails go out between these times, spread evenly over the window "
@@ -213,7 +229,7 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
                                     "time. Leave both empty to send as soon as sending runs."}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
-    actions = ["run_pipeline", "fetch_businesses"]
+    actions = ["run_pipeline", "fetch_businesses", "fetch_with_browser", "fetch_with_scraper"]
     inlines = [FollowUpInline]
     change_form_template = "admin/pipeline/discoverycampaign/change_form.html"
 
@@ -255,17 +271,29 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
             return None
         return run_step("run_pipeline", ["--campaign-id", str(queryset.first().pk), "--fetch-limit", "20"])
 
-    @admin.action(description="Fetch businesses from Google Maps (Module 1)")
-    def fetch_businesses(self, request, queryset):
+    def fetch_one(self, request, queryset, source=None):
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one campaign.", messages.WARNING)
             return None
-        return run_step("fetch_businesses", ["--campaign-id", str(queryset.first().pk), "--limit", "20"])
+        return HttpResponseRedirect(fetch_url(queryset.first().pk, source))
+
+    @admin.action(description="Fetch businesses from Google Maps (the campaign's lead source)")
+    def fetch_businesses(self, request, queryset):
+        return self.fetch_one(request, queryset)
+
+    @admin.action(description="Fetch businesses with the built-in browser")
+    def fetch_with_browser(self, request, queryset):
+        return self.fetch_one(request, queryset, "browser")
+
+    @admin.action(description="Fetch businesses with the scraper container")
+    def fetch_with_scraper(self, request, queryset):
+        return self.fetch_one(request, queryset, "scraper_api")
 
     def render_change_form(self, request, context, *args, **kwargs):
         obj = context.get("original")
         if obj is not None:
-            context["fetch_url"] = run_form_url("fetch_businesses", ["--campaign-id", str(obj.pk), "--limit", "20"])
+            context["fetch_browser_url"] = fetch_url(obj.pk, "browser")
+            context["fetch_scraper_url"] = fetch_url(obj.pk, "scraper_api")
             context["pipeline_url"] = run_form_url("run_pipeline", ["--campaign-id", str(obj.pk), "--fetch-limit", "20"])
         return super().render_change_form(request, context, *args, **kwargs)
 

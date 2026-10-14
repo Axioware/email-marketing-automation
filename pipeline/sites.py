@@ -31,6 +31,28 @@ def run_url(command: str, arguments: str = "") -> str:
     return f"{reverse('admin:pipeline_pipelinerun_add')}?{urlencode({'command': command, 'arguments': arguments})}"
 
 
+def lead_sources() -> dict:
+    """The "Get leads" panel: recent campaigns with a fetch button per lead source, and whether the scraper
+    container answers."""
+    from pipeline.models import DiscoveryCampaign
+    from pipeline.services import scraper_api
+
+    def fetch(pk, source):
+        return run_url("fetch_businesses", f"--campaign-id {pk} --limit 20 --source {source}")
+
+    campaigns = DiscoveryCampaign.objects.annotate(business_total=Count("businesses")).order_by("-created_at")[:8]
+    problem = scraper_api.status(timeout=1.5)
+    return {
+        "campaigns": [{"campaign": campaign, "browser_url": fetch(campaign.pk, "browser"),
+                       "scraper_url": fetch(campaign.pk, "scraper_api"),
+                       "url": reverse("admin:pipeline_discoverycampaign_change", args=[campaign.pk])}
+                      for campaign in campaigns],
+        "scraper_url": scraper_api.base_url(),
+        "scraper_problem": problem,
+        "scraper_needed": any(campaign.lead_source == "scraper_api" for campaign in campaigns),
+    }
+
+
 def sequence_results() -> list[dict]:
     """Sent emails per step and A/B variation, with open and reply rates."""
     from pipeline.models import Email
@@ -183,8 +205,13 @@ class PipelineAdminSite(admin.AdminSite):
         problems = sending.config_problems(sending.smtp_config())
         if problems:
             warnings.append("Sending is not set up: " + "; ".join(problems) + ".")
+        leads = lead_sources()
+        if leads["scraper_needed"] and leads["scraper_problem"]:
+            warnings.append(f"A campaign gets its leads from the scraper container, but it is {leads['scraper_problem']} "
+                            f"at {leads['scraper_url']}: start it, or set MAPS_SCRAPER_URL in .env.")
 
         return {
+            "leads": leads,
             "results": sequence_results(),
             "funnel": funnel,
             "steps": steps,

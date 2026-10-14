@@ -58,8 +58,8 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DiscoveryCampaign
-        fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "campaign_prompt",
-                  "send_window_start", "send_window_end", "send_timezone", "follow_ups", "business_count",
+        fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "lead_source",
+                  "campaign_prompt", "send_window_start", "send_window_end", "send_timezone", "follow_ups", "business_count",
                   "created_at", "updated_at", "started_at", "completed_at"]
         read_only_fields = ["status", "created_at", "updated_at", "started_at", "completed_at"]
 
@@ -202,11 +202,19 @@ class RunPipelineSerializer(serializers.Serializer):
                                                                          "generate", "followups"]), required=False)
     min_score = serializers.IntegerField(min_value=0, max_value=100, required=False)
     email_prompt_id = serializers.IntegerField(required=False)
+    source = serializers.ChoiceField(choices=["browser", "scraper_api"], required=False,
+                                     help_text="Lead source for fetching (default: the campaign's lead_source).")
     headed = serializers.BooleanField(default=False)
 
 
 class FetchBusinessesSerializer(serializers.Serializer):
     limit = serializers.IntegerField(min_value=1, default=20)
+    source = serializers.ChoiceField(choices=["browser", "scraper_api"], required=False,
+                                     help_text="browser (built-in Chromium) or scraper_api (the scraper container); "
+                                               "default: the campaign's lead_source.")
+    lang = serializers.CharField(max_length=10, required=False, help_text="Scraper container only: Google Maps language.")
+    concurrency = serializers.IntegerField(min_value=1, max_value=20, required=False,
+                                           help_text="Scraper container only: places opened at once.")
     delay = serializers.FloatField(min_value=0, required=False)
     headed = serializers.BooleanField(default=False)
 

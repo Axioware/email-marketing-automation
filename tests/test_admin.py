@@ -92,7 +92,8 @@ class AdminPagesTests(AdminCase):
         self.assertEqual((campaign.target_locations, campaign.search_terms), (["Karachi", "Clifton"], ["dental clinic", "dentist"]))
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[campaign.pk])).content.decode()
         self.assertIn('value="Karachi, Clifton"', page)
-        self.assertIn("Fetch businesses", page)
+        self.assertIn("Fetch with built-in browser", page)
+        self.assertIn("Fetch with scraper container", page)
 
     def test_campaign_rejects_several_countries(self):
         response = self.client.post(reverse("admin:pipeline_discoverycampaign_add"), {**CAMPAIGN_INLINE,

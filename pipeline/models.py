@@ -86,6 +86,7 @@ class EmailPrompt(models.Model):
 
 
 DEFAULT_SEND_TIMEZONE = "Asia/Karachi"
+LEAD_SOURCES = [("browser", "Built-in browser"), ("scraper_api", "Scraper container")]
 
 
 def send_window_constraint(table: str) -> models.CheckConstraint:
@@ -159,6 +160,10 @@ class DiscoveryCampaign(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    lead_source = models.CharField(
+        max_length=20, choices=LEAD_SOURCES, default="browser",
+        help_text="How businesses are found on Google Maps: the built-in browser, or the Google Maps scraper container "
+                  "(MAPS_SCRAPER_URL in .env).")
     send_window_start = models.TimeField(
         null=True, blank=True,
         help_text="Approved emails are sent between the start and end time, spread evenly (e.g. 09:00 - 20:00). "
@@ -179,6 +184,8 @@ class DiscoveryCampaign(models.Model):
                 name="ck_discovery_campaigns_status",
             ),
             send_window_constraint("discovery_campaigns"),
+            models.CheckConstraint(condition=models.Q(lead_source__in=["browser", "scraper_api"]),
+                                   name="ck_discovery_campaigns_lead_source"),
         ]
 
     def __str__(self):
@@ -227,6 +234,10 @@ class Business(models.Model):
         db_table = "businesses"
         ordering = ["id"]
         verbose_name_plural = "businesses"
+        constraints = [  # one business per Google place, whichever campaign or lead source found it
+            models.UniqueConstraint(fields=["google_place_id"], name="uq_businesses_google_place_id",
+                                    condition=models.Q(google_place_id__isnull=False) & ~models.Q(google_place_id="")),
+        ]
 
     def __str__(self):
         return self.name or f"Business {self.pk}"

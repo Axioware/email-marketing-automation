@@ -85,6 +85,23 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
 | Sending | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` (host, port and security default to Hostinger) |
 
+### Docker setup (Google Maps scraper, optional second lead source)
+
+Businesses can be found two ways, chosen per campaign (**Lead source**) or per run (`--source`):
+
+- **Built-in browser** (default): this app drives its own Chromium through Playwright. Needs `python -m playwright install chromium`.
+- **Scraper container**: the [Google Maps scraper](https://github.com/conor-is-my-name/google-maps-scraper) runs in Docker and does the browsing; this app calls its API and saves the results exactly as it saves its own.
+
+To run the container (from its folder, e.g. `~/Repositories/google-maps-scraper`):
+
+```sh
+docker network create shark      # once: its docker-compose.yml expects this network
+docker compose up -d --build      # serves http://127.0.0.1:8001
+curl http://127.0.0.1:8001/       # {"message": "Google Maps Scraper API is running."}
+```
+
+Set `MAPS_SCRAPER_URL` in `.env` if it runs elsewhere (default `http://127.0.0.1:8001`). The dashboard's **Get leads** panel shows whether it answers. Each search runs inside the container and must finish in its 5-minute limit, so one search asks for at most 40 places (3 places took about 100 seconds in testing; a search that times out is skipped and reported). Its own guidance: at most about 500 places a day per IP, at least a minute between searches.
+
 ### The pipeline
 
 Run the steps in order. Each one reads what the previous one stored, and each skips work it has already done, so it is safe to rerun. Every step can be started three ways: from the admin, through the API, or as a command.
@@ -94,7 +111,7 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | Step | Admin | Command |
 |---|---|---|
 | 1. Campaign | Discovery campaigns > Add | `python manage.py create_campaign` |
-| 2. Find businesses | Campaign > **Fetch businesses** | `python manage.py fetch_businesses --campaign-id 1 --limit 20` |
+| 2. Find businesses | Dashboard > **Get leads**, or Campaign > **Fetch with built-in browser** / **Fetch with scraper container** | `python manage.py fetch_businesses --campaign-id 1 --limit 20 [--source browser\|scraper_api]` |
 | 2b. Fill missing details | Businesses > action **Refresh Google Maps details** | `python manage.py refresh_businesses` |
 | 3. Research and score | Businesses > action **Research websites** | `python manage.py research_websites` |
 | 4. Find owners | Businesses > action **Find decision makers** | `python manage.py find_stakeholders --headed` |
@@ -130,7 +147,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 
 | Endpoint | What |
 |---|---|
-| `/api/campaigns/` | list, create, edit, delete; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20}` |
+| `/api/campaigns/` | list, create, edit, delete (`lead_source`: `browser` or `scraper_api`); `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20, "source": "scraper_api"}` (`source` optional: the campaign's lead source) |
 | `/api/follow-ups/` | a campaign's follow-up schedule (sequence, days after previous); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops follow-ups to that business |
 | `/api/campaign-prompts/`, `/api/email-prompts/` | campaign prompts qualify businesses (research scores websites against them; `full_prompt` shows what the agent receives), email prompts write emails; a campaign links to one campaign prompt (`campaign_prompt`), which has many email prompts |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
@@ -164,15 +181,18 @@ python manage.py create_campaign      # or answer the prompts
 
 ## Fetch businesses from Google Maps
 
-Needs Chromium (`python -m playwright install chromium`). From the admin: select a campaign, action **Fetch businesses from Google Maps** (or the **Fetch businesses** button on the campaign). From the terminal:
+Two lead sources (see [Docker setup (Google Maps scraper)](#docker-setup-google-maps-scraper-optional-second-lead-source)): the **built-in browser** (needs Chromium, `python -m playwright install chromium`) and the **scraper container**. Each campaign has a **Lead source** (default: built-in browser), used whenever it is fetched without `--source`. From the admin: the dashboard's **Get leads** panel has a button per source for each campaign; a campaign's page has **Fetch with built-in browser** and **Fetch with scraper container**; the Campaigns list has an action for each. From the terminal:
 
 ```sh
-python manage.py fetch_businesses --campaign-id 1 --limit 20
+python manage.py fetch_businesses --campaign-id 1 --limit 20                         # the campaign's lead source
+python manage.py fetch_businesses --campaign-id 1 --limit 20 --source scraper_api    # through the container
 ```
+
+Container options: `--lang` (Google Maps language, default `en`) and `--concurrency` (places opened at once, 1-20, default 5). The full pipeline takes `--source` too and passes it to its fetch step.
 
 At a terminal, `--campaign-id` and `--limit` are asked for when omitted; in a background run they are required. The fetcher searches that campaign's terms and locations, stores up to the requested number of new businesses, and leaves unavailable Maps fields as `NULL`. Use `--headed` if Google requires manual consent. Automated Google Maps access may be restricted by its terms; for production use, prefer the official Places API.
 
-Each new business is saved with a `business_sources` record containing the unnormalized Google Maps payload in PostgreSQL `JSONB`.
+Each new business is saved with a `business_sources` record containing the unnormalized Google Maps payload in PostgreSQL `JSONB`. `source` says which lead source found it: `google_maps` (built-in browser) or `google_maps_scraper` (container). Both are de-duplicated the same way against **every** saved business, in any campaign (Google place id, Maps link, then name + address or website): a business is saved once, so it gets one research, one set of contacts and one email sequence however many campaigns find it. One another campaign already has is skipped and named in the run's output. The database also refuses a second business with the same Google place id (migration 0011 stops with a list if duplicates already exist).
 
 ## Research business websites
 

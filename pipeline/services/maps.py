@@ -1,4 +1,10 @@
-"""Module 1: fetch businesses for a discovery campaign from Google Maps (Playwright + Chromium)."""
+"""Module 1: fetch businesses for a discovery campaign from Google Maps.
+
+Two lead sources, chosen per campaign (Lead source) or per run (--source):
+- browser: this module drives its own Chromium through Playwright (the default).
+- scraper_api: the Google Maps scraper container does the browsing (see scraper_api.py).
+Both produce the same records, de-duplicated against the campaign's businesses and saved the same way.
+"""
 import re
 import time
 import unicodedata
@@ -9,7 +15,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import phonenumbers
 import pycountry
 from django.core.management.base import CommandError
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
+from django.db.models import F
 from django.utils import timezone as django_timezone
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -140,7 +147,7 @@ def prompt_for_positive_integer(prompt: str) -> int:
         print("Enter a positive whole number.")
 
 
-CAMPAIGN_FIELDS = ("id", "name", "status", "target_country", "target_locations", "search_terms")
+CAMPAIGN_FIELDS = ("id", "name", "status", "target_country", "target_locations", "search_terms", "lead_source")
 
 
 def choose_campaign(campaign_id: int | None = None):
@@ -519,10 +526,17 @@ def same_business(first: dict, second: dict) -> bool:
 
 @outside_event_loop
 def existing_businesses(campaign_id: int) -> list[dict]:
+    """Every business already saved, in any campaign (this campaign's first): a business is found once, so it gets
+    one research, one set of contacts and one email sequence however many campaigns search for it."""
+    from django.db.models import Case, IntegerField, Value, When
+
     return list(
-        Business.objects.filter(discovery_campaign_id=campaign_id).values(
-            "google_place_id", "google_maps_url", "name", "website_url", "domain", "address"
-        )
+        Business.objects.annotate(
+            mine=Case(When(discovery_campaign_id=campaign_id, then=Value(0)), default=Value(1),
+                      output_field=IntegerField()))
+        .order_by("mine", "id")
+        .values("google_place_id", "google_maps_url", "name", "website_url", "domain", "address",
+                "discovery_campaign_id", campaign_name=F("discovery_campaign__name"))
     )
 
 
@@ -558,39 +572,75 @@ def scrape_campaign(
                 print(f"Skipping a Maps result ({type(error).__name__}).")
                 continue
 
-            details = extracted["business"]
-            if any(same_business(details, seen) for seen in seen_businesses):
-                continue
-
-            discovered_at = datetime.now(timezone.utc)
-            details.update(
-                discovery_campaign_id=campaign["id"],
-                first_discovered_at=discovered_at,
-                last_discovered_at=discovered_at,
-            )
-            records.append(extracted)
-            seen_businesses.append(details)
+            accept_record(extracted, campaign, seen_businesses, records)
 
     return records
 
 
+def scrape_with_browser(campaign: dict, queries: list[str], limit: int, options: dict) -> list[dict]:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=not options["headed"])
+        try:
+            return scrape_campaign(new_maps_page(browser), campaign, queries, limit, options["delay"],
+                                   options["headed"])
+        finally:
+            browser.close()
+
+
+def accept_record(record: dict, campaign: dict, seen: list[dict], records: list[dict]) -> bool:
+    """Add a found business to `records` unless it is already saved, in this campaign or any other (or this run
+    found it). Returns whether it was added; a business another campaign has is reported."""
+    details = record["business"]
+    match = next((other for other in seen if same_business(details, other)), None)
+    if match is not None:
+        if match.get("discovery_campaign_id") not in (None, campaign["id"]):
+            print(f"  Skipped {details.get('name') or 'a business'}: already in campaign "
+                  f"\"{match.get('campaign_name') or match['discovery_campaign_id']}\".", flush=True)
+        return False
+    discovered_at = datetime.now(timezone.utc)
+    details.update(discovery_campaign_id=campaign["id"], first_discovered_at=discovered_at,
+                   last_discovered_at=discovered_at)
+    records.append(record)
+    seen.append(details)
+    return True
+
+
 @outside_event_loop
-def save_records(records: list[dict]) -> None:
-    with transaction.atomic():
-        for record in records:
-            business = Business.objects.create(**record["business"])
-            BusinessSource.objects.create(
-                business=business,
-                source="google_maps",
-                source_business_id=business.google_place_id,
-                source_url=business.google_maps_url,
-                raw_data=record["raw_data"],
-                discovered_at=business.first_discovered_at,
-            )
+def save_records(records: list[dict]) -> int:
+    """Save the found businesses with their source listing. Returns how many were saved: one another run saved in
+    the meantime (same Google place) is skipped."""
+    saved = 0
+    for record in records:
+        try:
+            with transaction.atomic():
+                business = Business.objects.create(**record["business"])
+                BusinessSource.objects.create(
+                    business=business,
+                    source=business.source or "google_maps",
+                    source_business_id=business.google_place_id,
+                    source_url=business.google_maps_url,
+                    raw_data=record["raw_data"],
+                    discovered_at=business.first_discovered_at,
+                )
+        except IntegrityError:
+            print(f"  Skipped {record['business'].get('name') or 'a business'}: already saved by another run.")
+            continue
+        saved += 1
+    return saved
+
+
+SOURCES = {"browser": "built-in browser", "scraper_api": "scraper container"}
 
 
 def add_arguments(parser) -> None:
     parser.add_argument("--campaign-id", type=int, help="Campaign to fetch for (asked interactively when omitted).")
+    parser.add_argument("--source", choices=list(SOURCES),
+                        help="Where leads come from: browser (built-in Chromium) or scraper_api (the Google Maps "
+                             "scraper container, MAPS_SCRAPER_URL). Default: the campaign's lead source.")
+    parser.add_argument("--lang", default="en", help="Google Maps language for the scraper container (default: en).")
+    parser.add_argument("--concurrency", type=int, default=5,
+                        help="Places the scraper container opens at once, 1-20 (default: 5; higher is faster but "
+                             "more likely to be blocked).")
     parser.add_argument("--limit", type=int, help="How many businesses to fetch (asked interactively when omitted).")
     parser.add_argument(
         "--headed",
@@ -610,6 +660,8 @@ def run(options: dict) -> int:
         raise CommandError("--delay cannot be negative")
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
+    if not 1 <= options.get("concurrency", 5) <= 20:
+        raise CommandError("--concurrency must be between 1 and 20")
 
     try:
         campaign = choose_campaign(options["campaign_id"])
@@ -626,30 +678,30 @@ def run(options: dict) -> int:
         if not queries:
             return 1
 
+        source = options.get("source") or campaign.get("lead_source") or "browser"
         print(
             "Automated Google Maps access may be restricted by Google's terms. "
             "For production use, prefer the official Places API."
         )
+        print(f"Lead source: {SOURCES[source]}.")
+        if source == "scraper_api":
+            from pipeline.services import scraper_api
 
-        records = []
+            problem = scraper_api.status()
+            if problem:
+                print(f"The scraper container at {scraper_api.base_url()} is {problem}. Start it "
+                      "(docker compose up -d in its folder) or set MAPS_SCRAPER_URL in .env.")
+                return 1
+
+        records, saved = [], 0
         try:
             update_campaign_status(campaign["id"], "running")
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=not options["headed"])
-                try:
-                    page = new_maps_page(browser)
-                    records = scrape_campaign(
-                        page,
-                        campaign,
-                        queries,
-                        limit,
-                        options["delay"],
-                        options["headed"],
-                    )
-                finally:
-                    browser.close()
-            if records:
-                save_records(records)
+            if source == "scraper_api":
+                records = scraper_api.scrape_campaign(campaign, queries, limit, lang=options.get("lang") or "en",
+                                                      concurrency=options.get("concurrency", 5))
+            else:
+                records = scrape_with_browser(campaign, queries, limit, options)
+            saved = save_records(records) if records else 0
             update_campaign_status(campaign["id"], "completed")
         except Exception as error:
             try:
@@ -667,12 +719,12 @@ def run(options: dict) -> int:
                 print("Could not persist the campaign's failed status.")
             raise
 
-        if not records:
-            print("No new businesses were found for this campaign.")
+        if not saved:
+            print("No new businesses were found for this campaign (businesses any campaign already has are skipped).")
             print(f"Campaign {campaign['id']} completed with no new businesses.")
             return 0
 
-        print(f"Stored {len(records)} businesses for campaign {campaign['id']}.")
+        print(f"Stored {saved} businesses for campaign {campaign['id']}.")
         return 0
     except DatabaseError as error:
         print(f"Database operation failed ({type(error).__name__}).")

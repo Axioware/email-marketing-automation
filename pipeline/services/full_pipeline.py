@@ -28,6 +28,8 @@ def add_arguments(parser) -> None:
                              "is processed and nothing is fetched.")
     parser.add_argument("--fetch-limit", type=int, default=20,
                         help="New businesses to fetch from Google Maps (default: 20; 0 skips fetching).")
+    parser.add_argument("--source", choices=["browser", "scraper_api"],
+                        help="Lead source for fetching: browser or scraper_api (default: the campaign's lead source).")
     parser.add_argument("--skip", action="append", choices=list(STEPS), help="Skip this step (repeatable).")
     parser.add_argument("--min-score", type=int, default=50,
                         help="Qualification score needed to look for decision makers (default: 50).")
@@ -61,7 +63,8 @@ def run(options: dict) -> int:
     def arguments(step: str) -> list[str]:
         businesses = business_arguments(campaign_id)  # re-read: fetching adds businesses
         if step == "fetch":
-            return ["--campaign-id", str(campaign_id), "--limit", str(options["fetch_limit"]), *headed]
+            source = ["--source", options["source"]] if options.get("source") else []
+            return ["--campaign-id", str(campaign_id), "--limit", str(options["fetch_limit"]), *source, *headed]
         if step == "research":
             return [*businesses, *headed]
         if step == "stakeholders":
