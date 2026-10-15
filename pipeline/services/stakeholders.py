@@ -18,10 +18,10 @@ from django.core.management.base import CommandError
 from django.db import DatabaseError, transaction
 from django.db.models import F, Q
 
-from pipeline.management.base import out_of_time, time_limit_note
+from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile
 from pipeline.services import qualify, searxng
-from pipeline.services.research import JinaReader, ResearchError, is_public_http_url
+from pipeline.services.research import JINA_TIMEOUT, JinaReader, ResearchError, is_public_http_url
 
 DEFAULT_ROLES_FILE = Path(settings.BASE_DIR) / "config" / "target_roles_dental.json"
 MAX_PAGE_TEXT_CHARS = 8000
@@ -785,7 +785,9 @@ def crawl_site(reader: JinaReader, business: dict, evidence: Evidence, roles: Ro
         if not is_public_http_url(url):
             continue  # never let a business's website point us at this machine or the local network
         try:
-            page = reader.read(url)
+            page = reader.read(url, call_timeout((options or {}).get("deadline"), JINA_TIMEOUT))
+        except OutOfTime:
+            break
         except ResearchError as error:
             print(f"    {url}: {error}")
             continue
@@ -824,11 +826,11 @@ def build_queries(business: dict) -> list[str]:
     ]
 
 
-def run_search(query: str, evidence: Evidence, roles: RoleConfig) -> bool:
+def run_search(query: str, evidence: Evidence, roles: RoleConfig, deadline: float | None = None) -> bool:
     """One web search through SearXNG; each result's title and snippet is read on its own (a person counts only when
     the snippet mentions the business). Returns whether the search answered."""
     try:
-        results = searxng.search(query)
+        results = searxng.search(query, timeout=call_timeout(deadline, searxng.TIMEOUT))
     except searxng.SearchUnavailable as error:
         print(f"  Search failed: {error}")
         return False
@@ -968,7 +970,10 @@ def run(options: dict) -> int:
                         time.sleep(options["delay"])
                     searches_used += 1
                     print(f"  Search: {query}")
-                    search_ok = run_search(query, evidence, roles) or search_ok
+                    try:
+                        search_ok = run_search(query, evidence, roles, options.get("deadline")) or search_ok
+                    except OutOfTime:
+                        break
                     if evidence.has_target():
                         break
 

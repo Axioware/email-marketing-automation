@@ -200,6 +200,53 @@ class ResearchPageTests(TestCase):
         self.assertEqual(agent.call_args.kwargs["score_note"], research.TIME_LIMIT_NOTE)
 
 
+class TimeLimitTests(TestCase):
+    """With a deadline (the web app) no call runs past it, and unfinished work is left for the next run."""
+
+    def test_ai_call_waits_out_a_rate_limit_only_when_there_is_time(self):
+        import time
+
+        import httpx
+        from openai import RateLimitError
+
+        from pipeline.management.base import OutOfTime
+        from pipeline.services import llm
+
+        def limited(seconds):
+            response = httpx.Response(429, headers={"retry-after": str(seconds)},
+                                      request=httpx.Request("POST", "https://api.groq.com"))
+            return RateLimitError("rate limited", response=response, body=None)
+
+        client = mock.Mock()
+        bounded = client.with_options.return_value
+        bounded.chat.completions.create.side_effect = [limited(1), "answer"]
+        with mock.patch.object(llm.time, "sleep") as sleep:
+            self.assertEqual(llm.complete(client, time.monotonic() + 200, model="m"), "answer")
+        client.with_options.assert_called_once_with(max_retries=0)  # the SDK's own long waits are off
+        sleep.assert_called_once_with(1.0)
+        self.assertLessEqual(bounded.chat.completions.create.call_args.kwargs["timeout"], 60)
+        bounded.chat.completions.create.side_effect = [limited(60)]
+        with self.assertRaises(OutOfTime):
+            llm.complete(client, time.monotonic() + 50, model="m")  # waiting 60 s would pass the deadline
+        with self.assertRaises(OutOfTime):
+            llm.complete(client, time.monotonic() + 3, model="m")  # no time to even start
+
+    def test_research_interrupted_by_the_time_limit_is_done_again_next_run(self):
+        from pipeline.management.base import OutOfTime
+
+        campaign = make_campaign()
+        first = make_business(campaign, "First", website_url="https://first.pk")
+        make_business(campaign, "Second", website_url="https://second.pk")
+        with mock.patch.object(research, "make_llm_client", return_value=(object(), "m", "test")), \
+                mock.patch.object(research, "research_business", side_effect=OutOfTime("the run's time limit was reached")):
+            result = run_command("research_websites", "--local-only")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("researched again in the next run", result.stdout)
+        self.assertIn("Time limit reached: 2 business(es)", result.stdout)
+        self.assertEqual(BusinessWebsiteProfile.objects.get(business=first).status, "pending")
+        self.assertEqual(len(research.load_businesses(None, None)), 2)  # both are picked up again
+
+
 class StakeholderTests(TestCase):
     def test_queue_and_saving_contacts(self):
         campaign = make_campaign()

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from django.core.management.base import CommandError
 from django.db import DatabaseError
 
-from pipeline.management.base import out_of_time, time_limit_note
+from pipeline.management.base import OutOfTime, out_of_time, time_limit_note
 from pipeline.models import Email, EmailPrompt, FollowUp, Prospect
 from pipeline.services import generation
 
@@ -73,7 +73,7 @@ def thread_context(prospect_id: int, before_step: int) -> list[dict]:
 
 
 def write_followup(item: dict, llm: tuple, chosen: EmailPrompt | None = None, dry_run: bool = False,
-                   cache: dict | None = None) -> tuple[str, str]:
+                   cache: dict | None = None, deadline: float | None = None) -> tuple[str, str]:
     """Write one follow-up. Returns (outcome, detail): ("saved", subject), ("dry_run", body), ("skipped", reason)."""
     client, model, provider = llm
     rows = generation.prospect_rows(Prospect.objects.filter(pk=item["prospect_id"]))
@@ -89,7 +89,7 @@ def write_followup(item: dict, llm: tuple, chosen: EmailPrompt | None = None, dr
         "follow_up": {"number": item["sequence"]},
         "previous_emails": thread_context(item["prospect_id"], item["step"]),
     }
-    draft = generation.generate_draft(client, model, context, system_prompt)
+    draft = generation.generate_draft(client, model, context, system_prompt, deadline)
     if dry_run:
         return "dry_run", f"{draft.subject}\n{draft.body}"
     existing = Email.objects.filter(prospect_id=item["prospect_id"], sequence_step=item["step"]).first()
@@ -138,7 +138,11 @@ def run(options: dict) -> int:
                 break
             label = f"Prospect {item['prospect_id']} <{item['previous'].recipient}>, follow-up {item['sequence']}"
             try:
-                outcome, detail = write_followup(item, llm, chosen, options["dry_run"], cache)
+                outcome, detail = write_followup(item, llm, chosen, options["dry_run"], cache, options.get("deadline"))
+            except OutOfTime as error:
+                print(f"  Stopped: {error}.")
+                time_limit_note(len(due) - position, "follow-up(s)")
+                break
             except Exception as error:  # one bad follow-up must not stop the others
                 failed += 1
                 print(f"  {label} failed ({type(error).__name__}): {error}")

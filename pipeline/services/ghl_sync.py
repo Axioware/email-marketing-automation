@@ -6,7 +6,7 @@ from django.core.management.base import CommandError
 from pipeline.management.base import out_of_time, time_limit_note
 from pipeline.services import ghl, outreach
 
-RESERVE_SECONDS = 15  # with a deadline: a GHL call takes a second or two
+RESERVE_SECONDS = 100  # with a deadline: a GHL call takes a second or two, but may take 30 s and be retried
 
 
 def add_arguments(parser) -> None:

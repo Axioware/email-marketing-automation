@@ -34,3 +34,19 @@ def out_of_time(options: dict, reserve: float = 0.0) -> bool:
 def time_limit_note(left: int, what: str) -> None:
     print(f"Time limit reached: {left} {what} not done yet; start the run again to continue (finished work is "
           "skipped).", flush=True)
+
+
+class OutOfTime(Exception):
+    """Too little of the run's time is left to start (or keep waiting for) this call; the work is left for the next
+    run. Not an error of the item being processed."""
+
+
+def call_timeout(deadline: float | None, normal: float, margin: float = 5.0, minimum: float = 5.0) -> float:
+    """The timeout for one network call: `normal`, but never past the run's deadline (OutOfTime when less than
+    `minimum` seconds would be left)."""
+    if deadline is None:
+        return normal
+    left = deadline - time.monotonic() - margin
+    if left < minimum:
+        raise OutOfTime("the run's time limit was reached")
+    return min(normal, left)

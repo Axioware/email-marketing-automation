@@ -35,9 +35,9 @@ try:  # better text extraction when Jina Reader is not used (requirements-worker
 except ImportError:
     trafilatura = None
 
-from pipeline.management.base import out_of_time, time_limit_note
+from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessWebsiteProfile
-from pipeline.services.llm import make_llm_client, rejected_output
+from pipeline.services.llm import complete, make_llm_client, rejected_output
 from pipeline.services.dbthread import outside_event_loop
 
 MAX_PAGES_PER_BUSINESS = 5
@@ -147,14 +147,14 @@ class JinaReader:
         )
         self.max_wait = max_wait  # with a deadline: never wait out the rate limit past it
 
-    def read(self, url: str) -> dict:
+    def read(self, url: str, timeout: float = JINA_TIMEOUT) -> dict:
         """{url (after redirects), title, content (markdown), links [(text, url)], status (the page's HTTP status)}."""
         self.rate_limiter.acquire(self.max_wait)
         headers = {"Accept": "application/json", "X-With-Links-Summary": "true", "User-Agent": "outreach-app"}
         if self.key:
             headers["Authorization"] = f"Bearer {self.key}"
         try:
-            with urlopen(Request(f"https://r.jina.ai/{url}", headers=headers), timeout=JINA_TIMEOUT) as response:
+            with urlopen(Request(f"https://r.jina.ai/{url}", headers=headers), timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
         except (HTTPError, URLError, OSError, ValueError) as error:
             raise ResearchError(f"Jina Reader request failed ({type(error).__name__}).") from error
@@ -262,20 +262,21 @@ def is_same_site(url: str, homepage_url: str) -> bool:
     return bool(home_host and (target_host == home_host or target_host.endswith(f".{home_host}")))
 
 
-def extract_page(requested_url: str, homepage_url: str, jina_reader: JinaReader | None) -> dict:
+def extract_page(requested_url: str, homepage_url: str, jina_reader: JinaReader | None,
+                 deadline: float | None = None) -> dict:
     """Read one page of the business's website: its HTML (links, emails) over plain HTTP, and its rendered text and
     links through Jina Reader (pages built by JavaScript included). Either one is enough."""
     if not is_public_http_url(requested_url):
         raise ResearchError("Refusing to fetch a non-public or unsupported URL.")
     html = current_url = rendered = fetch_error = None
     try:
-        final_url, html = fetch_html(requested_url)
+        final_url, html = fetch_html(requested_url, call_timeout(deadline, PAGE_TIMEOUT))
         current_url = normalize_url(final_url)
     except ResearchError as error:
         fetch_error = error
     if jina_reader:
         try:
-            rendered = jina_reader.read(current_url or requested_url)
+            rendered = jina_reader.read(current_url or requested_url, call_timeout(deadline, JINA_TIMEOUT))
         except ResearchError as error:
             print(f"Jina extraction unavailable; using the page's HTML ({error}).")
     if rendered and rendered["status"] and rendered["status"] >= 400:
@@ -358,7 +359,7 @@ def parse_decision(content: str) -> "AgentResponse":
 
 
 def validate_agent_response(client: OpenAI, model: str, context: dict, must_score: bool, system_prompt: str,
-                            score_note: str = PAGE_LIMIT_NOTE) -> dict:
+                            score_note: str = PAGE_LIMIT_NOTE, deadline: float | None = None) -> dict:
     """One agent decision. With must_score the agent has to SCORE now; score_note says why (shown to the agent and
     added to its reasoning)."""
     feedback = None
@@ -376,9 +377,11 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
             request_data["must_score_reason"] = score_note
         user_message = json.dumps(request_data, ensure_ascii=False, default=json_default, allow_nan=False)
         try:
-            response = client.chat.completions.create(
-                model=model,
+            response = complete(
+                client,
+                deadline,
                 timeout=LLM_TIMEOUT,
+                model=model,
                 temperature=0.2,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
                 response_format=response_format,
@@ -515,7 +518,7 @@ def research_business(
         if not is_same_site(requested, homepage) or not is_public_http_url(requested):
             raise ResearchError("Requested page is not a public URL on the business website.")
 
-        result = extract_page(requested, homepage, jina_reader)
+        result = extract_page(requested, homepage, jina_reader, deadline)
         final_identity = url_identity(result["url"])
         if not final_identity or final_identity in visited_identities:
             raise ResearchError("Page redirected to a URL already scraped.")
@@ -575,13 +578,14 @@ def research_business(
         must_score = len(pages) >= MAX_PAGES_PER_BUSINESS or out_of_time_now
         note = TIME_LIMIT_NOTE if out_of_time_now and len(pages) < MAX_PAGES_PER_BUSINESS else PAGE_LIMIT_NOTE
         try:
-            decision = validate_agent_response(client, model, context, must_score, system_prompt, score_note=note)
+            decision = validate_agent_response(client, model, context, must_score, system_prompt, score_note=note,
+                                               deadline=deadline)
         except ResearchError:
             if must_score:
                 raise
             # The agent could not pick a readable page: score from the pages read so far instead of failing.
             decision = validate_agent_response(client, model, context, True, system_prompt,
-                                               score_note="no further useful page could be chosen")
+                                               score_note="no further useful page could be chosen", deadline=deadline)
         page_record.update(
             summary=decision["summary"],
             relevant_findings=decision["relevant_findings"],
@@ -641,7 +645,7 @@ BUSINESS_FIELDS = (
 )
 
 
-ABANDONED_AFTER = timedelta(minutes=30)  # a research takes a few minutes (at most five pages)
+ABANDONED_AFTER = timedelta(minutes=10)  # a research takes a few minutes (at most five pages)
 
 
 def load_businesses(limit: int | None, business_ids: list[int] | None, retry_failed: bool = False,
@@ -675,6 +679,12 @@ def finalize_profile(profile_id: int, result: dict) -> None:
         qualification_reasons=result["qualification_reasons"],
         agent_reasoning=result["agent_reasoning"],
     )
+
+
+@outside_event_loop
+def reset_profile(profile_id: int) -> None:
+    """Back to pending: the research was interrupted (time limit), so the next run does it again."""
+    BusinessWebsiteProfile.objects.filter(pk=profile_id).update(status="pending")
 
 
 @outside_event_loop
@@ -747,6 +757,11 @@ def run(options: dict) -> int:
             score = result.get("qualification_score")
             print(f"Business {business['id']}: {result['action']} after {result['pages_scraped']} page(s)"
                   + (f", score {score}." if score is not None else "."))
+        except OutOfTime as error:  # not the website's fault: the next run researches it again
+            reset_profile(profile_id)
+            print(f"Business {business['id']}: stopped, {error}; it is researched again in the next run.")
+            time_limit_note(len(queue) - position, "business(es)")
+            break
         except Exception as error:  # noqa: BLE001 - one website must not stop the others
             fail_profile(profile_id, error)
             failed += 1

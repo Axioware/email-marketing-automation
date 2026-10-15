@@ -25,9 +25,9 @@ from django.db.models.functions import Lower
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from pipeline.management.base import out_of_time, time_limit_note
+from pipeline.management.base import OutOfTime, out_of_time, time_limit_note
 from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, FollowUp, Prospect
-from pipeline.services.llm import make_llm_client, rejected_output
+from pipeline.services.llm import complete, make_llm_client, rejected_output
 
 # The model's instructions are one email prompt (email_prompts table, edited in the admin), chosen per campaign, step and
 # A/B group; it receives the JSON built by `prospect_context` as the user message. There is no built-in prompt.
@@ -279,7 +279,8 @@ def assign_initial_prompt(row: dict, save: bool = True) -> int | None:
     return prompt_id
 
 
-def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str) -> EmailDraft:
+def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str,
+                   deadline: float | None = None) -> EmailDraft:
     response_format = {
         "type": "json_schema",
         "json_schema": {"name": "outreach_email", "strict": True, "schema": EmailDraft.model_json_schema()},
@@ -288,9 +289,11 @@ def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str
     for _ in range(MAX_ATTEMPTS):
         payload = {**context, "validation_feedback": feedback}
         try:
-            response = client.chat.completions.create(
-                model=model,
+            response = complete(
+                client,
+                deadline,
                 timeout=LLM_TIMEOUT,
+                model=model,
                 temperature=0.7,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
                 response_format=response_format,
@@ -499,7 +502,11 @@ def run(options: dict) -> int:
                 continue
             system_prompt, email_prompt_id = resolve_prompt(row, chosen, prompts)
             try:
-                draft = generate_draft(client, model, prospect_context(row), system_prompt)
+                draft = generate_draft(client, model, prospect_context(row), system_prompt, options.get("deadline"))
+            except OutOfTime as error:
+                print(f"  Stopped: {error}.")
+                time_limit_note(len(queue) - position, "email(s)")
+                break
             except Exception as error:  # one bad prospect (bad output, API error) must not stop the run
                 failed += 1
                 print(f"  Prospect {row['prospect_id']} <{row['recipient']}> failed ({type(error).__name__}): {error}")
