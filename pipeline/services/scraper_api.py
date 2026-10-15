@@ -24,6 +24,7 @@ REQUEST_TIMEOUT = 330  # seconds; the container stops a search after 300
 MAX_PLACES_PER_SEARCH = 40  # one search must finish inside the container's 5 minutes
 DEFAULT_CONCURRENCY = 5  # the container's own default; 1-20, higher is faster but more likely to be blocked
 DEFAULT_LANG = "en"
+WEB_PLACES_PER_SEARCH = 20  # with a deadline: a search this size fits in the web app's time limit
 MIN_SEARCH_SECONDS = 60  # with a deadline: a search with less time than this is left for the next run
 KEY_REFUSED = "refused the key (MAPS_SCRAPER_KEY must equal the container's SCRAPER_API_KEY)"
 

@@ -124,9 +124,9 @@ Businesses you select are researched even if they were researched before (the ne
 1. Sidebar > **Businesses**, tick the businesses (only qualified ones are processed: a score of at least their campaign's minimum, or approved by you; rejected ones never).
 2. Action **Find decision makers (Module 3)** > **Go** > **Start run**.
 
-This opens Firefox in the background. It looks at the business's own pages first, then Google's AI answer, then DuckDuckGo. The people it finds are listed under **Contacts**, with their job title and every email address that might be theirs (for example `ali@clinic.pk`, `ali.khan@clinic.pk`).
+It reads the business's own team and about pages first, then searches the web through your SearXNG. No browser opens and there are no CAPTCHAs to solve. The people it finds are listed under **Contacts**, with their job title and every email address that might be theirs (for example `ali@clinic.pk`, `ali.khan@clinic.pk`).
 
-> **Tip:** Google sometimes shows a "consent" or CAPTCHA page. Add `--headed` to the arguments to see the Firefox window and click through it yourself. The run waits up to 5 minutes for you.
+> **Tip:** each run does as many businesses as fit in about 4 minutes, then says how many are left. Click **Run again** on the run's page to continue.
 
 ### Step 5: Verify emails
 
@@ -243,7 +243,7 @@ Useful arguments:
 |---|---|---|
 | `--dry-run` | most steps | Show what would happen, save nothing |
 | `--limit 5` | all steps | Process at most 5 items |
-| `--headed` | Fetch, Research, Find decision makers | Show the browser window |
+| `--headed` | Fetch with the built-in browser (your own machine only) | Show the browser window |
 | `--source scraper_api` | Fetch, Run full pipeline | Find businesses through the scraper container (`browser` for the built-in one); default: the campaign's lead source |
 | `--concurrency 3` | Fetch (scraper container) | Places the container opens at once (1-20, default 5; lower if Google starts blocking) |
 | `--all` | Refresh Google Maps details | Refresh every business, not only those missing details |
@@ -314,14 +314,15 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | A yellow warning on the dashboard | Add the missing setting to `.env` and restart the app |
 | A run failed | Open it under **Pipeline runs**; the last lines of the output say why |
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
-| Verify: "Cannot reach Reacher" | Docker is not running; start Docker and run again |
-| "No worker is running" | Start `python manage.py run_worker` on the machine with the browsers and Docker (only when the app runs on Vercel) |
+| Verify: "Cannot reach Reacher" | Your server's Reacher is down (`docker ps` on the server), or `REACHER_URL` is wrong |
+| Verify: "needs your server's Reacher" | Set `REACHER_URL` and `REACHER_SECRET` in Vercel (after port 25 is open on the server) |
+| A run says "Time limit reached ... start the run again" | Normal on Vercel: each run has about 4 minutes. Click **Run again**; finished work is skipped |
+| Fetch: "The built-in browser (Chromium) is not available here" | On Vercel use the scraper container: set the campaign's **Lead source** to Scraper container |
 | "past their send time ... never reported sent" | The GHL sending workflow is not published, or its webhook to `/api/ghl/email-sent/` fails (check the URL and the Custom Data key `secret`) |
 | An email shows a GoHighLevel error | Check `GHL_API_KEY`/`GHL_LOCATION_ID` and the custom fields, then click **Hand to GoHighLevel** on it |
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
 | Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
-| Find decision makers: "Google presented a CAPTCHA" | Run again later, or add `--headed` and solve it in the window. DuckDuckGo is used meanwhile |
-| Find decision makers: "Could not start Firefox" | Install Firefox and geckodriver |
+| Find decision makers: "Search failed: SearXNG ... is not reachable" | Check `SEARXNG_URL` and that the SearXNG container runs on the server; the business is retried next run |
 | Generate: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to rewrite those in review |
 | "Only emails in review can be approved" | The email was already approved, rejected or sent, perhaps by someone else |
 | A run stays "Running" after the computer restarted | Open **Pipeline runs**; it is marked Failed automatically. Run it again |

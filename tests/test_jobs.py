@@ -35,7 +35,7 @@ class ArgumentTests(TestCase):
             ("verify_emails", None, "--report /home/x/.bashrc", "cannot be set from the admin"),
             ("verify_emails", None, "--rep /tmp/x.csv", "cannot be set from the admin"),  # abbreviations too
             ("find_stakeholders", None, "--roles-file /etc/passwd", "cannot be set from the admin"),
-            ("find_stakeholders", None, "--profile /home/x/.mozilla", "cannot be set from the admin"),
+            ("find_stakeholders", None, "--profile /home/x/.mozilla", "unrecognized arguments"),  # gone with Firefox
             ("verify_emails", None, "--reacher-url http://127.0.0.1:9", "cannot be set from the admin"),
             ("verify_emails", None, "--settings evil.module", "cannot be set from the admin"),
             ("verify_emails", None, "--pythonpath /tmp", "cannot be set from the admin"),
@@ -112,6 +112,26 @@ class ExecuteTests(TestCase):
         output.write("x" * jobs.MAX_OUTPUT_CHARS + "tail")
         self.assertTrue(output.text().endswith("tail"))
         self.assertTrue(output.text().startswith("[earlier output trimmed]"))
+
+
+class OutputTests(TransactionTestCase):
+    def test_output_is_saved_while_a_browser_event_loop_runs(self):
+        """Playwright's sync API keeps an event loop running while the browser is open; a step printing then (research,
+        decision makers) must still save its output instead of failing with SynchronousOnlyOperation."""
+        import asyncio
+
+        from pipeline.services import dbthread
+
+        self.addCleanup(dbthread.close_worker_connection)
+        run = PipelineRun.objects.create(command="research_websites")
+        output = jobs.RunOutput(run.pk)
+
+        async def inside_the_browser():
+            output.write("Researching business 1\n")
+            output.save()
+
+        asyncio.run(inside_the_browser())
+        self.assertIn("Researching business 1", PipelineRun.objects.get(pk=run.pk).output)
 
 
 class BackgroundProcessTests(TransactionTestCase):

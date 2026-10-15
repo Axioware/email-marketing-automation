@@ -96,7 +96,6 @@ class AgentCallTests(unittest.TestCase):
                                                                must_score=False, system_prompt="SYS")
 
     def test_agent_that_cannot_pick_a_page_scores_from_what_it_read(self):
-        page = mock.Mock()
         extracted = {"url": "https://x.com/", "content": "Dental clinic", "links": [], "emails": []}
         scored = {"action": "SCORE", "summary": "s", "relevant_findings": [], "qualification_score": 70,
                   "qualification_reasons": ["r"], "agent_reasoning": "based on incomplete information"}
@@ -104,7 +103,7 @@ class AgentCallTests(unittest.TestCase):
                 mock.patch.object(research_business_websites, "validate_agent_response",
                                   side_effect=[research_business_websites.ResearchError("no valid URL"), scored]) as agent:
             result = research_business_websites.research_business(
-                mock.Mock(), "m", page, {"website_url": "https://x.com", "qualification_prompt": "CRITERIA"}, None)
+                mock.Mock(), "m", {"website_url": "https://x.com", "qualification_prompt": "CRITERIA"}, None)
         self.assertEqual((result["action"], result["qualification_score"], result["pages_scraped"]), ("SCORE", 70, 1))
         retry = agent.call_args_list[1]
         self.assertTrue(retry.args[3])  # must score now

@@ -19,6 +19,7 @@
 """
 import random
 import re
+import time
 from datetime import date, datetime, time as day_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -224,8 +225,8 @@ def withdraw(email: Email, client: ghl.Client | None = None) -> None:
 # ---------------------------------------------------------------- contacts
 
 
-def sync_contacts(limit: int = SYNC_BATCH) -> dict:
-    """Create GHL contacts for ready prospects that have none yet."""
+def sync_contacts(limit: int = SYNC_BATCH, deadline: float | None = None) -> dict:
+    """Create GHL contacts for ready prospects that have none yet (with a deadline, only while there is time)."""
     result = {"created": 0, "matched": 0, "failed": 0}
     pending = list(generation.ready_prospects().filter(ghl_contact_id__isnull=True)
                    .select_related("contact", "business__discovery_campaign").order_by("id")[:limit])
@@ -233,6 +234,9 @@ def sync_contacts(limit: int = SYNC_BATCH) -> dict:
         return result
     client = ghl.Client()
     for prospect in pending:
+        if deadline is not None and time.monotonic() > deadline:
+            result["left"] = result.get("left", 0) + 1
+            continue
         try:
             contact_id, new = client.upsert_contact(contact_payload(prospect))
             link_contact(prospect, contact_id)

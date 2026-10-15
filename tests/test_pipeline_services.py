@@ -101,11 +101,11 @@ class ResearchTests(TestCase):
         self.assertFalse(hasattr(research, "research_prompt"))  # the campaign prompt is used as stored
 
         researched = []
-        fake = lambda client, model, page, business, jina, on_page=None: researched.append(business) or {
+        fake = lambda client, model, business, jina, on_page=None, deadline=None: researched.append(business) or {
             "action": "SCORE", "pages_scraped": 1, "scraped_urls": [], "scraped_pages": [], "discovered_links": [],
             "emails": [], "qualification_score": 80, "qualification_reasons": ["fits"], "agent_reasoning": "ok"}
         with mock.patch.object(research, "make_llm_client", return_value=(object(), "m", "test")), \
-                mock.patch.object(research, "sync_playwright"), mock.patch.object(research, "research_business", fake):
+                mock.patch.object(research, "research_business", fake):
             result = run_command("research_websites", "--local-only")
             self.assertEqual(result.returncode, 1)  # a business was skipped
             self.assertIn(f"Business {bare.pk} (B) skipped: its campaign has no campaign prompt", result.stdout)
@@ -121,16 +121,83 @@ class ResearchTests(TestCase):
     def test_already_researched_business_explains_redo(self):
         business = make_business(make_campaign(), "Done", website_url="https://done.pk", score=70)
         with mock.patch.object(research, "make_llm_client", return_value=(mock.Mock(), "m", "groq")), \
-                mock.patch.object(research, "sync_playwright") as playwright:
+                mock.patch.object(research, "research_business") as researched:
             result = run_command("research_websites", "--business-id", business.pk)
         self.assertEqual(result.returncode, 0)
         self.assertIn("add --redo", result.stdout)
-        playwright.assert_not_called()
+        researched.assert_not_called()
 
     def test_needs_an_llm_key(self):
         result = run_command("research_websites", env={"GROQ_API_KEY": "", "GROK_API_KEY": "", "OPENAI_API_KEY": ""})
         self.assertEqual(result.returncode, 1)
         self.assertIn("GROQ_API_KEY", result.stderr)
+
+
+class ResearchPageTests(TestCase):
+    """Reading one page without a browser: its HTML over HTTP plus Jina Reader's rendered text and links."""
+
+    HTML = ('<html><body><nav><a href="/team">Our team</a></nav><p>Call us</p>'
+            '<a href="mailto:Info@Clinic.pk">mail</a><a href="https://facebook.com/clinic">fb</a></body></html>')
+
+    def setUp(self):
+        patcher = mock.patch.object(research, "is_public_http_url", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_html_and_rendered_page_are_combined(self):
+        reader = mock.Mock()
+        reader.read.return_value = {"url": "https://clinic.pk/", "title": "Home", "status": 200,
+                                    "content": "# Clinic\n\nDr. Ali Khan, owner. Write to ali@clinic.pk",
+                                    "links": [("Doctors", "https://clinic.pk/doctors/"), ("Team", "/team")]}
+        with mock.patch.object(research, "fetch_html", return_value=("https://www.clinic.pk/", self.HTML)):
+            page = research.extract_page("https://clinic.pk/", "https://clinic.pk/", reader)
+        self.assertEqual(page["url"], "https://clinic.pk/")
+        self.assertIn("Dr. Ali Khan", page["content"])  # Jina's rendered text
+        urls = [link["url"] for link in page["links"]]
+        self.assertEqual(urls, ["https://clinic.pk/team", "https://facebook.com/clinic", "https://clinic.pk/doctors"])
+        self.assertEqual([link["same_site"] for link in page["links"]], [True, False, True])
+        self.assertEqual(page["emails"], ["ali@clinic.pk", "info@clinic.pk"])
+
+    def test_either_source_is_enough(self):
+        reader = mock.Mock()
+        reader.read.side_effect = research.ResearchError("Jina Reader request failed (HTTPError).")
+        with mock.patch.object(research, "fetch_html", return_value=("https://clinic.pk/", self.HTML)):
+            page = research.extract_page("https://clinic.pk/", "https://clinic.pk/", reader)
+        self.assertIn("Call us", page["content"])  # the HTML's own text
+        reader.read.side_effect = None
+        reader.read.return_value = {"url": "https://clinic.pk/", "title": "", "status": 200, "content": "Rendered only",
+                                    "links": []}
+        with mock.patch.object(research, "fetch_html", side_effect=research.ResearchError("Page returned HTTP 403.")):
+            self.assertEqual(research.extract_page("https://clinic.pk/", "https://clinic.pk/", reader)["content"],
+                             "Rendered only")  # a site that blocks plain requests
+        reader.read.side_effect = research.ResearchError("Jina Reader request failed (URLError).")
+        with mock.patch.object(research, "fetch_html", side_effect=research.ResearchError("Page returned HTTP 403.")), \
+                self.assertRaisesRegex(research.ResearchError, "HTTP 403"):
+            research.extract_page("https://clinic.pk/", "https://clinic.pk/", reader)
+
+    def test_redirect_off_the_site_and_missing_pages_are_refused(self):
+        with mock.patch.object(research, "fetch_html", return_value=("https://parked.example/", self.HTML)), \
+                self.assertRaisesRegex(research.ResearchError, "outside the business website"):
+            research.extract_page("https://clinic.pk/", "https://clinic.pk/", None)
+        reader = mock.Mock()
+        reader.read.return_value = {"url": "https://clinic.pk/x", "title": "", "status": 404, "content": "Not found",
+                                    "links": []}
+        with mock.patch.object(research, "fetch_html", side_effect=research.ResearchError("Page returned HTTP 404.")), \
+                self.assertRaisesRegex(research.ResearchError, "HTTP 404"):
+            research.extract_page("https://clinic.pk/x", "https://clinic.pk/", reader)
+
+    def test_out_of_time_scores_from_what_was_read(self):
+        page = {"url": "https://clinic.pk/", "content": "Dental clinic", "links": [], "emails": []}
+        scored = {"action": "SCORE", "summary": "s", "relevant_findings": [], "qualification_score": 55,
+                  "qualification_reasons": ["r"], "agent_reasoning": "x"}
+        import time
+
+        with mock.patch.object(research, "extract_page", return_value=page), \
+                mock.patch.object(research, "validate_agent_response", return_value=scored) as agent:
+            research.research_business(mock.Mock(), "m", {"website_url": "https://clinic.pk", "qualification_prompt": "C"},
+                                       None, deadline=time.monotonic() + 10)
+        self.assertTrue(agent.call_args.args[3])  # must score now
+        self.assertEqual(agent.call_args.kwargs["score_note"], research.TIME_LIMIT_NOTE)
 
 
 class StakeholderTests(TestCase):
@@ -175,26 +242,85 @@ class StakeholderTests(TestCase):
         self.assertTrue(contact.candidate_emails)
 
 
+def jina_page(url, content="", title="Page", status=200, links=()):
+    return {"url": url, "title": title, "content": content, "links": list(links), "status": status}
+
+
 class CrawlSafetyTests(TestCase):
+    def setUp(self):
+        self.roles = stakeholders.load_role_config(stakeholders.DEFAULT_ROLES_FILE)
+
     def test_site_pages_on_private_addresses_are_never_opened(self):
-        driver = mock.Mock()
+        reader = mock.Mock()
         business = {"website_url": "http://127.0.0.1:8000", "scraped_pages": [], "discovered_links": []}
         evidence = stakeholders.Evidence("Clinic", ["127.0.0.1"])
-        roles = stakeholders.load_role_config(stakeholders.DEFAULT_ROLES_FILE)
-        with mock.patch.object(stakeholders.time, "sleep"):
-            self.assertEqual(stakeholders.crawl_site(driver, business, evidence, roles, 6), 0)
-        driver.get.assert_not_called()
+        self.assertEqual(stakeholders.crawl_site(reader, business, evidence, self.roles, 6), 0)
+        reader.read.assert_not_called()
 
     def test_redirect_to_a_private_address_is_not_read(self):
-        driver = mock.Mock()
-        driver.current_url = "http://169.254.169.254/latest/meta-data"
+        reader = mock.Mock()
+        reader.read.return_value = jina_page("http://169.254.169.254/latest/meta-data", "Dr. Ali Khan, owner. " * 10)
         business = {"website_url": "https://example.com", "scraped_pages": [], "discovered_links": []}
         evidence = stakeholders.Evidence("Clinic", ["example.com"])
-        roles = stakeholders.load_role_config(stakeholders.DEFAULT_ROLES_FILE)
-        with mock.patch.object(stakeholders.time, "sleep"), \
-                mock.patch.object(stakeholders, "is_public_http_url", side_effect=lambda u: "169.254" not in u):
-            self.assertEqual(stakeholders.crawl_site(driver, business, evidence, roles, 2), 0)
-        driver.find_element.assert_not_called()
+        with mock.patch.object(stakeholders, "is_public_http_url", side_effect=lambda u: "169.254" not in u):
+            self.assertEqual(stakeholders.crawl_site(reader, business, evidence, self.roles, 2), 0)
+        self.assertEqual(evidence.people, {})
+
+    def test_team_page_names_mailto_and_linkedin(self):
+        reader = mock.Mock()
+        reader.read.return_value = jina_page(
+            "https://example.com/team", "## Our team\n\nDr. Kashif Jamal is the founder and owner of the clinic. " * 3,
+            links=[("Email", "mailto:kashif@example.com"), ("LinkedIn", "https://pk.linkedin.com/in/kashif-jamal")])
+        business = {"website_url": "https://example.com", "scraped_pages": [], "discovered_links": []}
+        evidence = stakeholders.Evidence("Example Clinic", ["example.com"])
+        self.assertEqual(stakeholders.crawl_site(reader, business, evidence, self.roles, 1), 1)
+        self.assertTrue(evidence.has_target())
+        self.assertIn("kashif@example.com", evidence.emails)
+        self.assertIn("https://www.linkedin.com/in/kashif-jamal", evidence.linkedin.values())
+
+    def test_missing_pages_and_reader_errors_are_skipped(self):
+        reader = mock.Mock()
+        reader.read.side_effect = [jina_page("https://example.com/", "x" * 200, status=404),
+                                   research.ResearchError("Jina Reader request failed (HTTPError).")]
+        business = {"website_url": "https://example.com", "scraped_pages": [], "discovered_links": []}
+        evidence = stakeholders.Evidence("Clinic", ["example.com"])
+        self.assertEqual(stakeholders.crawl_site(reader, business, evidence, self.roles, 2), 0)
+
+
+class SearchTests(TestCase):
+    def setUp(self):
+        self.roles = stakeholders.load_role_config(stakeholders.DEFAULT_ROLES_FILE)
+
+    def test_snippets_that_mention_the_business_give_people(self):
+        results = [
+            {"url": "https://fellows.ted.com/fellows/1", "title": "Awab Alvi - TED Fellows", "engine": "google cse",
+             "content": "Dentist. Organization. Alvi Dental Hospital. He is the founder of Alvi Dental Hospital."},
+            {"url": "https://pk.linkedin.com/in/awabalvi", "title": "Awab Alvi - Orthodontist - LinkedIn",
+             "engine": "google cse", "content": "Owner. Alvi Dental Hospital. Jan 1999 - Present."},
+            {"url": "https://other.example/x", "title": "Unrelated", "engine": "bing",
+             "content": "Dr. Sara Malik is the owner of Smile Studio Lahore."},
+        ]
+        evidence = stakeholders.Evidence("Alvi Dental Hospital", ["alvidental.com"])
+        with mock.patch.object(stakeholders.searxng, "search", return_value=results):
+            self.assertTrue(stakeholders.run_search('"Alvi Dental Hospital" owner', evidence, self.roles))
+        names = {person["name"] for person in evidence.people.values()}
+        self.assertIn("Awab Alvi", names)
+        self.assertNotIn("Sara Malik", names)  # the snippet is about another business
+        self.assertIn("https://www.linkedin.com/in/awabalvi", evidence.linkedin.values())
+
+    def test_branch_suffixes_are_left_out_of_searches(self):
+        for name, expected in (("Alvi Dental Hospital — SMCHS", "Alvi Dental Hospital"),
+                               ("Smile Studio | DHA Phase 6", "Smile Studio"), ("City Dental (Gulberg)", "City Dental"),
+                               ("Dental Care - Lahore", "Dental Care"), ("Kashif Dental Clinic", "Kashif Dental Clinic")):
+            self.assertEqual(stakeholders.search_name(name), expected)
+        queries = stakeholders.build_queries({"name": "Alvi Dental Hospital — SMCHS", "city": "Karachi"})
+        self.assertEqual(queries[1], '"Alvi Dental Hospital" owner')
+
+    def test_unreachable_search_is_reported_not_raised(self):
+        evidence = stakeholders.Evidence("Clinic", ["example.com"])
+        with mock.patch.object(stakeholders.searxng, "search",
+                               side_effect=stakeholders.searxng.SearchUnavailable("SearXNG is not reachable")):
+            self.assertFalse(stakeholders.run_search("q", evidence, self.roles))
 
 
 class NavigationRetryTests(TestCase):
@@ -212,17 +338,13 @@ class NavigationRetryTests(TestCase):
         self.assertIsNone(maps.browser_hint(maps.PlaywrightError("Timeout 60000ms exceeded")))
 
     def test_a_page_reached_twice_through_redirects_is_read_once(self):
-        driver = mock.Mock()
-        driver.current_url = "https://example.com/about-us/"  # every path redirects here
-        driver.find_element.return_value.text = "About our clinic. " * 20
-        driver.title = "About"
-        driver.find_elements.return_value = []
+        reader = mock.Mock()
+        reader.read.return_value = jina_page("https://example.com/about-us/", "About our clinic. " * 20, "About")
         business = {"website_url": "https://example.com", "scraped_pages": [], "discovered_links": []}
         evidence = stakeholders.Evidence("Clinic", ["example.com"])
         roles = stakeholders.load_role_config(stakeholders.DEFAULT_ROLES_FILE)
-        with mock.patch.object(stakeholders.time, "sleep"), mock.patch.object(stakeholders, "linkedin_hrefs", return_value=[]):
-            self.assertEqual(stakeholders.crawl_site(driver, business, evidence, roles, 4), 1)
-        self.assertEqual(driver.get.call_count, 4)
+        self.assertEqual(stakeholders.crawl_site(reader, business, evidence, roles, 4), 1)
+        self.assertEqual(reader.read.call_count, 4)
 
 
 class PlaywrightDatabaseTests(TransactionTestCase):

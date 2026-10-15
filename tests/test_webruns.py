@@ -67,51 +67,73 @@ class FakeScraper:
 
 @override_settings(ON_VERCEL=True)
 class RoutingTests(TestCase):
-    def start(self, command, arguments, env):
-        with mock.patch.dict(os.environ, env), mock.patch.object(webruns, "execute") as execute, \
+    def start(self, command, arguments, env=None):
+        with mock.patch.dict(os.environ, {**VERCEL, **(env or {})}), mock.patch.object(webruns, "execute") as execute, \
                 mock.patch.object(jobs, "launch") as launch, self.captureOnCommitCallbacks(execute=True):
             run = jobs.start_run(command, arguments)
         run.refresh_from_db()
         return run, execute, launch
 
-    def test_verification_against_your_server_runs_in_the_request(self):
-        run, execute, launch = self.start("verify_emails", [], {**VERCEL, **REMOTE_REACHER})
-        self.assertEqual(run.runs_on, "web")
-        execute.assert_called_once_with(run.pk)
-        launch.assert_not_called()
-
-    def test_scraper_fetch_against_your_server_runs_in_the_request(self):
+    def test_on_vercel_every_run_executes_in_its_request(self):
         campaign = make_campaign(lead_source="scraper_api")
-        run, execute, _ = self.start("fetch_businesses", ["--campaign-id", campaign.pk, "--limit", "5"],
-                                     {**VERCEL, **REMOTE_SCRAPER})
-        self.assertEqual(run.runs_on, "web")
-        execute.assert_called_once()
-        run, execute, _ = self.start("fetch_businesses", ["--campaign-id", campaign.pk, "--limit", "5", "--source",
-                                                          "browser"], {**VERCEL, **REMOTE_SCRAPER})
-        self.assertEqual(run.runs_on, "worker")  # the built-in browser needs the worker
-        execute.assert_not_called()
-
-    def test_everything_else_goes_to_the_worker(self):
-        campaign = make_campaign(lead_source="scraper_api")
-        cases = [
-            ("verify_emails", [], {**VERCEL, "REACHER_URL": "http://127.0.0.1:8080", "REACHER_SECRET": "s"}),
-            ("verify_emails", [], {**VERCEL, "REACHER_URL": REMOTE_REACHER["REACHER_URL"], "REACHER_SECRET": ""}),
-            ("fetch_businesses", ["--campaign-id", campaign.pk, "--limit", "5"],
-             {**VERCEL, "MAPS_SCRAPER_URL": "http://127.0.0.1:8001", "MAPS_SCRAPER_KEY": "k"}),
-            ("fetch_businesses", ["--campaign-id", campaign.pk, "--limit", "5"],
-             {**VERCEL, "MAPS_SCRAPER_URL": REMOTE_SCRAPER["MAPS_SCRAPER_URL"], "MAPS_SCRAPER_KEY": ""}),
-            ("research_websites", [], {**VERCEL, **REMOTE_REACHER, **REMOTE_SCRAPER}),
-        ]
-        for command, arguments, env in cases:
-            run, execute, _ = self.start(command, arguments, env)
-            self.assertEqual(run.runs_on, "worker", (command, env))
-            execute.assert_not_called()
+        for command, arguments in (("verify_emails", []), ("research_websites", []), ("find_stakeholders", []),
+                                   ("generate_emails", []), ("generate_followups", []), ("ghl_sync", []),
+                                   ("fetch_businesses", ["--campaign-id", campaign.pk, "--limit", "5"]),
+                                   ("run_pipeline", ["--campaign-id", campaign.pk])):
+            run, execute, launch = self.start(command, arguments)
+            self.assertEqual(run.runs_on, "web", command)
+            execute.assert_called_once_with(run.pk)
+            launch.assert_not_called()  # nothing runs anywhere else
 
     @override_settings(ON_VERCEL=False)
-    def test_off_vercel_nothing_runs_in_the_request(self):
-        run, execute, _ = self.start("verify_emails", [], {**VERCEL, **REMOTE_REACHER})
+    def test_off_vercel_runs_go_to_a_process_or_the_worker(self):
+        run, execute, _ = self.start("verify_emails", [], REMOTE_REACHER)
         self.assertEqual(run.runs_on, "worker")
         execute.assert_not_called()
+
+
+@override_settings(ON_VERCEL=True)
+class RefusalTests(TestCase):
+    """What needs something the web app does not have fails at once, saying why."""
+
+    def run_it(self, command, arguments, env=None):
+        run = PipelineRun.objects.create(command=command, arguments=[str(a) for a in arguments], runs_on="web")
+        with mock.patch.dict(os.environ, {"REACHER_URL": "", "REACHER_SECRET": "", **(env or {})}):
+            webruns.execute(run.pk)
+        run.refresh_from_db()
+        return run
+
+    def test_browser_and_local_reacher_steps(self):
+        run = self.run_it("refresh_businesses", [])
+        self.assertEqual(run.status, "failed")
+        self.assertIn("needs the built-in browser", run.output)
+        run = self.run_it("verify_emails", [], {"REACHER_URL": "http://127.0.0.1:8080", "REACHER_SECRET": "s"})
+        self.assertIn("needs your server's Reacher", run.output)
+        campaign = make_campaign(lead_source="browser", target_country="Pakistan", search_terms=["dentist"],
+                                 target_locations=["Lahore"])
+        with mock.patch("pipeline.services.maps.sync_playwright", None):
+            run = self.run_it("fetch_businesses", ["--campaign-id", campaign.pk, "--limit", "2"])
+        self.assertEqual(run.status, "failed")
+        self.assertIn("built-in browser (Chromium) is not available here", run.output)
+
+    def test_pipeline_and_ai_steps_stop_at_the_deadline(self):
+        campaign = make_campaign()
+        make_business(campaign, "Clinic", website_url="https://clinic.pk")
+        run = PipelineRun.objects.create(command="run_pipeline", runs_on="web",
+                                         arguments=["--campaign-id", str(campaign.pk), "--fetch-limit", "0"])
+        webruns.execute(run.pk, time_limit=1)
+        run.refresh_from_db()
+        self.assertEqual(run.status, "succeeded", run.output)
+        self.assertIn("Time limit reached before step 1", run.output)
+        from django.core.management import call_command
+        from pipeline.services import generation
+
+        rows = [{"prospect_id": 1}, {"prospect_id": 2}]
+        with mock.patch.object(generation, "make_llm_client", return_value=(mock.Mock(), "m", "groq")), \
+                mock.patch.object(generation, "load_prospects", return_value=rows), \
+                mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
+            call_command("generate_emails", deadline=time.monotonic())
+        self.assertIn("Time limit reached: 2 email(s) not done yet", out.getvalue())
 
 
 @override_settings(ON_VERCEL=True, AUTH_TOKEN=TOKEN)
@@ -130,7 +152,7 @@ class DirectRunTests(TransactionTestCase):
         env = {**VERCEL, "MAPS_SCRAPER_URL": self.scraper.url, "MAPS_SCRAPER_KEY": "k3y",
                "REACHER_URL": self.reacher.url, "REACHER_SECRET": "s3cret", "VERIFY_MAIL_FROM": "", "VERIFY_HELO": ""}
         patchers = [mock.patch.dict(os.environ, env),
-                    mock.patch.object(webruns, "web_capable", return_value=True)]  # fakes run on 127.0.0.1
+                    mock.patch.object(webruns, "refusal", return_value=None)]  # the fake Reacher runs on 127.0.0.1
         for patcher in patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -143,7 +165,7 @@ class DirectRunTests(TransactionTestCase):
         response = self.post_run("fetch_businesses", {"campaign_id": self.campaign.pk, "limit": 2})
         run = response.json()
         self.assertEqual((run["status"], run["runs_on"]), ("succeeded", "web"), run["output"])
-        self.assertIn("calling your server directly", run["output"])
+        self.assertIn("Runs on the web app", run["output"])
         self.assertIn("Stored 2 businesses", run["output"])
         self.assertEqual(Business.objects.filter(discovery_campaign=self.campaign).count(), 2)
         self.assertEqual(self.scraper.requests[0]["max_places"], "2")
@@ -151,7 +173,9 @@ class DirectRunTests(TransactionTestCase):
 
     def test_a_search_asks_for_at_most_search_places(self):
         self.post_run("fetch_businesses", {"campaign_id": self.campaign.pk, "limit": 100})
-        self.assertEqual(int(self.scraper.requests[0]["max_places"]), webruns.SEARCH_PLACES)
+        from pipeline.services import scraper_api
+
+        self.assertEqual(int(self.scraper.requests[0]["max_places"]), scraper_api.WEB_PLACES_PER_SEARCH)
 
     def test_fetch_stops_at_the_time_limit(self):
         self.scraper.seconds = 0.3
@@ -184,11 +208,11 @@ class DirectRunTests(TransactionTestCase):
         campaign = make_campaign()
         make_contact(make_business(campaign, "A"), "good@a.org", ["grey@a.org"])
         make_contact(make_business(campaign, "B"), "bad@b.org")
-        run = self.post_run("verify_emails", {"delay": 0}).json()
+        run = self.post_run("verify_emails", {"delay": 0, "no_auto_start": True}).json()
         self.assertEqual(run["status"], "succeeded", run["output"])
         self.assertEqual(sorted(self.reacher.calls), ["bad@b.org", "good@a.org", "grey@a.org"])
         self.assertEqual(Prospect.objects.get(email="good@a.org").email_status, "deliverable")
-        again = self.post_run("verify_emails", {"delay": 0}).json()
+        again = self.post_run("verify_emails", {"delay": 0, "no_auto_start": True}).json()
         self.assertEqual(again["status"], "succeeded", again["output"])
         self.assertEqual(len(self.reacher.calls), 3)  # unknown (grey) is not checked again; --recheck does that
 
@@ -198,20 +222,21 @@ class DirectRunTests(TransactionTestCase):
             make_contact(make_business(campaign, f"B{index}"), email)
         self.reacher.delays = {"good": 0.3, "bad": 0.3, "good2": 0.3}
         run = PipelineRun.objects.create(command="verify_emails", runs_on="web",
-                                         arguments=["--delay", "0", "--reacher-timeout", "0.1"])
+                                         arguments=["--delay", "0", "--reacher-timeout", "0.1", "--no-auto-start"])
         webruns.execute(run.pk, time_limit=0.15)  # new checks start only in the first 0.05 s
         run.refresh_from_db()
         self.assertEqual(run.status, "succeeded", run.output)
         self.assertEqual(len(self.reacher.calls), 1)
         self.assertIn("Time limit reached: 2 contact(s) not finished; start the run again", run.output)
-        rest = PipelineRun.objects.create(command="verify_emails", runs_on="web", arguments=["--delay", "0"])
+        rest = PipelineRun.objects.create(command="verify_emails", runs_on="web",
+                                          arguments=["--delay", "0", "--no-auto-start"])
         webruns.execute(rest.pk)
         self.assertEqual(sorted(self.reacher.calls), ["bad@b.org", "good2@c.org", "good@a.org"])
 
     def test_wrong_reacher_key_fails_the_run(self):
         self.reacher.secret = "other"
         make_contact(make_business(make_campaign(), "A"), "good@a.org")
-        run = self.post_run("verify_emails", {"delay": 0}).json()
+        run = self.post_run("verify_emails", {"delay": 0, "no_auto_start": True}).json()
         self.assertEqual(run["status"], "failed")
         self.assertIn("refused the key", run["output"])
         self.assertEqual(self.reacher.calls, [])
@@ -228,7 +253,7 @@ class DirectRunTests(TransactionTestCase):
         launch.assert_not_called()  # never a process on Vercel
 
     def test_a_run_executes_once(self):
-        run = PipelineRun.objects.create(command="verify_emails", runs_on="web", arguments=["--delay", "0"])
+        run = PipelineRun.objects.create(command="verify_emails", runs_on="web", arguments=["--delay", "0", "--no-auto-start"])
         webruns.execute(run.pk)
         output = PipelineRun.objects.get(pk=run.pk).output
         webruns.execute(run.pk)

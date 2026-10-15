@@ -1,5 +1,8 @@
 """Module 2: an LLM agent reads each business's website (at most five pages) and scores it for outreach.
 
+Pages are read over plain HTTP plus Jina Reader (which renders them in its own browser), so no browser runs here and
+the step runs on the web app (Vercel) as well.
+
 The model's instructions are the campaign prompt of the business's campaign, exactly as stored (campaign_prompts
 table, edited in the admin); nothing is added to it. The app only fixes the shape of each answer: AgentResponse, sent
 as a strict JSON schema whose field descriptions say how to read another page, score, or stop. A business whose
@@ -7,29 +10,32 @@ campaign has no campaign prompt is not researched."""
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
 import time
 from collections import deque
+from datetime import timedelta
 from decimal import Decimal
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from django.core.management.base import CommandError
 from django.db.models import F, Q
+from django.utils import timezone
 from openai import OpenAI
 
-# Worker-only libraries (requirements-worker.txt): the web app on Vercel imports this module without them.
-try:
-    import trafilatura
-    from bs4 import BeautifulSoup
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    trafilatura = BeautifulSoup = sync_playwright = None
+from bs4 import BeautifulSoup
 
+try:  # better text extraction when Jina Reader is not used (requirements-worker.txt); plain page text otherwise
+    import trafilatura
+except ImportError:
+    trafilatura = None
+
+from pipeline.management.base import out_of_time, time_limit_note
 from pipeline.models import Business, BusinessWebsiteProfile
 from pipeline.services.llm import make_llm_client, rejected_output
 from pipeline.services.dbthread import outside_event_loop
@@ -46,8 +52,23 @@ MAX_PROMPT_LINKS = 50
 MAX_COMPLETION_TOKENS = 2500  # the decision is short; Groq counts this budget against the per-minute limit
 MAX_PROMPT_LINK_TEXT = 80
 PRIVATE_CONTEXT_KEYS = {"visited_identities", "current_page_links", "previously_discovered_links"}  # validation only
-JINA_REQUESTS_PER_MINUTE = 20
+JINA_REQUESTS_PER_MINUTE = 20  # Jina Reader's free limit without a key; with JINA_API_KEY it allows more
+JINA_KEYED_REQUESTS_PER_MINUTE = 200
 JINA_RATE_WINDOW_SECONDS = 60
+JINA_TIMEOUT = 30
+PAGE_TIMEOUT = 15
+MAX_HTML_BYTES = 3_000_000
+LLM_TIMEOUT = 60
+# With a deadline (the web app on Vercel): a business starts only with this much time left, and the agent is asked
+# to score from what it read once less than PAGE_RESERVE_SECONDS are left (another page plus a decision).
+BUSINESS_RESERVE_SECONDS = 150
+PAGE_RESERVE_SECONDS = 100
+TIME_LIMIT_NOTE = "the run's time limit was reached"
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en",
+}
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 class AgentResponse(BaseModel):
@@ -99,7 +120,8 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self.request_times = deque()
 
-    def acquire(self) -> None:
+    def acquire(self, max_wait: float | None = None) -> None:
+        """Wait for a free slot; with `max_wait`, give up (ResearchError) instead of waiting longer than that."""
         while True:
             now = time.monotonic()
             while self.request_times and now - self.request_times[0] >= self.window_seconds:
@@ -108,33 +130,67 @@ class SlidingWindowRateLimiter:
                 self.request_times.append(now)
                 return
             wait_seconds = self.window_seconds - (now - self.request_times[0])
+            if max_wait is not None and wait_seconds > max_wait:
+                raise ResearchError("Jina Reader's per-minute limit is used up")
             time.sleep(max(0, wait_seconds))
 
 
 class JinaReader:
-    def __init__(self):
+    """Jina Reader (r.jina.ai) opens a page in its own browser and returns the rendered text, the final URL and the
+    page's links, so no browser runs here. JINA_API_KEY (optional) raises its rate limit."""
+
+    def __init__(self, max_wait: float | None = None):
+        self.key = os.environ.get("JINA_API_KEY", "").strip()
         self.rate_limiter = SlidingWindowRateLimiter(
-            JINA_REQUESTS_PER_MINUTE,
+            JINA_KEYED_REQUESTS_PER_MINUTE if self.key else JINA_REQUESTS_PER_MINUTE,
             JINA_RATE_WINDOW_SECONDS,
         )
+        self.max_wait = max_wait  # with a deadline: never wait out the rate limit past it
 
-    def extract(self, url: str) -> str:
-        self.rate_limiter.acquire()
-        request = Request(
-            f"https://r.jina.ai/{url}",
-            headers={
-                "Accept": "text/plain",
-                "X-Return-Format": "markdown",
-            },
-        )
+    def read(self, url: str) -> dict:
+        """{url (after redirects), title, content (markdown), links [(text, url)], status (the page's HTTP status)}."""
+        self.rate_limiter.acquire(self.max_wait)
+        headers = {"Accept": "application/json", "X-With-Links-Summary": "true", "User-Agent": "outreach-app"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
         try:
-            with urlopen(request, timeout=60) as response:
-                content = response.read().decode("utf-8", errors="replace").strip()
-        except (HTTPError, URLError, TimeoutError) as error:
+            with urlopen(Request(f"https://r.jina.ai/{url}", headers=headers), timeout=JINA_TIMEOUT) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (HTTPError, URLError, OSError, ValueError) as error:
             raise ResearchError(f"Jina Reader request failed ({type(error).__name__}).") from error
+        data = payload.get("data") if isinstance(payload, dict) else None
+        content = ((data or {}).get("content") or "").strip()
         if not content:
             raise ResearchError("Jina Reader returned no readable content.")
-        return content[:MAX_CONTENT_CHARS]
+        links = data.get("links") or {}
+        pairs = (list(links.items()) if isinstance(links, dict) else
+                 [(item.get("text") or "", item.get("url") or "") for item in links if isinstance(item, dict)])
+        return {"url": data.get("url") or url, "title": data.get("title") or "", "content": content[:MAX_CONTENT_CHARS],
+                "links": [(str(text or ""), str(href)) for text, href in pairs if href],
+                "status": data.get("httpStatus") if isinstance(data.get("httpStatus"), int) else None}
+
+
+class PublicRedirects(HTTPRedirectHandler):
+    """Follow a page's redirects only to public addresses (a website must not point us at this machine)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_public_http_url(newurl):
+            raise ResearchError("Page redirected to a non-public address.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_html(url: str, timeout: float = PAGE_TIMEOUT) -> tuple[str, str]:
+    """(final URL, HTML) of a public web page."""
+    try:
+        with build_opener(PublicRedirects).open(Request(url, headers=BROWSER_HEADERS), timeout=timeout) as response:
+            if "html" not in (response.headers.get("Content-Type") or "html").casefold():
+                raise ResearchError("The page is not HTML.")
+            raw = response.read(MAX_HTML_BYTES)
+            return response.geturl(), raw.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+    except HTTPError as error:
+        raise ResearchError(f"Page returned HTTP {error.code}.") from error
+    except (URLError, OSError, ValueError) as error:
+        raise ResearchError(f"Page could not be loaded ({type(error).__name__}).") from error
 
 
 def normalize_url(value: str, base_url: str | None = None) -> str | None:
@@ -206,64 +262,67 @@ def is_same_site(url: str, homepage_url: str) -> bool:
     return bool(home_host and (target_host == home_host or target_host.endswith(f".{home_host}")))
 
 
-def extract_page(page, requested_url: str, homepage_url: str, jina_reader: JinaReader | None) -> dict:
+def extract_page(requested_url: str, homepage_url: str, jina_reader: JinaReader | None) -> dict:
+    """Read one page of the business's website: its HTML (links, emails) over plain HTTP, and its rendered text and
+    links through Jina Reader (pages built by JavaScript included). Either one is enough."""
     if not is_public_http_url(requested_url):
         raise ResearchError("Refusing to fetch a non-public or unsupported URL.")
-    response = page.goto(requested_url, wait_until="domcontentloaded", timeout=30000)
-    if response is not None and response.status >= 400:
-        raise ResearchError(f"Page returned HTTP {response.status}.")
-
-    current_url = normalize_url(page.url)
-    if not current_url or not is_same_site(current_url, homepage_url):
+    html = current_url = rendered = fetch_error = None
+    try:
+        final_url, html = fetch_html(requested_url)
+        current_url = normalize_url(final_url)
+    except ResearchError as error:
+        fetch_error = error
+    if jina_reader:
+        try:
+            rendered = jina_reader.read(current_url or requested_url)
+        except ResearchError as error:
+            print(f"Jina extraction unavailable; using the page's HTML ({error}).")
+    if rendered and rendered["status"] and rendered["status"] >= 400:
+        raise ResearchError(f"Page returned HTTP {rendered['status']}.")
+    if html is None and rendered is None:
+        raise fetch_error or ResearchError("The page could not be read.")
+    current_url = current_url or normalize_url(rendered["url"]) or requested_url
+    if not current_url or not is_same_site(current_url, homepage_url) or not is_public_http_url(current_url):
         raise ResearchError("Page redirected outside the business website.")
 
-    html = page.content()
-    soup = BeautifulSoup(html, "html.parser")
-    visible_text = soup.get_text(" ", strip=True)
-    emails = {address.casefold() for address in EMAIL_PATTERN.findall(visible_text)}
+    emails = set()
     links = []
     seen_links = set()
-    for anchor in soup.select("a[href]"):
-        href = anchor.get("href", "").strip()
+
+    def add_link(href: str, text: str) -> None:
+        href = (href or "").strip()
         if href.casefold().startswith("mailto:"):
             emails.update(address.casefold() for address in EMAIL_PATTERN.findall(href[7:]))
-            continue
+            return
         link_url = normalize_url(href, current_url)
         identity = url_identity(link_url) if link_url else None
         if not link_url or not identity or identity in seen_links:
-            continue
+            return
         seen_links.add(identity)
-        links.append(
-            {
-                "url": link_url,
-                "text": " ".join(anchor.get_text(" ", strip=True).split()),
-                "same_site": is_same_site(link_url, homepage_url),
-            }
-        )
+        links.append({"url": link_url, "text": " ".join((text or "").split()),
+                      "same_site": is_same_site(link_url, homepage_url)})
 
-    content = None
-    if jina_reader:
-        try:
-            content = jina_reader.extract(current_url)
-        except ResearchError as error:
-            print(f"Jina extraction unavailable; using local extraction ({error}).")
-    if not content:
+    soup = BeautifulSoup(html, "html.parser") if html else None
+    if soup is not None:
+        emails.update(address.casefold() for address in EMAIL_PATTERN.findall(soup.get_text(" ", strip=True)))
+        for anchor in soup.select("a[href]"):
+            add_link(anchor.get("href", ""), anchor.get_text(" ", strip=True))
+    for text, href in (rendered or {}).get("links", []):
+        add_link(href, text)
+
+    content = rendered["content"] if rendered else None
+    if not content and soup is not None:
         for element in soup.select(
             "script, style, noscript, svg, nav, header, footer, aside, form, "
             "[role='navigation'], [role='banner'], [role='contentinfo']"
         ):
             element.decompose()
-
-        content = trafilatura.extract(
-            str(soup),
-            include_comments=False,
-            include_tables=True,
-            include_links=False,
-            output_format="txt",
-        )
-    if not content:
-        content = soup.get_text("\n", strip=True)
-    content = "\n".join(line.strip() for line in content.splitlines() if line.strip())
+        if trafilatura is not None:
+            content = trafilatura.extract(str(soup), include_comments=False, include_tables=True, include_links=False,
+                                          output_format="txt")
+        content = content or soup.get_text("\n", strip=True)
+    content = "\n".join(line.strip() for line in (content or "").splitlines() if line.strip())
     content = content[:MAX_CONTENT_CHARS]
     emails.update(address.casefold() for address in EMAIL_PATTERN.findall(content))
     return {
@@ -272,15 +331,6 @@ def extract_page(page, requested_url: str, homepage_url: str, jina_reader: JinaR
         "links": links[:MAX_PAGE_LINKS],
         "emails": sorted(emails),
     }
-
-
-def guard_navigation(route, homepage_url: str) -> None:
-    if route.request.is_navigation_request():
-        target = normalize_url(route.request.url)
-        if not target or not is_same_site(target, homepage_url) or not is_public_http_url(target):
-            route.abort()
-            return
-    route.continue_()
 
 
 def prompt_context(context: dict) -> dict:
@@ -328,6 +378,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
         try:
             response = client.chat.completions.create(
                 model=model,
+                timeout=LLM_TIMEOUT,
                 temperature=0.2,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
                 response_format=response_format,
@@ -438,10 +489,10 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
 def research_business(
     client: OpenAI,
     model: str,
-    page,
     business: dict,
     jina_reader: JinaReader | None,
     on_page=None,
+    deadline: float | None = None,
 ) -> dict:
     homepage = normalize_url(business.get("website_url") or "")
     if not homepage or not is_public_http_url(homepage):
@@ -453,7 +504,6 @@ def research_business(
     visited_urls = set()
     visited_identities = set()
     next_url = homepage
-    page.route("**/*", lambda route: guard_navigation(route, homepage))
     system_prompt = business["qualification_prompt"].strip()  # the campaign prompt, exactly as stored
     business = {key: value for key, value in business.items() if key != "qualification_prompt"}  # already in it
 
@@ -465,7 +515,7 @@ def research_business(
         if not is_same_site(requested, homepage) or not is_public_http_url(requested):
             raise ResearchError("Requested page is not a public URL on the business website.")
 
-        result = extract_page(page, requested, homepage, jina_reader)
+        result = extract_page(requested, homepage, jina_reader)
         final_identity = url_identity(result["url"])
         if not final_identity or final_identity in visited_identities:
             raise ResearchError("Page redirected to a URL already scraped.")
@@ -521,9 +571,11 @@ def research_business(
             "visited_urls": sorted(visited_urls),
             "visited_identities": list(visited_identities),
         }
-        must_score = len(pages) >= MAX_PAGES_PER_BUSINESS
+        out_of_time_now = out_of_time({"deadline": deadline}, PAGE_RESERVE_SECONDS)
+        must_score = len(pages) >= MAX_PAGES_PER_BUSINESS or out_of_time_now
+        note = TIME_LIMIT_NOTE if out_of_time_now and len(pages) < MAX_PAGES_PER_BUSINESS else PAGE_LIMIT_NOTE
         try:
-            decision = validate_agent_response(client, model, context, must_score, system_prompt)
+            decision = validate_agent_response(client, model, context, must_score, system_prompt, score_note=note)
         except ResearchError:
             if must_score:
                 raise
@@ -589,14 +641,20 @@ BUSINESS_FIELDS = (
 )
 
 
+ABANDONED_AFTER = timedelta(minutes=30)  # a research takes a few minutes (at most five pages)
+
+
 def load_businesses(limit: int | None, business_ids: list[int] | None, retry_failed: bool = False,
                     redo: bool = False) -> list[dict]:
     eligible_statuses = ("pending", "failed") if retry_failed else ("pending",)
     queryset = Business.objects.filter(website_url__isnull=False).exclude(website_url="").order_by("id")
+    # "running" for longer than a research can take: the process doing it died (crash, restart); research it again
+    abandoned = Q(website_profile__status="running", website_profile__updated_at__lt=timezone.now() - ABANDONED_AFTER)
     if not redo:
-        queryset = queryset.filter(Q(website_profile__isnull=True) | Q(website_profile__status__in=eligible_statuses))
+        queryset = queryset.filter(Q(website_profile__isnull=True) | Q(website_profile__status__in=eligible_statuses)
+                                   | abandoned)
     else:  # everything except a research that is running right now
-        queryset = queryset.exclude(website_profile__status="running")
+        queryset = queryset.exclude(Q(website_profile__status="running") & ~abandoned)
     if business_ids:
         queryset = queryset.filter(id__in=business_ids)
     if limit is not None:
@@ -629,7 +687,6 @@ def fail_profile(profile_id: int, error: Exception) -> None:
 def add_arguments(parser) -> None:
     parser.add_argument("--business-id", type=int, action="append", help="Research this business only (repeatable).")
     parser.add_argument("--limit", type=int, help="Maximum number of businesses in this run.")
-    parser.add_argument("--headed", action="store_true", help="Show the Chromium browser.")
     parser.add_argument(
         "--retry-failed",
         action="store_true",
@@ -643,14 +700,11 @@ def add_arguments(parser) -> None:
     parser.add_argument(
         "--local-only",
         action="store_true",
-        help="Do not send page URLs/content to Jina Reader; use local text extraction.",
+        help="Do not send page URLs to Jina Reader; read only the pages' HTML (sites built by JavaScript show less).",
     )
 
 
 def run(options: dict) -> int:
-    if sync_playwright is None or trafilatura is None:
-        raise CommandError("Website research needs the browser libraries (pip install -r requirements-worker.txt); "
-                           "run it on the worker.")
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
     llm = make_llm_client()
@@ -658,7 +712,8 @@ def run(options: dict) -> int:
         raise CommandError("Set GROQ_API_KEY (or GROK_API_KEY) or OPENAI_API_KEY in the environment or project .env file")
     client, model, provider = llm
     print(f"Using {provider} model {model}.")
-    jina_reader = None if options["local_only"] else JinaReader()
+    deadline = options.get("deadline")
+    jina_reader = None if options["local_only"] else JinaReader(max_wait=30 if deadline is not None else None)
 
     queue = load_businesses(options["limit"], options["business_id"], retry_failed=options["retry_failed"],
                             redo=options["redo"])
@@ -678,31 +733,24 @@ def run(options: dict) -> int:
     print(f"Researching {len(queue)} businesses; maximum {MAX_PAGES_PER_BUSINESS} pages each.")
     completed = 0
     failed = len(unprompted)
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=not options["headed"])
+    for position, business in enumerate(queue):
+        if out_of_time(options, BUSINESS_RESERVE_SECONDS):
+            time_limit_note(len(queue) - position, "business(es)")
+            break
+        profile_id = start_profile(business["id"])
+        print(f"Researching business {business['id']}: {business['name'] or '(unnamed)'}", flush=True)
         try:
-            for business in queue:
-                profile_id = start_profile(business["id"])
-                print(f"Researching business {business['id']}: {business['name'] or '(unnamed)'}")
-                page = browser.new_page()
-                try:
-                    page.set_default_timeout(15000)
-                    save_page = lambda pages, emails, links: save_progress(profile_id, pages, emails, links)
-                    result = research_business(client, model, page, business, jina_reader, on_page=save_page)
-                    finalize_profile(profile_id, result)
-                    completed += 1
-                    print(
-                        f"Business {business['id']}: {result['action']} after "
-                        f"{result['pages_scraped']} page(s)."
-                    )
-                except Exception as error:
-                    fail_profile(profile_id, error)
-                    failed += 1
-                    print(f"Business {business['id']} failed ({type(error).__name__}): {error}")
-                finally:
-                    page.close()
-        finally:
-            browser.close()
+            save_page = lambda pages, emails, links: save_progress(profile_id, pages, emails, links)
+            result = research_business(client, model, business, jina_reader, on_page=save_page, deadline=deadline)
+            finalize_profile(profile_id, result)
+            completed += 1
+            score = result.get("qualification_score")
+            print(f"Business {business['id']}: {result['action']} after {result['pages_scraped']} page(s)"
+                  + (f", score {score}." if score is not None else "."))
+        except Exception as error:  # noqa: BLE001 - one website must not stop the others
+            fail_profile(profile_id, error)
+            failed += 1
+            print(f"Business {business['id']} failed ({type(error).__name__}): {error}")
     print(f"Research complete: {completed} completed, {failed - len(unprompted)} failed"
           + (f", {len(unprompted)} skipped (no campaign prompt)." if unprompted else "."))
     return 1 if failed else 0

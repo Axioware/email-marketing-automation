@@ -9,6 +9,8 @@ cannot run at all (missing LLM key, Reacher not available, Google CAPTCHA) stops
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
+from pipeline.management.base import out_of_time
+
 from pipeline.models import Business, DiscoveryCampaign, EmailPrompt
 
 STEPS = {
@@ -21,6 +23,7 @@ STEPS = {
     "ghl": "Create GoHighLevel contacts",
 }
 PARTIAL_FAILURE = "Finished with errors"  # how a step reports that only some items failed
+STEP_RESERVE_SECONDS = 45  # with a deadline (the web app): a step starts only with this much time left
 
 
 def add_arguments(parser) -> None:
@@ -37,7 +40,7 @@ def add_arguments(parser) -> None:
                              "minimum score).")
     parser.add_argument("--email-prompt-id", type=int,
                         help="Write emails with this email prompt (default: the campaign's initial-email prompts).")
-    parser.add_argument("--headed", action="store_true", help="Show the browsers (useful for Google consent pages).")
+    parser.add_argument("--headed", action="store_true", help="Show the built-in browser while fetching (Google consent).")
 
 
 def business_arguments(campaign_id: int | None) -> list[str]:
@@ -68,10 +71,10 @@ def run(options: dict) -> int:
             source = ["--source", options["source"]] if options.get("source") else []
             return ["--campaign-id", str(campaign_id), "--limit", str(options["fetch_limit"]), *source, *headed]
         if step == "research":
-            return [*businesses, *headed]
+            return businesses
         if step == "stakeholders":
             minimum = ["--min-score", str(options["min_score"])] if options["min_score"] is not None else []
-            return [*minimum, *businesses, *headed]
+            return [*minimum, *businesses]
         if step == "verify":
             return businesses
         if step == "followups":  # follow-ups use the prompt of each step
@@ -94,9 +97,14 @@ def run(options: dict) -> int:
             # Without business ids a step would process every business, not just this campaign's.
             print("\nThe campaign has no businesses yet; nothing more to do.")
             return 1 if partial else 0
+        if out_of_time(options, STEP_RESERVE_SECONDS):
+            print(f"\nTime limit reached before step {number} ({STEPS[step]}); start the pipeline again to continue "
+                  "(finished work is skipped).")
+            return 1 if partial else 0
         print(f"\n=== Step {number}/{len(planned)}: {STEPS[step]} ===", flush=True)
+        deadline = {"deadline": options["deadline"]} if options.get("deadline") is not None else {}
         try:
-            call_command(commands[step], *args)
+            call_command(commands[step], *args, **deadline)
         except CommandError as error:
             if PARTIAL_FAILURE in str(error):
                 partial.append(STEPS[step])

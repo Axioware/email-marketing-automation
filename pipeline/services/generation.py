@@ -25,6 +25,7 @@ from django.db.models.functions import Lower
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from pipeline.management.base import out_of_time, time_limit_note
 from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, FollowUp, Prospect
 from pipeline.services.llm import make_llm_client, rejected_output
 
@@ -46,6 +47,8 @@ REGENERATABLE_STATUSES = ("in_review", "rejected")
 SEQUENCE_STEP = 1  # emails.sequence_step of the first email; follow-up N is stored as step N + 1
 MAX_ATTEMPTS = 3
 MAX_COMPLETION_TOKENS = 2500  # a short email; Groq counts this budget against its per-minute token limit
+LLM_TIMEOUT = 60
+EMAIL_RESERVE_SECONDS = 70  # with a deadline (the web app): an email starts only if the AI can answer in time
 MAX_SUBJECT_CHARS = 200
 MAX_BODY_CHARS = 5000
 FOOTER_ALT = "Axioware"
@@ -287,6 +290,7 @@ def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str
         try:
             response = client.chat.completions.create(
                 model=model,
+                timeout=LLM_TIMEOUT,
                 temperature=0.7,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
                 response_format=response_format,
@@ -484,7 +488,10 @@ def run(options: dict) -> int:
         print(f"Generating emails for {len(queue)} prospect(s).")
         created = failed = skipped = 0
         prompts: dict = {}
-        for row in queue:
+        for position, row in enumerate(queue):
+            if out_of_time(options, EMAIL_RESERVE_SECONDS):
+                time_limit_note(len(queue) - position, "email(s)")
+                break
             token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
             if chosen is None and assign_initial_prompt(row, save=not options["dry_run"]) is None:
                 skipped += 1

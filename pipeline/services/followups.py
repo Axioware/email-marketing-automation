@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from django.core.management.base import CommandError
 from django.db import DatabaseError
 
+from pipeline.management.base import out_of_time, time_limit_note
 from pipeline.models import Email, EmailPrompt, FollowUp, Prospect
 from pipeline.services import generation
 
@@ -131,7 +132,10 @@ def run(options: dict) -> int:
         print(f"Using {llm[2]} model {llm[1]}. Writing {len(due)} due follow-up(s).")
         saved = skipped = failed = 0
         cache: dict = {}
-        for item in due:
+        for position, item in enumerate(due):
+            if out_of_time(options, generation.EMAIL_RESERVE_SECONDS):
+                time_limit_note(len(due) - position, "follow-up(s)")
+                break
             label = f"Prospect {item['prospect_id']} <{item['previous'].recipient}>, follow-up {item['sequence']}"
             try:
                 outcome, detail = write_followup(item, llm, chosen, options["dry_run"], cache)

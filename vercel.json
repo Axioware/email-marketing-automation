@@ -3,7 +3,7 @@
   "functions": {
     "emailautomation/wsgi.py": {
       "maxDuration": 300,
-      "excludeFiles": "{.venv/**,tests/**,assets/**,results.csv,supabase/**,config/**}"
+      "excludeFiles": "{.venv/**,tests/**,assets/**,results.csv,supabase/**,deploy/**}"
     }
   }
 }

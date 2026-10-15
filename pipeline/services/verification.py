@@ -598,10 +598,9 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
-    """Check the contacts' addresses. The web app on Vercel (pipeline/webruns.py) also passes "deadline"
-    (time.monotonic() after which no new check starts, so it answers within its time limit) and "skip_unknown"
-    (addresses checked before with an unknown result are not checked again, so each run gets further; --recheck
-    checks them)."""
+    """Check the contacts' addresses. With a "deadline" (the web app on Vercel, pipeline/webruns.py) no check starts
+    unless it can finish in time, and addresses that came back unknown before are not checked again, so each run gets
+    further (--recheck checks them)."""
     if options["delay"] < 0 or options["reacher_timeout"] <= 0 or options["max_candidates"] < 0:
         raise CommandError("--delay and --max-candidates cannot be negative and --reacher-timeout must be > 0")
     if options["limit"] is not None and options["limit"] < 1:
@@ -632,6 +631,8 @@ def run(options: dict) -> int:
         skipped = streak = deliverable_count = stored_count = 0
         aborted = out_of_time = False
         deadline, left = options.get("deadline"), 0
+        if deadline is not None:
+            deadline -= options["reacher_timeout"]  # the last check may take the whole Reacher timeout
         for position, contact in enumerate(queue):
             addresses = candidate_addresses(contact, options["max_candidates"])
             if deadline is not None and time.monotonic() >= deadline:
@@ -644,7 +645,7 @@ def run(options: dict) -> int:
                     break
                 prospect_status = known.get((contact["id"], address))
                 if not options["recheck"] and (already_decided(prospect_status) or
-                                               (options.get("skip_unknown") and prospect_status == "unknown")):
+                                               (options.get("deadline") is not None and prospect_status == "unknown")):
                     skipped += 1
                     continue
                 domain = address.rpartition("@")[2].casefold()

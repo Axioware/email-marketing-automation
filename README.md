@@ -1,6 +1,6 @@
 # Email Marketing Automation
 
-Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each and lets you review and approve them. Approved emails are scheduled and **GoHighLevel sends them** (see [Sending through GoHighLevel](#sending-through-gohighlevel)); the web app can run on **Vercel** with the pipeline steps on a worker machine (see [Deploying on Vercel](#deploying-on-vercel-web-app--worker)). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each and lets you review and approve them. Approved emails are scheduled and **GoHighLevel sends them** (see [Sending through GoHighLevel](#sending-through-gohighlevel)); the whole app runs on **Vercel**, every step inside the request that starts it, calling the scraper, Reacher and SearXNG on your own server (see [Deploying on Vercel](#deploying-on-vercel)). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
 
 **Using the admin day to day:** see the [user guide](docs/USER_GUIDE.md), also available in the admin under **Guide** (top right).
 
@@ -26,7 +26,7 @@ Generate a `DJANGO_SECRET_KEY` for `.env` with `python -c "import secrets; print
 Also needed:
 
 - **Docker**: email verification (Module 4) runs Reacher in a container (see "Docker setup" below).
-- **Firefox and geckodriver**: contact discovery (Module 3).
+- **SearXNG** (your own instance, `SEARXNG_URL`): web search for contact discovery (Module 3).
 - **Supabase**: the database; the open-tracking edge function is optional (open tracking is off).
 - **GoHighLevel**: sends the emails (see [Sending through GoHighLevel](#sending-through-gohighlevel)).
 
@@ -117,7 +117,7 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 2. Find businesses | Dashboard > **Get leads**, or Campaign > **Fetch with built-in browser** / **Fetch with scraper container** | `python manage.py fetch_businesses --campaign-id 1 --limit 20 [--source browser\|scraper_api]` |
 | 2b. Fill missing details | Businesses > action **Refresh Google Maps details** | `python manage.py refresh_businesses` |
 | 3. Research and score | Businesses > action **Research websites** | `python manage.py research_websites` |
-| 4. Find owners | Businesses > action **Find decision makers** | `python manage.py find_stakeholders --headed` |
+| 4. Find owners | Businesses > action **Find decision makers** | `python manage.py find_stakeholders` |
 | 5. Verify emails | Businesses or Contacts > action **Verify emails** | `python manage.py verify_emails` |
 | 3b. Review low scores | Businesses > filter **Needs your review** > **Approve** / **Reject** | - |
 | 5b. Review unverified addresses | Prospects > filter Needs review > **Approve** / **Reject** | - |
@@ -140,7 +140,7 @@ Steps started from the admin or the API run as **pipeline runs**: a background p
 Notes:
 
 - **Reacher starts itself.** The first verification run creates and configures the Docker container. It needs outbound port 25.
-- **Step 4 opens Firefox.** Google may show a CAPTCHA; `--headed` lets you see the window. DuckDuckGo is the fallback. In a background run, a consent prompt waits up to 5 minutes for you to finish it in the window.
+- **Step 4 searches through SearXNG** (`SEARXNG_URL`); without it only the website is used.
 - **Opens are counted only after an email is sent**, through the deployed edge function.
 
 ## REST API
@@ -202,7 +202,7 @@ Each new business is saved with a `business_sources` record containing the unnor
 
 ## Research business websites
 
-Set an LLM key in `.env`: `GROQ_API_KEY` (or `GROK_API_KEY`; used when present; optionally `GROQ_MODEL`, default `openai/gpt-oss-120b`) or, as the fallback, `OPENAI_API_KEY` (optionally `OPENAI_MODEL`, default `gpt-5.4-mini`). The script prints which provider and model it uses. Groq is called through its OpenAI-compatible API, so no extra package is needed. The agent needs strict JSON-schema output, so a different `GROQ_MODEL` must support it. Chromium is needed (`python -m playwright install chromium`). Jina Reader's public endpoint is used by default for cleaned page text; it requires no API key and is limited to 20 requests per 60 seconds. If Jina fails, the worker falls back to local extraction. Use `--local-only` to keep page content local.
+Set an LLM key in `.env`: `GROQ_API_KEY` (or `GROK_API_KEY`; used when present; optionally `GROQ_MODEL`, default `openai/gpt-oss-120b`) or, as the fallback, `OPENAI_API_KEY` (optionally `OPENAI_MODEL`, default `gpt-5.4-mini`). The script prints which provider and model it uses. Groq is called through its OpenAI-compatible API, so no extra package is needed. The agent needs strict JSON-schema output, so a different `GROQ_MODEL` must support it. No browser is needed: each page's HTML is fetched over HTTP (links, emails) and its text comes from Jina Reader, which renders the page (JavaScript included) in its own browser. Jina's public endpoint needs no key and allows 20 requests per minute; `JINA_API_KEY` raises that. If Jina fails, the page's own HTML text is used. `--local-only` never sends URLs to Jina (sites built by JavaScript then show less).
 
 ```sh
 python manage.py research_websites --limit 5
@@ -214,22 +214,22 @@ The script processes businesses with websites that do not yet have a completed p
 
 ## Find decision makers and contact emails (Module 3)
 
-Needs Firefox and [geckodriver](https://github.com/mozilla/geckodriver/releases) installed locally; no API keys or paid services. In the admin: select businesses, action **Find decision makers**.
+No browser and no paid services: the business's pages are read through Jina Reader and web search goes to your own SearXNG instance (`SEARXNG_URL`, e.g. `http://your-server:8080`; its `settings.yml` must list `json` under `search: formats`; `SEARXNG_KEY` is sent as `X-API-Key` when set). In the admin: select businesses, action **Find decision makers**.
 
 ```sh
-python manage.py find_stakeholders --limit 5 --headed
+python manage.py find_stakeholders --limit 5
 ```
 
 For each qualified business (research score at least its campaign's **minimum score**, or approved by a person; rejected ones never; `--min-score` overrides the campaign's minimum) it runs a waterfall:
 
 1. **Module 2 data:** scraped page text, findings, emails and LinkedIn links are mined for people and job titles.
-2. **Rendered site crawl** (only if no target-role person yet; `--max-pages`, default 6): team/about/contact pages are opened in Firefox so JavaScript-built pages are read as a visitor sees them. Pages Module 2 already read are skipped.
+2. **Site pages** (only if no target-role person yet; `--max-pages`, default 6): team/about/contact pages are read through Jina Reader, which renders JavaScript-built pages as a visitor sees them. Pages Module 2 already read are skipped.
 3. **Role ranking:** people are classified with `config/target_roles_dental.json` (target roles, fallback roles, excluded roles). Swap the file with `--roles-file` for other niches.
-4. **Web search** (only if still no target-role person, at most `--max-searches` per business, default 3): Google AI Overview first, DuckDuckGo as fallback. A result is accepted only if it contains the business's phone number, or its name plus location/domain.
+4. **Web search** (only if still no target-role person, at most `--max-searches` per business, default 3): SearXNG results, each title and snippet read on its own. The searches use the business's name without the branch Google Maps adds ("Alvi Dental Hospital — SMCHS" is searched as "Alvi Dental Hospital"). A result counts only if it contains the business's phone number, or its name plus location/domain.
 5. **Email:** an email found publicly is stored with `email_source` `website` or `search`; otherwise a pattern guess is stored as `inferred`. All other guesses are kept in `candidate_emails`. Every email is `unverified`; verification is Module 4.
 6. **Selection:** the highest-ranked role becomes the primary contact (`is_primary`); other target-role people are kept as secondary contacts. `source_urls` and `discovery_reasoning` record the evidence.
 
-Options: `--business-id ID` (repeatable), `--redo` (reprocess and replace this module's contacts), `--no-search`, `--no-crawl`, `--dry-run`, `--delay SECONDS`, `--profile PATH` (copy of a Firefox profile, e.g. one signed in to Google, to reduce CAPTCHAs). Automated search may be restricted by Google's and DuckDuckGo's terms.
+Options: `--business-id ID` (repeatable), `--redo` (reprocess and replace this module's contacts), `--no-search`, `--no-crawl`, `--dry-run`, `--delay SECONDS` (between searches, default 1).
 
 ## Verify contact emails and build prospects (Module 4)
 
@@ -380,30 +380,25 @@ The dashboard warns when GHL is not set up, when approved emails are not in GHL 
 
 ## Containers on your own server (nginx)
 
-The scraper and Reacher can run on a VPS behind nginx instead of on the worker machine. Each refuses requests without its key, and nginx only forwards `https://your-domain/scraper/...` and `https://your-domain/reacher/...` to them (both published on `127.0.0.1` only). Files: [deploy/vps/](deploy/vps/).
+The scraper and Reacher run on your VPS behind nginx. Each refuses requests without its key, and nginx only forwards `https://your-domain/scraper/...` and `https://your-domain/reacher/...` to them (both published on `127.0.0.1` only). Files: [deploy/vps/](deploy/vps/).
 
 1. **Scraper**: in its folder, a `.env` with `SCRAPER_API_KEY=<key>`, then `docker compose up -d --build`. Its API now answers only requests with the header `X-API-Key: <key>` (every route, `/docs` included; without the variable it answers nothing).
 2. **Reacher**: copy `deploy/vps/reacher-compose.yml` with a `.env` holding `REACHER_SECRET`, `VERIFY_MAIL_FROM`, `VERIFY_HELO`, then `docker compose -f reacher-compose.yml up -d`. Reacher then needs the header `x-reacher-secret` on every check (it answers `/version` to anyone). The VPS needs outbound port 25; `VERIFY_HELO` should match its reverse DNS.
 3. **nginx**: paste `deploy/vps/nginx-locations.conf` into the site's `server` block and reload. It allows a search 340 s and a check 120 s.
 4. **App** (Vercel's environment variables, and `.env` wherever else the steps run): `MAPS_SCRAPER_URL=https://your-domain/scraper`, `MAPS_SCRAPER_KEY=<scraper key>`, `REACHER_URL=https://your-domain/reacher`, `REACHER_SECRET=<reacher key>`, plus `VERIFY_MAIL_FROM` (the app checks once per run that the sender's domain accepts mail). A remote Reacher must be https with a secret; the app then never manages it through Docker, checks the key before verifying anyone, and stops with "refused the key" when it is wrong.
 
-With these set on Vercel, **fetching through the scraper container and verifying emails run on Vercel itself, calling your server directly** (pipeline/webruns.py): no worker, no queue.
+## Deploying on Vercel
 
-- The request that starts the run (the admin's run form, a dashboard button, or `POST /api/runs/`) calls the container, waits for its answer, saves the results and answers with the finished run. The page waits meanwhile (a Google Maps search takes a minute or more).
-- It must finish within Vercel's request limit (`vercel.json` allows 300 s; a run uses at most 270): a fetch runs Google Maps searches of at most 20 places while time is left, and verification checks addresses until about 3 minutes are used. The output then says what is left (`Time limit reached: ... start the run again`); starting the same run again continues, since businesses already saved and addresses already checked are skipped (verification also skips addresses that came back unknown; `--recheck` checks them).
-- A run Vercel cut off (it shows "running" for more than 6 minutes) is marked failed; start it again with a smaller `--limit`.
-- The run's page and the API show `runs_on`: `web` (run in the request) or `worker` (everything else: the built-in browser, research, decision makers, a local Reacher).
-- The scraper container also has `POST /jobs` / `GET /jobs/{id}` (a search in the background); the app does not use them.
+Everything runs on Vercel, **inside the request that starts it**: no worker, no queue, nothing running on another machine. A run (the admin's run form, a dashboard button, or `POST /api/runs/`) executes the command right there; the command calls your server and outside services directly (the scraper and Reacher behind nginx, SearXNG, Jina Reader, the AI, GoHighLevel), saves the results and answers with the finished run. The page waits meanwhile (a Google Maps search or a research takes a minute or more). See pipeline/webruns.py.
 
-## Deploying on Vercel (web app + worker)
-
-Vercel runs short web requests only: no background processes, browsers or Docker. So the **web app** (admin, API, webhooks) runs on Vercel, and the **pipeline steps** that need browsers or Docker (fetching with the built-in browser, research, decision makers, writing emails) run on a **worker**: a machine with Chromium, Firefox and the same `DATABASE_URL`. Fetching through the scraper container and verifying with Reacher run on Vercel itself when both are on your server (see [Containers on your own server](#containers-on-your-own-server-nginx)).
-
-- Vercel finds Django through `manage.py` and serves `WSGI_APPLICATION` (`emailautomation/wsgi.py`) as one function; static files go to its CDN. `vercel.json` allows that function 300 s per request (a scraper/Reacher run uses up to 270 s; the email-sent webhook writes the next follow-up with the AI inside the request; bulk-approve around 30-40 emails at a time, since each approval writes to GHL). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
-- Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `SENDER_NAME`, and for scraping/verifying on Vercel `MAPS_SCRAPER_URL`, `MAPS_SCRAPER_KEY`, `REACHER_URL`, `REACHER_SECRET`, `VERIFY_MAIL_FROM` (see [Containers on your own server](#containers-on-your-own-server-nginx)).
-- On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
+- **Time limit:** `vercel.json` allows 300 s per request and a run uses at most 270. Each step starts new work (a search, a business, a contact, an address, an email) only while there is time for it, then says what is left (`Time limit reached: ... start the run again`). Starting it again continues, since finished work is skipped (verification also skips addresses that came back unknown; `--recheck` checks them). **Run whole pipeline** runs its steps in order until the time is up. Typical amounts per run: a Google Maps search of up to 20 places, 2-4 researched businesses, several decision-maker searches, a few minutes of address checks, a dozen or more emails.
+- A run Vercel cut off anyway (it shows "running" for more than 6 minutes) is marked failed; start it again with a smaller `--limit`.
+- Not available on Vercel (they fail at once, saying why): fetching with the **built-in browser** (use the scraper container as the lead source) and **refreshing Maps details**; verification while `REACHER_URL`/`REACHER_SECRET` are not set (a local Docker Reacher cannot run there).
+- Vercel finds Django through `manage.py` and serves `WSGI_APPLICATION` (`emailautomation/wsgi.py`) as one function; static files go to its CDN. `requirements.txt` holds the web app's packages (what Vercel installs); `requirements-worker.txt` adds the browsers for running steps on your own machine.
+- Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `SENDER_NAME`, `MAPS_SCRAPER_URL`, `MAPS_SCRAPER_KEY`, `SEARXNG_URL` (optional `SEARXNG_KEY`, `JINA_API_KEY`), and for verification `REACHER_URL`, `REACHER_SECRET`, `VERIFY_MAIL_FROM` (see [Containers on your own server](#containers-on-your-own-server-nginx)).
+- On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
 - Run `python manage.py migrate` from your machine (not on deploy).
-- On the worker: `python manage.py run_worker`. Runs started in the admin or the API wait in the queue until the worker picks them up; **Stop** reaches the worker through the database. The dashboard shows when the worker was last seen. Run one worker.
+- Without Vercel (`RUN_MODE=queue` elsewhere), runs wait for `python manage.py run_worker` on a machine with the same `DATABASE_URL`; with `RUN_MODE=local` (default) they start as background processes.
 
 ### Placeholders to fill
 
@@ -429,7 +424,8 @@ Tests never use the `.env` database or real services: they run against a throwaw
 | `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` + `ghl.py` (scheduling and GoHighLevel) |
 | `vercel.json` | the Vercel function settings (time limit, files left out) |
 | `deploy/vps/` | Reacher compose file and nginx locations for running the containers on your own server |
-| `pipeline/webruns.py` | scraper/Reacher runs Vercel executes itself, inside the request that starts them |
+| `pipeline/webruns.py` | on Vercel every run executes inside the request that starts it, with a time limit |
+| `pipeline/services/searxng.py` | web search through your SearXNG instance (decision makers) |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |
 | `pipeline/api/` | the REST API |

@@ -45,7 +45,7 @@ def lead_sources() -> dict:
     campaigns = DiscoveryCampaign.objects.annotate(business_total=Count("businesses")).order_by("-created_at")[:8]
     from pipeline import jobs
 
-    if jobs.queue_mode() and scraper_api.is_local():  # the worker's own container: the worker's view of it counts
+    if jobs.queue_mode() and not settings.ON_VERCEL and scraper_api.is_local():  # the worker's container: its view counts
         worker = worker_status()
         problem = (worker["info"].get("scraper") if worker["alive"] else "not known (no worker running)")
         problem = None if problem == "running" else problem
@@ -249,7 +249,8 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append(f"{stuck} email(s) in GoHighLevel are over a day past their send time and were never reported "
                             "sent: check the sending workflow (published?) and its email-sent webhook.")
         worker = worker_status()
-        if jobs.queue_mode() and not worker["alive"]:
+        uses_worker = jobs.queue_mode() and not settings.ON_VERCEL  # on Vercel every run executes in its request
+        if uses_worker and not worker["alive"]:
             warnings.append("No worker is running: queued runs wait until `python manage.py run_worker` is started on "
                             "the machine with the browsers and Docker.")
         if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
@@ -260,7 +261,7 @@ class PipelineAdminSite(admin.AdminSite):
                             f"at {leads['scraper_url']}: start it, or set MAPS_SCRAPER_URL in .env.")
 
         return {
-            "worker": worker if jobs.queue_mode() else None,
+            "worker": worker if uses_worker else None,
             "leads": leads,
             "results": sequence_results(),
             "funnel": funnel,

@@ -1,43 +1,27 @@
 """Module 3: find the decision makers of qualified businesses and the email addresses they probably use.
 
-Waterfall: Module 2's website data, then the business's own pages rendered in Firefox, then Google's AI Overview
-(DuckDuckGo as fallback). Rules only, no LLM. Email candidates are stored for Module 4 to verify.
+Waterfall: Module 2's website data, then the business's own team/about/contact pages (read through Jina Reader, which
+renders them in its own browser), then web search through your SearXNG instance (SEARXNG_URL). Rules only, no LLM.
+No browser runs here, so the step runs on the web app (Vercel) as well. Email candidates are stored for Module 4 to
+verify.
 """
 import json
-import os
 import re
-import shutil
 import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.core.management.base import CommandError
 from django.db import DatabaseError, transaction
 from django.db.models import F, Q
 
-# Worker-only libraries (requirements-worker.txt): the web app on Vercel imports this module without them.
-try:
-    from selenium import webdriver
-    from selenium.common.exceptions import TimeoutException, WebDriverException
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
-    from selenium.webdriver.firefox.options import Options
-    from selenium.webdriver.firefox.service import Service
-    from selenium.webdriver.support.ui import WebDriverWait
-except ImportError:
-    class WebDriverException(Exception):
-        """Stands in for selenium's error where selenium is not installed."""
-
-    TimeoutException = WebDriverException
-    webdriver = By = FirefoxProfile = Options = Service = WebDriverWait = None
-
+from pipeline.management.base import out_of_time, time_limit_note
 from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile
-from pipeline.services import qualify
-from pipeline.services.console import wait_for_person
-from pipeline.services.research import is_public_http_url
+from pipeline.services import qualify, searxng
+from pipeline.services.research import JinaReader, ResearchError, is_public_http_url
 
 DEFAULT_ROLES_FILE = Path(settings.BASE_DIR) / "config" / "target_roles_dental.json"
 MAX_PAGE_TEXT_CHARS = 8000
@@ -45,7 +29,12 @@ MAX_CONTACTS_PER_BUSINESS = 4
 MAX_FALLBACK_CONTACTS = 2
 MAX_DOMAINS = 2
 MAX_TITLE_CHARS = 80
-AI_OVERVIEW_SETTLE_SECONDS = 3
+MAX_SEARCH_RESULTS = 10  # results read per search, best first
+# With a deadline (the web app on Vercel): a business starts only with this much time left; site pages and searches
+# stop when less than these are left.
+BUSINESS_RESERVE_SECONDS = 60
+PAGE_RESERVE_SECONDS = 40
+SEARCH_RESERVE_SECONDS = 25
 OWN_EMAIL_SOURCES = ("website", "search", "inferred", "pattern")  # rows this module may replace
 
 HONORIFICS = {"dr", "mr", "mrs", "ms", "miss", "prof", "sir", "mx", "eng", "engr"}
@@ -60,10 +49,6 @@ ROLE_BASED_LOCAL_PARTS = {
     "mail", "team", "billing", "hr", "careers", "service", "services", "care", "help", "dr", "doctor",
     "clinic", "dental", "webmaster", "marketing", "accounts", "noreply", "no-reply", "feedback",
 }
-AI_OVERVIEW_END_MARKERS = (
-    "show more", "dive deeper", "ai responses may include mistakes", "generative ai is experimental",
-    "people also ask", "sources", "feedback",
-)
 NOT_NAME_WORDS = {
     "the", "this", "that", "google", "maps", "overview", "ai", "inc", "llc", "ltd", "company", "business",
     "owner", "owners", "founder", "manager", "director", "partner", "ceo", "president", "january",
@@ -143,16 +128,10 @@ COMMON_SITE_PATHS = [
     "/doctors", "/leadership", "/staff", "/contact", "/contact-us",
 ]
 MIN_RENDERED_TEXT_CHARS = 80
-RENDER_SETTLE_SECONDS = 2
-CRAWL_PAGE_DELAY_SECONDS = 1.0
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
 
 class StakeholderError(RuntimeError):
-    pass
-
-
-class SearchBlocked(StakeholderError):
     pass
 
 
@@ -479,6 +458,18 @@ def extract_people(text: str, roles: RoleConfig, business_name: str = "") -> lis
     return found
 
 
+def search_name(business_name: str) -> str:
+    """The business's name without the branch or location Google Maps adds ("Alvi Dental Hospital — SMCHS",
+    "Smile Studio | DHA", "City Dental (Gulberg)"): web pages about the business rarely repeat that part."""
+    name = " ".join((business_name or "").split())
+    for separator in (" — ", " – ", " | ", " ("):
+        name = name.split(separator)[0]
+    head, _, tail = name.rpartition(" - ")
+    if head and len(tail.split()) <= 3:
+        name = head
+    return name.strip() or " ".join((business_name or "").split())
+
+
 def distinctive_tokens(business_name: str) -> set[str]:
     tokens = {ascii_token(word) for word in business_name.split()}
     return {token for token in tokens if len(token) > 2 and token not in BUSINESS_NAME_STOPWORDS}
@@ -724,106 +715,7 @@ def build_contacts(business_id: int, evidence: Evidence) -> list[dict]:
     return contacts
 
 
-# ---------------------------------------------------------------- browser and search
-
-
-def start_firefox(headed: bool, profile: str | None):
-    """Launch the locally installed Firefox through geckodriver."""
-    if Path("/snap/bin/firefox").exists():
-        # Snap Firefox cannot read the default /tmp, where Selenium stores temporary profiles.
-        tmpdir = Path.home() / "snap" / "firefox" / "common" / "tmp"
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        os.environ["TMPDIR"] = str(tmpdir)
-    options = Options()
-    if not headed:
-        options.add_argument("-headless")
-    options.page_load_strategy = "eager"
-    options.set_preference("intl.accept_languages", "en-US, en")
-    if profile:
-        options.profile = FirefoxProfile(profile)  # works on a copy, so your real profile is untouched
-    geckodriver = shutil.which("geckodriver")
-    service = Service(executable_path=geckodriver) if geckodriver else Service()
-    driver = webdriver.Firefox(options=options, service=service)
-    driver.set_page_load_timeout(60)
-    return driver
-
-
-def has_element(driver, selector: str) -> bool:
-    return bool(driver.find_elements(By.CSS_SELECTOR, selector))
-
-
-def wait_for_element(driver, selector: str, error_message: str) -> None:
-    try:
-        WebDriverWait(driver, 15).until(lambda d: has_element(d, selector))
-    except TimeoutException:
-        raise StakeholderError(error_message)
-
-
-def element_text(driver, selector: str) -> str:
-    for element in driver.find_elements(By.CSS_SELECTOR, selector):
-        text = element.text
-        if text.strip():
-            return text
-    return ""
-
-
-def linkedin_hrefs(driver) -> list[str]:
-    hrefs = []
-    for element in driver.find_elements(By.CSS_SELECTOR, "a[href*='linkedin.com/in/']"):
-        try:
-            hrefs.append(element.get_attribute("href") or "")
-        except WebDriverException:
-            continue
-    return hrefs
-
-
-def wait_for_manual_consent(driver, headed: bool) -> None:
-    if "consent." not in driver.current_url.split("?")[0]:
-        return
-    if not headed:
-        raise SearchBlocked("Search engine requires consent. Rerun with --headed to complete it manually.")
-    wait_for_person(
-        "Complete the consent prompt in the browser, then press Enter to continue: ",
-        lambda: "consent." not in driver.current_url.split("?")[0],
-    )
-
-
-def extract_ai_overview(page_text: str) -> str | None:
-    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
-    for index, line in enumerate(lines):
-        if line.casefold() == "ai overview":
-            section = []
-            for follow in lines[index + 1:]:
-                if follow.casefold().startswith(AI_OVERVIEW_END_MARKERS):
-                    break
-                section.append(follow)
-            return "\n".join(section)[:MAX_PAGE_TEXT_CHARS] or None
-    return None
-
-
-def search_google(driver, query: str, headed: bool) -> tuple[str, str | None, list[str]]:
-    """Return (search_url, AI Overview text or None, linkedin links on the page)."""
-    search_url = f"https://www.google.com/search?hl=en&q={quote(query, safe='')}"
-    driver.get(search_url)
-    wait_for_manual_consent(driver, headed)
-    if "/sorry/" in driver.current_url or has_element(driver, 'iframe[src*="recaptcha"], #captcha-form'):
-        raise SearchBlocked("Google presented a CAPTCHA.")
-    wait_for_element(driver, "#search, #rso", "Google results did not load.")
-    time.sleep(AI_OVERVIEW_SETTLE_SECONDS)  # the AI Overview renders after the main results
-    return search_url, extract_ai_overview(element_text(driver, "#rso, #center_col, #search")), linkedin_hrefs(driver)
-
-
-def search_duckduckgo(driver, query: str, headed: bool) -> tuple[str, str, list[str]]:
-    """Return (search_url, results text including any AI-assisted answer, linkedin links)."""
-    search_url = f"https://duckduckgo.com/?q={quote(query, safe='')}&ia=web&kl=us-en"
-    driver.get(search_url)
-    wait_for_manual_consent(driver, headed)
-    if has_element(driver, ".anomaly-modal__modal, form[action*='anomaly']"):
-        raise SearchBlocked("DuckDuckGo presented a bot challenge.")
-    wait_for_element(driver, '[data-testid="result"], article', "DuckDuckGo results did not load.")
-    time.sleep(AI_OVERVIEW_SETTLE_SECONDS)
-    text = "\n".join(line.strip() for line in element_text(driver, "#react-layout, body").splitlines() if line.strip())
-    return search_url, text[:MAX_PAGE_TEXT_CHARS], linkedin_hrefs(driver)
+# ---------------------------------------------------------------- site pages and search
 
 
 def page_identity(url: str) -> tuple[str, str]:
@@ -881,55 +773,50 @@ def choose_site_pages(business: dict, max_pages: int) -> list[str]:
     return chosen[:max_pages]
 
 
-def crawl_site(driver, business: dict, evidence: Evidence, roles: RoleConfig, max_pages: int) -> int:
-    """Waterfall step 2: render the site's team/about/contact pages in Firefox and read what a visitor sees."""
+def crawl_site(reader: JinaReader, business: dict, evidence: Evidence, roles: RoleConfig, max_pages: int,
+               options: dict | None = None) -> int:
+    """Waterfall step 2: read the site's team/about/contact pages as a visitor sees them (Jina Reader renders them)."""
     base_host = host_of(business.get("website_url")) or ""
     rendered = 0
     read = set()  # final pages already read: a common path (e.g. /about) often redirects to one read before
     for url in choose_site_pages(business, max_pages):
-        if evidence.has_target():
+        if evidence.has_target() or out_of_time(options or {}, PAGE_RESERVE_SECONDS):
             break
         if not is_public_http_url(url):
-            continue  # never let a business's website point the browser at this machine or the local network
+            continue  # never let a business's website point us at this machine or the local network
         try:
-            driver.get(url)
-            if not same_site(driver.current_url, base_host) or not is_public_http_url(driver.current_url):
-                continue  # redirected off the business's site, or to a non-public address
-            if page_identity(driver.current_url) in read:
-                continue
-            read.add(page_identity(driver.current_url))
-            time.sleep(RENDER_SETTLE_SECONDS)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
-            text = driver.find_element(By.TAG_NAME, "body").text
-            title = (driver.title or "").casefold()
-            final_url = driver.current_url
-            mail_links = [
-                (el.get_attribute("href") or "")[7:] for el in driver.find_elements(By.CSS_SELECTOR, "a[href^='mailto:']")
-            ]
-            linkedin_links = linkedin_hrefs(driver)
-        except (TimeoutException, WebDriverException) as error:
-            print(f"    {url}: {type(error).__name__}: {str(error).splitlines()[0][:120]}")
+            page = reader.read(url)
+        except ResearchError as error:
+            print(f"    {url}: {error}")
             continue
+        final_url = page["url"]
+        if not same_site(final_url, base_host) or not is_public_http_url(final_url):
+            continue  # redirected off the business's site, or to a non-public address
+        if page_identity(final_url) in read:
+            continue
+        read.add(page_identity(final_url))
+        text = clean_markdown(page["content"])
+        title = page["title"].casefold()
         head = text[:300].casefold()
-        if len(text.strip()) < MIN_RENDERED_TEXT_CHARS or any(
+        if (page["status"] or 200) >= 400 or len(text.strip()) < MIN_RENDERED_TEXT_CHARS or any(
             marker in title or marker in head for marker in ("page not found", "404", "not found")
         ):
             continue
         rendered += 1
+        hrefs = [href for _, href in page["links"]]
+        mail_links = [href[7:] for href in hrefs if href.casefold().startswith("mailto:")]
         people = extract_people(text, roles, evidence.business_name)
         evidence.add_people(people, "website", final_url)
         evidence.add_emails(EMAIL_PATTERN.findall(text) + [m.split("?")[0] for m in mail_links], "website", final_url)
-        evidence.add_linkedin(linkedin_links)
+        evidence.add_linkedin(hrefs)
         print(f"    {final_url}: {len(people)} person(s)")
-        time.sleep(CRAWL_PAGE_DELAY_SECONDS)
     return rendered
 
 
 def build_queries(business: dict) -> list[str]:
     location = business_location(business)
     place = f", {location}" if location else ""
-    name = business["name"]
+    name = search_name(business["name"])
     return [
         f"Who is owner/stakeholders of {name}{place}?",
         f'"{name}" owner',
@@ -937,42 +824,27 @@ def build_queries(business: dict) -> list[str]:
     ]
 
 
-def run_search(driver, query: str, headed: bool, blocked: dict, evidence: Evidence, roles: RoleConfig) -> bool:
-    """Google AI Overview first, DuckDuckGo as fallback. Returns True if any engine answered."""
-    answered = False
-    for engine_name in ("google", "duckduckgo"):
-        if blocked[engine_name]:
-            continue
-        try:
-            if engine_name == "google":
-                url, text, links = search_google(driver, query, headed)
-                answered = True
-                if text is None:
-                    print("  Google showed no AI Overview; falling back to DuckDuckGo.")
-                    continue
-                if not mentions_business(text, evidence.business_name, evidence.context_tokens, evidence.phone):
-                    print("  AI Overview does not mention the business; ignoring it.")
-                    continue
-                source = "search_ai"
-            else:
-                url, text, links = search_duckduckgo(driver, query, headed)
-                answered = True
-                source = "search_snippet"
-            echo = ascii_token(query.replace('"', ""))
-            text = "\n".join(line for line in text.splitlines() if echo not in ascii_token(line))  # query echoed by the page
-            people = extract_people(text, roles, evidence.business_name)
-            evidence.add_people(people, source, url, require_mention=(source == "search_snippet"))
-            evidence.add_emails(EMAIL_PATTERN.findall(text), "search", url)
-            evidence.add_linkedin(links)
-            if people:
-                return True
-            print(f"  No target-role people in {engine_name} results.")
-        except SearchBlocked as error:
-            blocked[engine_name] = True
-            print(f"  {error} Skipping {engine_name} for the rest of this run.")
-        except (StakeholderError, WebDriverException) as error:
-            print(f"  {engine_name} failed: {str(error).splitlines()[0]}")
-    return answered
+def run_search(query: str, evidence: Evidence, roles: RoleConfig) -> bool:
+    """One web search through SearXNG; each result's title and snippet is read on its own (a person counts only when
+    the snippet mentions the business). Returns whether the search answered."""
+    try:
+        results = searxng.search(query)
+    except searxng.SearchUnavailable as error:
+        print(f"  Search failed: {error}")
+        return False
+    echo = ascii_token(query.replace('"', ""))
+    found = 0
+    for result in results[:MAX_SEARCH_RESULTS]:
+        text = f"{result['title']}\n{result['content']}"
+        text = "\n".join(line for line in text.splitlines() if echo not in ascii_token(line))  # the query echoed back
+        people = extract_people(text, roles, evidence.business_name)
+        evidence.add_people(people, "search_snippet", result["url"], require_mention=True)
+        evidence.add_emails(EMAIL_PATTERN.findall(text), "search", result["url"])
+        evidence.add_linkedin([result["url"]])
+        found += len(people)
+    if not found:
+        print(f"  No target-role people in {len(results)} result(s).")
+    return True
 
 
 # ---------------------------------------------------------------- database
@@ -1037,19 +909,14 @@ def add_arguments(parser) -> None:
     parser.add_argument("--redo", action="store_true", help="Reprocess businesses that were already processed.")
     parser.add_argument("--roles-file", type=Path, default=DEFAULT_ROLES_FILE, help="Target-role configuration JSON.")
     parser.add_argument("--max-searches", type=int, default=3, help="Maximum searches per business (default: 3).")
-    parser.add_argument("--no-search", action="store_true", help="Skip web search.")
-    parser.add_argument("--no-crawl", action="store_true", help="Skip rendering the business's own site pages.")
-    parser.add_argument("--max-pages", type=int, default=6, help="Maximum site pages to render per business (default: 6).")
+    parser.add_argument("--no-search", action="store_true", help="Skip web search (SearXNG).")
+    parser.add_argument("--no-crawl", action="store_true", help="Skip reading the business's own site pages.")
+    parser.add_argument("--max-pages", type=int, default=6, help="Maximum site pages to read per business (default: 6).")
     parser.add_argument("--dry-run", action="store_true", help="Print the contacts without writing to the database.")
-    parser.add_argument("--headed", action="store_true", help="Show Firefox (needed for consent/CAPTCHA).")
-    parser.add_argument("--profile", help="Firefox profile folder to copy and use (keeps Google cookies/consent).")
-    parser.add_argument("--delay", type=float, default=6.0, help="Seconds between searches (default: 6).")
+    parser.add_argument("--delay", type=float, default=1.0, help="Seconds between searches (default: 1).")
 
 
 def run(options: dict) -> int:
-    if webdriver is None:
-        raise CommandError("Finding decision makers needs selenium (pip install -r requirements-worker.txt); run it on "
-                           "the worker.")
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
     if options["min_score"] is not None and not 0 <= options["min_score"] <= 100:
@@ -1061,7 +928,11 @@ def run(options: dict) -> int:
     except (OSError, ValueError, KeyError) as error:
         raise CommandError(f"Cannot read the roles file {options['roles_file']}: {error}") from error
 
-    driver = None
+    search = not options["no_search"] and options["max_searches"] > 0
+    if search and not searxng.configured():
+        print("SEARXNG_URL is not set, so there is no web search; only the website is used.")
+        search = False
+    reader = JinaReader(max_wait=20 if options.get("deadline") is not None else None)
     try:
         queue = load_businesses(options["min_score"], options["limit"], options["business_id"], options["redo"])
         if not queue:
@@ -1070,54 +941,41 @@ def run(options: dict) -> int:
 
         threshold = options["min_score"] if options["min_score"] is not None else "the campaign's minimum"
         print(f"Discovering contacts for {len(queue)} businesses (score >= {threshold}, or approved by a person).")
-        blocked = {"google": False, "duckduckgo": False}
         stored = empty = deferred = searches_used = 0
-        for business in queue:
+        for position, business in enumerate(queue):
+            if out_of_time(options, BUSINESS_RESERVE_SECONDS):
+                time_limit_note(len(queue) - position, "business(es)")
+                break
             domains = collect_domains(business)
-            evidence = Evidence(business["name"], domains, context_tokens_for(business, domains), phone_key(business["phone"]))
-            print(f"Business {business['id']}: {business['name']}")
+            evidence = Evidence(search_name(business["name"]), domains, context_tokens_for(business, domains),
+                                phone_key(business["phone"]))
+            print(f"Business {business['id']}: {business['name']}", flush=True)
             collect_site_evidence(business, evidence, roles)
             print(f"  Module 2 data: {len(evidence.people)} person(s), target role found: {evidence.has_target()}.")
 
-            def ensure_driver():
-                nonlocal driver
-                if driver is None:
-                    driver = start_firefox(options["headed"], options["profile"])
-                return driver
-
-            try:
-                if not evidence.has_target() and not options["no_crawl"] and options["max_pages"]:
-                    print("  Rendering site pages in Firefox...")
-                    pages = crawl_site(ensure_driver(), business, evidence, roles, options["max_pages"])
-                    print(f"  Rendered {pages} page(s); target role found: {evidence.has_target()}.")
-            except WebDriverException as error:
-                print(f"Could not start Firefox ({type(error).__name__}): {str(error).splitlines()[0]}")
-                print("Install Firefox and geckodriver (https://github.com/mozilla/geckodriver/releases).")
-                return 1
+            if not evidence.has_target() and not options["no_crawl"] and options["max_pages"]:
+                print("  Reading site pages...")
+                pages = crawl_site(reader, business, evidence, roles, options["max_pages"], options)
+                print(f"  Read {pages} page(s); target role found: {evidence.has_target()}.")
 
             search_ok = True
-            if not evidence.has_target() and not options["no_search"] and options["max_searches"]:
-                try:
-                    ensure_driver()
-                except WebDriverException as error:
-                    print(f"Could not start Firefox ({type(error).__name__}): {str(error).splitlines()[0]}")
-                    return 1
+            if not evidence.has_target() and search:
                 search_ok = False
                 for query in build_queries(business)[: options["max_searches"]]:
-                    if all(blocked.values()):
+                    if out_of_time(options, SEARCH_RESERVE_SECONDS):
                         break
                     if searches_used:
                         time.sleep(options["delay"])
                     searches_used += 1
                     print(f"  Search: {query}")
-                    search_ok = run_search(driver, query, options["headed"], blocked, evidence, roles) or search_ok
+                    search_ok = run_search(query, evidence, roles) or search_ok
                     if evidence.has_target():
                         break
 
             rows = build_contacts(business["id"], evidence)
             if not rows and not search_ok:
                 deferred += 1
-                print("  Search was blocked; leaving this business for a later run.")
+                print("  Search did not answer; leaving this business for a later run.")
                 continue
             for row in rows:
                 marker = "*" if row["is_primary"] else " "
@@ -1140,6 +998,3 @@ def run(options: dict) -> int:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")
         print("Check DATABASE_URL and run `python manage.py migrate` first.")
         return 1
-    finally:
-        if driver is not None:
-            driver.quit()

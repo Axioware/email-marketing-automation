@@ -37,8 +37,9 @@ except ImportError:
 
 def require_worker_libraries() -> None:
     if sync_playwright is None or phonenumbers is None or pycountry is None:
-        raise CommandError("This step needs the browser libraries (pip install -r requirements-worker.txt); run it "
-                           "on the worker.")
+        raise CommandError("The built-in browser (Chromium) is not available here; fetch with the scraper container "
+                           "instead (--source scraper_api, or the campaign's Lead source), or run this on a machine with "
+                           "pip install -r requirements-worker.txt.")
 
 from pipeline.models import Business, BusinessSource, DiscoveryCampaign
 from pipeline.services.console import interactive, wait_for_person
@@ -684,8 +685,8 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
-    """Fetch for a campaign. The web app on Vercel also passes "deadline" (time.monotonic() by which it must be done)
-    and "max_per_search" for the scraper container (pipeline/webruns.py)."""
+    """Fetch for a campaign. With a "deadline" (the web app on Vercel) the scraper container's searches are smaller
+    and none starts without time for it (pipeline/webruns.py)."""
     if options["delay"] < 0:
         raise CommandError("--delay cannot be negative")
     if options["limit"] is not None and options["limit"] < 1:
@@ -732,7 +733,8 @@ def run(options: dict) -> int:
                 records = scraper_api.scrape_campaign(
                     campaign, queries, limit, lang=options.get("lang") or "en", concurrency=options.get("concurrency", 5),
                     deadline=options.get("deadline"),
-                    max_per_search=options.get("max_per_search") or scraper_api.MAX_PLACES_PER_SEARCH)
+                    max_per_search=(scraper_api.WEB_PLACES_PER_SEARCH if options.get("deadline") is not None
+                                    else scraper_api.MAX_PLACES_PER_SEARCH))
             else:
                 records = scrape_with_browser(campaign, queries, limit, options)
             saved = save_records(records) if records else 0

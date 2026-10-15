@@ -31,6 +31,7 @@ from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
 from pipeline.models import PipelineRun
+from pipeline.services.dbthread import outside_event_loop
 
 COMMANDS = {
     "run_pipeline": "Full pipeline - fetch, research, decision makers, verify, write emails (never sends)",
@@ -48,7 +49,7 @@ DJANGO_OPTIONS = {"help", "version", "verbosity", "settings", "pythonpath", "tra
                   "skip_checks"}
 # Options that name files or local services. They stay available on the command line but cannot be set from the
 # admin or the API, so a web user can never make a run write files or read profiles at arbitrary paths.
-WEB_BLOCKED_OPTIONS = {"report", "roles_file", "profile", "reacher_container", "reacher_url"}
+WEB_BLOCKED_OPTIONS = {"report", "roles_file", "reacher_container", "reacher_url"}
 MAX_OUTPUT_CHARS = 400_000
 FLUSH_SECONDS = 2.0
 QUEUED_TIMEOUT = timedelta(minutes=2)
@@ -302,9 +303,14 @@ class RunOutput:
             return
         self.last_save = time.monotonic()
         try:
-            PipelineRun.objects.filter(pk=self.run_id).update(output=self.text())
+            _store_output(self.run_id, self.text())
         except DatabaseError:
             pass
+
+
+@outside_event_loop  # a step prints while Playwright's browser (an event loop) is open
+def _store_output(run_id: int, text: str) -> None:
+    PipelineRun.objects.filter(pk=run_id).update(output=text)
 
 
 def execute_run(run_id: int) -> int:
