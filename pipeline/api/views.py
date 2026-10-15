@@ -12,7 +12,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from pipeline import jobs, review, webruns
+from pipeline import jobs, review
 from pipeline.api import serializers as s
 from pipeline.models import (
     Business,
@@ -265,6 +265,7 @@ class PipelineRunViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         run = serializer.save()
+        run.refresh_from_db()  # a run the web app executes directly (pipeline/webruns.py) is already finished
         return Response(s.PipelineRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
 
     def destroy(self, request, *args, **kwargs):
@@ -277,15 +278,6 @@ class PipelineRunViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.
     def cancel(self, request, pk=None):
         run = self.get_object()
         message = jobs.cancel_run(run)
-        run.refresh_from_db()
-        return Response({"detail": message, "run": s.PipelineRunSerializer(run).data})
-
-    @extend_schema(request=None)
-    @action(detail=True, methods=["post"], url_path="continue")
-    def continue_run(self, request, pk=None):
-        """Queue the next batch of a run the web app executes in batches (when its batch died)."""
-        run = self.get_object()
-        message = webruns.continue_run(run)
         run.refresh_from_db()
         return Response({"detail": message, "run": s.PipelineRunSerializer(run).data})
 

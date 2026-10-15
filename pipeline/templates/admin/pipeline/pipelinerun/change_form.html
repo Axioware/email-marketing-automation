@@ -12,15 +12,10 @@
 {% block content %}
 {% if run and not run.is_finished %}
   <form method="post" action="{% url 'admin:pipeline_pipelinerun_cancel' run.pk %}" class="pipeline-actions">{% csrf_token %}
-    <span>This page refreshes every few seconds while the run is {{ run.get_status_display|lower }}.{% if run.runs_on == "web" %} It runs on the web app in batches of a few minutes; closing this page does not stop it.{% endif %}</span>
+    <span>This page refreshes every few seconds while the run is {{ run.get_status_display|lower }}.</span>
     <input type="submit" class="danger" value="Stop this run">
   </form>
-  {% if run.runs_on == "web" %}
-  <form method="post" action="{% url 'admin:pipeline_pipelinerun_continue' run.pk %}" class="pipeline-actions">{% csrf_token %}
-    <span class="help">If the output has not moved for several minutes, its batch died; this page continues it after 6 minutes, or now:</span>
-    <input type="submit" value="Continue now">
-  </form>
-  {% endif %}
+
 {% endif %}
 {{ block.super }}
 {% if commands %}

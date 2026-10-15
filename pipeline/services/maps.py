@@ -684,7 +684,8 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
-    require_worker_libraries()
+    """Fetch for a campaign. The web app on Vercel also passes "deadline" (time.monotonic() by which it must be done)
+    and "max_per_search" for the scraper container (pipeline/webruns.py)."""
     if options["delay"] < 0:
         raise CommandError("--delay cannot be negative")
     if options["limit"] is not None and options["limit"] < 1:
@@ -713,6 +714,8 @@ def run(options: dict) -> int:
             "For production use, prefer the official Places API."
         )
         print(f"Lead source: {SOURCES[source]}.")
+        if source == "browser":
+            require_worker_libraries()
         if source == "scraper_api":
             from pipeline.services import scraper_api
 
@@ -726,8 +729,10 @@ def run(options: dict) -> int:
         try:
             update_campaign_status(campaign["id"], "running")
             if source == "scraper_api":
-                records = scraper_api.scrape_campaign(campaign, queries, limit, lang=options.get("lang") or "en",
-                                                      concurrency=options.get("concurrency", 5))
+                records = scraper_api.scrape_campaign(
+                    campaign, queries, limit, lang=options.get("lang") or "en", concurrency=options.get("concurrency", 5),
+                    deadline=options.get("deadline"),
+                    max_per_search=options.get("max_per_search") or scraper_api.MAX_PLACES_PER_SEARCH)
             else:
                 records = scrape_with_browser(campaign, queries, limit, options)
             saved = save_records(records) if records else 0

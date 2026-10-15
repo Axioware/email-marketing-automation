@@ -8,7 +8,7 @@ RUN_MODE=local (default): starting a run spawns that process on this machine.
 RUN_MODE=queue (the web app on Vercel, which cannot run background processes, browsers or Docker): starting a run
 only stores it; `manage.py run_worker` on a machine with the browsers and Docker picks queued runs up, and a stop
 request is passed to it through the database. Steps that only call the scraper container or Reacher on your own server
-run on Vercel itself, in batches (pipeline/webruns.py).
+run on Vercel itself, inside the request that starts them (pipeline/webruns.py).
 """
 import argparse
 import os
@@ -151,14 +151,15 @@ def start_run(command: str, arguments: list[str], user=None) -> PipelineRun:
 
 
 def dispatch(run: PipelineRun) -> None:
-    """Decide where a new run executes and start it once the surrounding transaction commits: in batches on the web
-    app (Vercel, steps that only call your own server), on a worker (queue mode), or in a process here."""
+    """Decide where a new run executes and start it once the surrounding transaction commits: right here in this
+    request (Vercel, steps that only call your own server; the request answers when the run is done), on a worker
+    (queue mode), or in a background process here."""
     from pipeline import webruns
 
     if webruns.web_capable(run.command, run.arguments):
         PipelineRun.objects.filter(pk=run.pk).update(runs_on="web")
         run.runs_on = "web"
-        transaction.on_commit(lambda: webruns.kick(run.pk))
+        transaction.on_commit(lambda: webruns.execute(run.pk))
     elif not queue_mode():
         transaction.on_commit(lambda: launch(run.pk))
 
@@ -190,9 +191,7 @@ def cancel_run(run: PipelineRun) -> str:
     if run.status != PipelineRun.Status.RUNNING:
         return "This run is not running."
     if run.runs_on == "web":
-        from pipeline import webruns
-
-        return webruns.cancel(run)
+        return "This run is working inside the request that started it; it finishes on its own within 5 minutes."
     if queue_mode():  # it runs on the worker's machine: the worker sees the request and stops it
         PipelineRun.objects.filter(pk=run.pk).update(cancel_requested=True)
         return "Stop requested; the worker stops the run within a few seconds."
@@ -224,6 +223,9 @@ def process_alive(pid: int) -> bool:
 def refresh_stale_runs() -> None:
     """Mark runs failed whose process died without recording a result (e.g. the machine restarted). In queue mode the
     processes live on the worker's machine, so the worker does this itself (run_worker)."""
+    from pipeline import webruns
+
+    webruns.fail_cut_off_runs()
     if queue_mode():
         return
     fail_dead_runs(queued_too=True)

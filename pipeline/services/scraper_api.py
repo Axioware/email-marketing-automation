@@ -10,6 +10,8 @@ later step work the same whichever source found the business.
 """
 import json
 import os
+import socket
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -22,6 +24,7 @@ REQUEST_TIMEOUT = 330  # seconds; the container stops a search after 300
 MAX_PLACES_PER_SEARCH = 40  # one search must finish inside the container's 5 minutes
 DEFAULT_CONCURRENCY = 5  # the container's own default; 1-20, higher is faster but more likely to be blocked
 DEFAULT_LANG = "en"
+MIN_SEARCH_SECONDS = 60  # with a deadline: a search with less time than this is left for the next run
 KEY_REFUSED = "refused the key (MAPS_SCRAPER_KEY must equal the container's SCRAPER_API_KEY)"
 
 
@@ -56,12 +59,12 @@ def status(url: str | None = None, timeout: float = 3) -> str | None:
 
 
 def search(query: str, max_places: int, url: str | None = None, lang: str = DEFAULT_LANG,
-           concurrency: int = DEFAULT_CONCURRENCY) -> list[dict]:
-    """The places the container finds for one Google Maps search."""
+           concurrency: int = DEFAULT_CONCURRENCY, timeout: float = REQUEST_TIMEOUT) -> list[dict]:
+    """The places the container finds for one Google Maps search (one request; it answers when the search is done)."""
     params = urlencode({"query": query, "max_places": max_places, "lang": lang, "headless": "true",
                         "concurrency": concurrency})
     try:
-        places = _get(f"{base_url(url)}/scrape-get?{params}", REQUEST_TIMEOUT)
+        places = _get(f"{base_url(url)}/scrape-get?{params}", timeout)
     except HTTPError as error:
         if error.code == 504:
             raise TimeoutError(f"the container gave up after 5 minutes; fetch fewer businesses per run "
@@ -74,7 +77,11 @@ def search(query: str, max_places: int, url: str | None = None, lang: str = DEFA
         if error.code == 401:
             raise ScraperUnavailable(f"the scraper container {KEY_REFUSED}") from error
         raise ScraperUnavailable(f"the scraper container answered HTTP {error.code} {detail}".strip()) from error
+    except (TimeoutError, socket.timeout) as error:
+        raise TimeoutError(f"the search took longer than the {timeout:.0f} seconds this run had left") from error
     except (URLError, OSError) as error:
+        if isinstance(getattr(error, "reason", None), (TimeoutError, socket.timeout)):
+            raise TimeoutError(f"the search took longer than the {timeout:.0f} seconds this run had left") from error
         raise ScraperUnavailable(f"the scraper container at {base_url(url)} is not reachable "
                                  f"({getattr(error, 'reason', error)})") from error
     except ValueError as error:
@@ -82,53 +89,6 @@ def search(query: str, max_places: int, url: str | None = None, lang: str = DEFA
     if not isinstance(places, list):
         raise ScraperUnavailable("the scraper container answered something other than a list of places")
     return [place for place in places if isinstance(place, dict)]
-
-
-def _call(url: str, method: str, timeout: float):
-    """A JSON request to the container's job endpoints; errors become ScraperUnavailable (404 stays an HTTPError)."""
-    request = Request(url, method=method, headers=_headers(), data=b"" if method == "POST" else None)
-    try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - a URL from our own settings
-            return json.loads(response.read().decode("utf-8") or "null")
-    except HTTPError as error:
-        if error.code == 404:
-            raise
-        if error.code == 401:
-            raise ScraperUnavailable(f"the scraper container {KEY_REFUSED}") from error
-        raise ScraperUnavailable(f"the scraper container answered HTTP {error.code}") from error
-    except (URLError, OSError, ValueError) as error:
-        raise ScraperUnavailable(f"the scraper container at {base_url()} is not reachable "
-                                 f"({getattr(error, 'reason', error)})") from error
-
-
-JOB_REQUEST_TIMEOUT = 30
-
-
-def start_job(query: str, max_places: int, lang: str = DEFAULT_LANG, concurrency: int = DEFAULT_CONCURRENCY) -> str:
-    """Start a search in the background on the container (POST /jobs); returns its id at once. For callers with a
-    short request limit (Vercel); the container runs one search at a time."""
-    params = urlencode({"query": query, "max_places": max_places, "lang": lang, "concurrency": concurrency})
-    try:
-        answer = _call(f"{base_url()}/jobs?{params}", "POST", JOB_REQUEST_TIMEOUT)
-    except HTTPError as error:
-        raise ScraperUnavailable("the scraper container has no /jobs endpoint; update it") from error
-    if not isinstance(answer, dict) or not answer.get("id"):
-        raise ScraperUnavailable("the scraper container did not answer a job id")
-    return str(answer["id"])
-
-
-def job(job_id: str) -> dict | None:
-    """The job's state: {"status": queued|running|done|failed, "error", "results" (when done)}; None when the
-    container no longer knows it (it restarted)."""
-    try:
-        answer = _call(f"{base_url()}/jobs/{job_id}", "GET", JOB_REQUEST_TIMEOUT)
-    except HTTPError:
-        return None
-    if not isinstance(answer, dict) or answer.get("status") not in ("queued", "running", "done", "failed"):
-        raise ScraperUnavailable("the scraper container answered an unreadable job")
-    if answer["status"] == "done":
-        answer["results"] = [place for place in answer.get("results") or [] if isinstance(place, dict)]
-    return answer
 
 
 def is_local(url: str | None = None) -> bool:
@@ -200,23 +160,35 @@ def record_from_place(place: dict, target_country: str | None) -> dict | None:
 
 
 def scrape_campaign(campaign: dict, queries: list[str], limit: int, url: str | None = None, lang: str = DEFAULT_LANG,
-                    concurrency: int = DEFAULT_CONCURRENCY) -> list[dict]:
+                    concurrency: int = DEFAULT_CONCURRENCY, deadline: float | None = None,
+                    max_per_search: int = MAX_PLACES_PER_SEARCH) -> list[dict]:
     """New businesses for the campaign, at most `limit`, searching each query through the container in turn.
 
     The container has no paging, so each search asks for what is still needed plus the businesses the campaign
     already has (they come back first and are skipped), up to MAX_PLACES_PER_SEARCH. Businesses any campaign
     already has are skipped too.
+
+    With a `deadline` (time.monotonic(); the web app on Vercel, which must answer within its time limit) no search
+    starts with less than MIN_SEARCH_SECONDS left, each one may only use the time that is left, and a search asks for
+    at most `max_per_search` places.
     """
     seen = maps.existing_businesses(campaign["id"])
     records = []
-    for query in queries:
+    for number, query in enumerate(queries):
         if len(records) >= limit:
             break
+        timeout = REQUEST_TIMEOUT
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout < MIN_SEARCH_SECONDS:
+                print(f"Time limit reached: {len(queries) - number} search(es) not run; start the run again to "
+                      "continue (businesses found now are skipped then).")
+                break
         known = sum(1 for business in seen if business.get("discovery_campaign_id") == campaign["id"])
-        wanted = min(limit - len(records) + known, MAX_PLACES_PER_SEARCH)
+        wanted = min(limit - len(records) + known, max_per_search)
         print(f"Searching Google Maps through the scraper container: {query} (up to {wanted} places)", flush=True)
         try:
-            places = search(query, wanted, url, lang, concurrency)
+            places = search(query, wanted, url, lang, concurrency, timeout)
         except TimeoutError as error:
             print(f"  Skipped this search: {error}.")
             continue

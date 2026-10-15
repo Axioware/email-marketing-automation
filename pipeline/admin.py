@@ -20,7 +20,7 @@ from django.urls import path, reverse
 from django.utils.html import format_html, format_html_join
 from django.utils.text import Truncator
 
-from pipeline import jobs, review, webruns
+from pipeline import jobs, review
 from pipeline.models import (
     Business,
     CampaignPrompt,
@@ -1355,9 +1355,6 @@ class PipelineRunAdmin(PipelineAdmin):
     def change_view(self, request, object_id, form_url="", extra_context=None):
         jobs.refresh_stale_runs()
         run = PipelineRun.objects.filter(pk=object_id).first()
-        if run is not None and webruns.stalled(run):  # its batch died; whoever watches the run keeps it going
-            webruns.continue_run(run)
-            run.refresh_from_db()
         if run is not None:
             extra_context = {**(extra_context or {}), "run": run,
                              "rerun_url": run_form_url(run.command, run.arguments) if run.command in jobs.COMMANDS else None}
@@ -1365,16 +1362,7 @@ class PipelineRunAdmin(PipelineAdmin):
 
     def get_urls(self):
         return [path("<int:object_id>/cancel/", self.admin_site.admin_view(self.cancel_view),
-                     name="pipeline_pipelinerun_cancel"),
-                path("<int:object_id>/continue/", self.admin_site.admin_view(self.continue_view),
-                     name="pipeline_pipelinerun_continue")] + super().get_urls()
-
-    def continue_view(self, request, object_id):
-        if request.method != "POST":
-            return HttpResponseNotAllowed(["POST"])
-        run = get_object_or_404(PipelineRun, pk=object_id)
-        self.message_user(request, webruns.continue_run(run))
-        return HttpResponseRedirect(admin_url(run))
+                     name="pipeline_pipelinerun_cancel")] + super().get_urls()
 
     def cancel_view(self, request, object_id):
         if request.method != "POST":

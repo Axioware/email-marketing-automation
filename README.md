@@ -387,23 +387,21 @@ The scraper and Reacher can run on a VPS behind nginx instead of on the worker m
 3. **nginx**: paste `deploy/vps/nginx-locations.conf` into the site's `server` block and reload. It allows a search 340 s and a check 120 s.
 4. **App** (Vercel's environment variables, and `.env` wherever else the steps run): `MAPS_SCRAPER_URL=https://your-domain/scraper`, `MAPS_SCRAPER_KEY=<scraper key>`, `REACHER_URL=https://your-domain/reacher`, `REACHER_SECRET=<reacher key>`, plus `VERIFY_MAIL_FROM` (the app checks once per run that the sender's domain accepts mail). A remote Reacher must be https with a secret; the app then never manages it through Docker, checks the key before verifying anyone, and stops with "refused the key" when it is wrong.
 
-With these set on Vercel, **fetching through the scraper container and verifying emails run on Vercel itself**, no worker needed (pipeline/webruns.py):
+With these set on Vercel, **fetching through the scraper container and verifying emails run on Vercel itself, calling your server directly** (pipeline/webruns.py): no worker, no queue.
 
-- Each run advances in **batches** of about 3 minutes, each in its own function invocation, driven by **Vercel Queues** (a Celery task, `pipeline/tasks.py`; the subscriber is `vercel_worker.py`, declared in `pyproject.toml`). A batch queues the next until the run is done; closing the browser does not stop it.
-- **Fetching** uses the scraper's background searches (`POST /jobs`, then `GET /jobs/{id}`): a batch starts a search and looks at it every 5 seconds, so a 5-minute search simply spans two batches. Searches run one at a time on the server.
-- **Verifying** checks addresses until the batch's time is used, remembering which ones it checked, so none is checked twice in a run.
-- A batch holds a lease on its run, so two never work on it at once. If a batch dies, Vercel Queues delivers it again once the lease expires; the run page also continues a run that has not moved for 6 minutes (or **Continue now**, `POST /api/runs/{id}/continue/`). **Stop** takes effect between batches.
-- The run's page and the API show `runs_on`: `web` (these batches) or `worker` (everything else: the built-in browser, research, decision makers, a local Reacher).
-
-Generate each key with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+- The request that starts the run (the admin's run form, a dashboard button, or `POST /api/runs/`) calls the container, waits for its answer, saves the results and answers with the finished run. The page waits meanwhile (a Google Maps search takes a minute or more).
+- It must finish within Vercel's request limit (`vercel.json` allows 300 s; a run uses at most 270): a fetch runs Google Maps searches of at most 20 places while time is left, and verification checks addresses until about 3 minutes are used. The output then says what is left (`Time limit reached: ... start the run again`); starting the same run again continues, since businesses already saved and addresses already checked are skipped (verification also skips addresses that came back unknown; `--recheck` checks them).
+- A run Vercel cut off (it shows "running" for more than 6 minutes) is marked failed; start it again with a smaller `--limit`.
+- The run's page and the API show `runs_on`: `web` (run in the request) or `worker` (everything else: the built-in browser, research, decision makers, a local Reacher).
+- The scraper container also has `POST /jobs` / `GET /jobs/{id}` (a search in the background); the app does not use them.
 
 ## Deploying on Vercel (web app + worker)
 
 Vercel runs short web requests only: no background processes, browsers or Docker. So the **web app** (admin, API, webhooks) runs on Vercel, and the **pipeline steps** that need browsers or Docker (fetching with the built-in browser, research, decision makers, writing emails) run on a **worker**: a machine with Chromium, Firefox and the same `DATABASE_URL`. Fetching through the scraper container and verifying with Reacher run on Vercel itself when both are on your server (see [Containers on your own server](#containers-on-your-own-server-nginx)).
 
-- Vercel finds Django through `manage.py` and serves `WSGI_APPLICATION` (`emailautomation/wsgi.py`) as one function; static files go to its CDN. `vercel.json` only allows that function 60 s per request (the email-sent webhook writes the next follow-up with the AI inside that time; bulk-approve around 30-40 emails at a time, since each approval writes to GHL). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
+- Vercel finds Django through `manage.py` and serves `WSGI_APPLICATION` (`emailautomation/wsgi.py`) as one function; static files go to its CDN. `vercel.json` allows that function 300 s per request (a scraper/Reacher run uses up to 270 s; the email-sent webhook writes the next follow-up with the AI inside the request; bulk-approve around 30-40 emails at a time, since each approval writes to GHL). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
 - Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `SENDER_NAME`, and for scraping/verifying on Vercel `MAPS_SCRAPER_URL`, `MAPS_SCRAPER_KEY`, `REACHER_URL`, `REACHER_SECRET`, `VERIFY_MAIL_FROM` (see [Containers on your own server](#containers-on-your-own-server-nginx)).
-- `pyproject.toml` is what Vercel installs (keep its dependencies the same as `requirements.txt`; a test checks it) and declares the Vercel Queues subscriber for batched runs. On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
+- On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
 - Run `python manage.py migrate` from your machine (not on deploy).
 - On the worker: `python manage.py run_worker`. Runs started in the admin or the API wait in the queue until the worker picks them up; **Stop** reaches the worker through the database. The dashboard shows when the worker was last seen. Run one worker.
 
@@ -431,7 +429,7 @@ Tests never use the `.env` database or real services: they run against a throwaw
 | `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` + `ghl.py` (scheduling and GoHighLevel) |
 | `vercel.json` | the Vercel function settings (time limit, files left out) |
 | `deploy/vps/` | Reacher compose file and nginx locations for running the containers on your own server |
-| `pipeline/webruns.py`, `pipeline/tasks.py`, `vercel_worker.py`, `pyproject.toml` | runs Vercel executes itself in batches (scraper, Reacher) through Vercel Queues |
+| `pipeline/webruns.py` | scraper/Reacher runs Vercel executes itself, inside the request that starts them |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |
 | `pipeline/api/` | the REST API |

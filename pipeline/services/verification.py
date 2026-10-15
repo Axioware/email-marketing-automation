@@ -598,9 +598,10 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
-    """Check the contacts' addresses. In batches (pipeline/webruns.py) `options` also carries "progress" (a dict kept
-    between batches: the addresses this run already checked are skipped; "more" says whether any are left) and
-    "deadline" (time.monotonic() after which no new check starts)."""
+    """Check the contacts' addresses. The web app on Vercel (pipeline/webruns.py) also passes "deadline"
+    (time.monotonic() after which no new check starts, so it answers within its time limit) and "skip_unknown"
+    (addresses checked before with an unknown result are not checked again, so each run gets further; --recheck
+    checks them)."""
     if options["delay"] < 0 or options["reacher_timeout"] <= 0 or options["max_candidates"] < 0:
         raise CommandError("--delay and --max-candidates cannot be negative and --reacher-timeout must be > 0")
     if options["limit"] is not None and options["limit"] < 1:
@@ -630,20 +631,20 @@ def run(options: dict) -> int:
         report: list[dict] = []
         skipped = streak = deliverable_count = stored_count = 0
         aborted = out_of_time = False
-        progress, deadline = options.get("progress"), options.get("deadline")
-        checked = set(progress.setdefault("checked", [])) if progress is not None else set()
-        for contact in queue:
-            addresses = [address for address in candidate_addresses(contact, options["max_candidates"])
-                         if f"{contact['id']}:{address}" not in checked]
-            if not addresses and progress is not None:
-                continue  # done in an earlier batch
+        deadline, left = options.get("deadline"), 0
+        for position, contact in enumerate(queue):
+            addresses = candidate_addresses(contact, options["max_candidates"])
+            if deadline is not None and time.monotonic() >= deadline:
+                out_of_time, left = True, len(queue) - position
+                break
             print(f"Contact {contact['id']} ({contact['name']}), business {contact['business_id']}: {len(addresses)} address(es)")
             for address in addresses:
                 if deadline is not None and time.monotonic() >= deadline:
-                    out_of_time = True
+                    out_of_time, left = True, len(queue) - position
                     break
                 prospect_status = known.get((contact["id"], address))
-                if not options["recheck"] and already_decided(prospect_status):
+                if not options["recheck"] and (already_decided(prospect_status) or
+                                               (options.get("skip_unknown") and prospect_status == "unknown")):
                     skipped += 1
                     continue
                 domain = address.rpartition("@")[2].casefold()
@@ -691,8 +692,6 @@ def run(options: dict) -> int:
                     "status": status, "verdict": outcome["reason"], "probed": probed,
                     "catch_all": summary.get("is_catch_all"), "role_account": summary.get("is_role_account"), "note": note,
                 })
-                if progress is not None:
-                    progress["checked"].append(f"{contact['id']}:{address}")
                 if streak >= MAX_CONSECUTIVE_NO_SMTP:
                     print(f"Reacher could not open an SMTP connection to {streak} servers in a row; outbound port 25 is "
                           "probably blocked for Docker or your network. Stopping. Results so far are saved.")
@@ -700,8 +699,9 @@ def run(options: dict) -> int:
                     break
             if aborted or out_of_time:
                 break
-        if progress is not None:
-            progress["more"] = out_of_time and not aborted
+        if out_of_time:
+            print(f"Time limit reached: {left} contact(s) not finished; start the run again to continue "
+                  "(addresses checked now are skipped then).")
 
         total = sum(counts.values())
         saved = "nothing saved (dry run)" if dry_run else f"{stored_count} saved to prospects"

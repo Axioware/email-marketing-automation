@@ -502,7 +502,7 @@ class EmailOpenEvent(models.Model):
 
 class PipelineRun(models.Model):
     """One run of a pipeline command, started from the admin or the API and executed in a background process (or, on
-    Vercel, in short batches; pipeline/webruns.py)."""
+    Vercel, inside the request that started it; pipeline/webruns.py)."""
 
     class Status(models.TextChoices):
         QUEUED = "queued", "Queued"
@@ -521,12 +521,10 @@ class PipelineRun(models.Model):
     pid = models.IntegerField(null=True, blank=True)
     cancel_requested = models.BooleanField(default=False, db_default=False, help_text="Stop asked for; the worker running it stops it.")
     runs_on = models.CharField(
-        max_length=8, choices=[("worker", "Worker"), ("web", "Web app, in batches")], default="worker",
+        max_length=8, choices=[("worker", "Worker"), ("web", "Web app, directly")], default="worker",
         db_default="worker",
-        help_text="Worker: a machine running run_worker. Web app: Vercel itself, one short batch at a time (steps that "
-                  "only call the scraper container or Reacher on your server).")
-    progress = models.JSONField(default=dict, blank=True, help_text="Where a batched run is (the next batch continues there).")
-    lease_until = models.DateTimeField(null=True, blank=True, help_text="A batch is working on the run until then.")
+        help_text="Worker: a machine running run_worker. Web app: Vercel itself, inside the request that started it "
+                  "(steps that only call the scraper container or Reacher on your server).")
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
