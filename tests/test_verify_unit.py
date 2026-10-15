@@ -42,6 +42,33 @@ class SenderGuardTests(unittest.TestCase):
         self.assertIsNone(v.check_sender(self.client, "good@mine.org"))
 
 
+class SecretTests(unittest.TestCase):
+    """Reacher with RCH__HEADER_SECRET: every check carries x-reacher-secret; /version needs none."""
+
+    def setUp(self):
+        self.server = FakeReacher()
+        self.server.secret = "s3cret"
+        self.addCleanup(self.server.close)
+
+    def test_right_secret_is_sent(self):
+        client = v.ReacherClient(self.server.url, 5, "s3cret")
+        client.check_key()
+        self.assertEqual(v.summarize_reacher(client.check("good@a.org"))["is_reachable"], "safe")
+
+    def test_missing_or_wrong_secret_stops_the_run(self):
+        for secret in (None, "wrong"):
+            client = v.ReacherClient(self.server.url, 5, secret)
+            self.assertEqual(client.version(), "0.11.6")  # Reacher answers /version to anyone
+            with self.assertRaisesMessage(v.ReacherUnavailable, "refused the key"):
+                client.check_key()
+            with self.assertRaisesMessage(v.ReacherUnavailable, "refused the key"):
+                client.check("good@a.org")
+        self.assertEqual(self.server.calls, [])
+
+    def assertRaisesMessage(self, exc, text):
+        return self.assertRaisesRegex(exc, text)
+
+
 class PureLogicTests(unittest.TestCase):
     def test_candidate_addresses_puts_the_contact_email_first_and_dedupes(self):
         contact = {"email": "Shoaib@x.pk", "candidate_emails": [
@@ -386,13 +413,21 @@ class EnsureReacherTests(unittest.TestCase):
             self.ensure(auto_start=False)
         self.assertEqual(self.commands, [])
 
-    def test_remote_url_is_rejected(self):
-        for url in ("https://reacher.example.com", "https://api.reacher.email"):
-            self.client.base_url = url
+    def test_remote_url_needs_https_and_a_secret(self):
+        for url, secret in (("https://reacher.example.com", None), ("http://reacher.example.com", "s"),
+                            ("https://api.reacher.email", "")):
+            self.client.base_url, self.client.secret = url, secret
             with self.assertRaises(v.ReacherUnavailable) as caught:
                 self.ensure()
             self.assertIn("is not local", str(caught.exception))
         self.assertEqual(self.commands, [])
+
+    def test_remote_server_is_used_as_it_is(self):
+        self.client.base_url, self.client.secret = "https://vps.example.com/reacher", "s3cret"
+        self.versions = ["0.11.6"]
+        self.assertEqual(self.ensure(helo=None, mail_from=None), "0.11.6")
+        self.client.check_key.assert_called_once_with()
+        self.assertEqual(self.commands, [])  # never managed through Docker
 
     def test_no_docker(self):
         with mock.patch.object(v.shutil, "which", lambda name: None):

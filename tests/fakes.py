@@ -60,6 +60,7 @@ class FakeReacher:
         self.die_on: str | None = None  # close the socket without answering for this local part
         self.shutdown_on: str | None = None  # same, and take the whole server down afterwards
         self.sequence: dict[str, list] = {}  # local part -> scenario names consumed one per call
+        self.secret: str | None = None  # like RCH__HEADER_SECRET: checks then need the x-reacher-secret header
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -85,6 +86,11 @@ class FakeReacher:
                 to = json.loads(self.rfile.read(length))["to_email"]
                 if self.path not in ("/v1/check_email", "/v0/check_email") or (self.path == "/v1/check_email" and fake.only_v0):
                     return self._send(404, {})
+                if fake.secret is not None:
+                    supplied = self.headers.get("x-reacher-secret")
+                    if supplied != fake.secret:  # what Reacher answers (plain text, 400)
+                        word = "Missing" if supplied is None else "Invalid"
+                        return self._send(400, raw=f'{word} request header "x-reacher-secret"'.encode())
                 fake.calls.append(to)
                 local = to.split("@")[0]
                 if local in (fake.die_on, fake.shutdown_on):

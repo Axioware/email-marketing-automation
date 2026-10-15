@@ -7,7 +7,8 @@ works. Long steps (scraping, research, verification) therefore never block a web
 RUN_MODE=local (default): starting a run spawns that process on this machine.
 RUN_MODE=queue (the web app on Vercel, which cannot run background processes, browsers or Docker): starting a run
 only stores it; `manage.py run_worker` on a machine with the browsers and Docker picks queued runs up, and a stop
-request is passed to it through the database.
+request is passed to it through the database. Steps that only call the scraper container or Reacher on your own server
+run on Vercel itself, in batches (pipeline/webruns.py).
 """
 import argparse
 import os
@@ -145,9 +146,21 @@ def start_run(command: str, arguments: list[str], user=None) -> PipelineRun:
     worker starts it)."""
     run = PipelineRun.objects.create(command=command, arguments=arguments,
                                      created_by=user if getattr(user, "is_authenticated", False) else None)
-    if not queue_mode():
-        transaction.on_commit(lambda: launch(run.pk))
+    dispatch(run)
     return run
+
+
+def dispatch(run: PipelineRun) -> None:
+    """Decide where a new run executes and start it once the surrounding transaction commits: in batches on the web
+    app (Vercel, steps that only call your own server), on a worker (queue mode), or in a process here."""
+    from pipeline import webruns
+
+    if webruns.web_capable(run.command, run.arguments):
+        PipelineRun.objects.filter(pk=run.pk).update(runs_on="web")
+        run.runs_on = "web"
+        transaction.on_commit(lambda: webruns.kick(run.pk))
+    elif not queue_mode():
+        transaction.on_commit(lambda: launch(run.pk))
 
 
 def log_path(run_id: int) -> Path:
@@ -176,6 +189,10 @@ def cancel_run(run: PipelineRun) -> str:
     run.refresh_from_db()
     if run.status != PipelineRun.Status.RUNNING:
         return "This run is not running."
+    if run.runs_on == "web":
+        from pipeline import webruns
+
+        return webruns.cancel(run)
     if queue_mode():  # it runs on the worker's machine: the worker sees the request and stops it
         PipelineRun.objects.filter(pk=run.pk).update(cancel_requested=True)
         return "Stop requested; the worker stops the run within a few seconds."
@@ -216,7 +233,8 @@ def fail_dead_runs(queued_too: bool = False) -> None:
     """Running runs whose process (on this machine) is gone are marked failed; with `queued_too`, also runs that
     never started within QUEUED_TIMEOUT."""
     now = timezone.now()
-    for run in PipelineRun.objects.filter(status=PipelineRun.Status.RUNNING).exclude(pid=None):
+    worker_runs = PipelineRun.objects.filter(runs_on="worker")  # web runs have no process (pipeline/webruns.py)
+    for run in worker_runs.filter(status=PipelineRun.Status.RUNNING).exclude(pid=None):
         if not process_alive(run.pid):
             PipelineRun.objects.filter(pk=run.pk, status=PipelineRun.Status.RUNNING).update(
                 status=PipelineRun.Status.FAILED, finished_at=now,
@@ -224,7 +242,7 @@ def fail_dead_runs(queued_too: bool = False) -> None:
             )
     if not queued_too:
         return
-    for run in PipelineRun.objects.filter(status=PipelineRun.Status.QUEUED, created_at__lt=now - QUEUED_TIMEOUT):
+    for run in worker_runs.filter(status=PipelineRun.Status.QUEUED, created_at__lt=now - QUEUED_TIMEOUT):
         PipelineRun.objects.filter(pk=run.pk, status=PipelineRun.Status.QUEUED).update(
             status=PipelineRun.Status.FAILED, finished_at=now,
             output="[The run never started.]\n" + _log_tail(run.pk),
@@ -289,7 +307,7 @@ class RunOutput:
 
 def execute_run(run_id: int) -> int:
     """Run a queued pipeline run in this process and record the result. Returns the exit code."""
-    if not PipelineRun.objects.filter(pk=run_id, status=PipelineRun.Status.QUEUED).update(
+    if not PipelineRun.objects.filter(pk=run_id, status=PipelineRun.Status.QUEUED, runs_on="worker").update(
         status=PipelineRun.Status.RUNNING, started_at=timezone.now(), pid=os.getpid()
     ):
         return 0  # cancelled before it started, or already taken

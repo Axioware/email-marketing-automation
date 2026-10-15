@@ -1,0 +1,14 @@
+# Reacher on your VPS: put REACHER_SECRET, VERIFY_MAIL_FROM and VERIFY_HELO in a .env next to this file, then
+#   docker compose -f reacher-compose.yml up -d
+# Outbound port 25 must be open on the VPS; VERIFY_HELO should match the VPS's reverse DNS (PTR) name.
+services:
+  reacher:
+    image: reacherhq/backend:latest
+    container_name: reacher
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"  # only nginx on this machine reaches it
+    environment:
+      RCH__HEADER_SECRET: ${REACHER_SECRET:?Set REACHER_SECRET in .env}
+      RCH__FROM_EMAIL: ${VERIFY_MAIL_FROM:?Set VERIFY_MAIL_FROM in .env}
+      RCH__HELLO_NAME: ${VERIFY_HELO:?Set VERIFY_HELO in .env}

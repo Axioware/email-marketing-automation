@@ -58,7 +58,7 @@ class Command(BaseCommand):
                 if clock - last_beat >= HEARTBEAT_SECONDS:
                     heartbeat(name)
                     last_beat = clock
-                run = (PipelineRun.objects.filter(status=PipelineRun.Status.QUEUED)
+                run = (PipelineRun.objects.filter(status=PipelineRun.Status.QUEUED, runs_on="worker")
                        .order_by("created_at", "id").first())
                 if run is None:
                     if options["once"]:

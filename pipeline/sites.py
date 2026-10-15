@@ -45,7 +45,7 @@ def lead_sources() -> dict:
     campaigns = DiscoveryCampaign.objects.annotate(business_total=Count("businesses")).order_by("-created_at")[:8]
     from pipeline import jobs
 
-    if jobs.queue_mode():  # fetching runs on the worker, so the worker's view of the container counts
+    if jobs.queue_mode() and scraper_api.is_local():  # the worker's own container: the worker's view of it counts
         worker = worker_status()
         problem = (worker["info"].get("scraper") if worker["alive"] else "not known (no worker running)")
         problem = None if problem == "running" else problem

@@ -1,5 +1,8 @@
 """Verify candidate emails with a self-hosted Reacher server (Docker) and store every result in `prospects`.
 
+Reacher runs either in local Docker (managed here) or on your own server behind nginx (REACHER_URL=https://...,
+REACHER_SECRET = its RCH__HEADER_SECRET, sent as `x-reacher-secret`; a remote server needs both).
+
 Flow: for each contact in `business_contacts`, take the contact's own `email` plus every address in
 `candidate_emails`, check each with Reacher, and store each address in `prospects` with its status (deliverable,
 undeliverable, risky, unknown) and a detailed verdict (catch_all, mailbox_not_found, smtp_unreachable, ...).
@@ -76,17 +79,18 @@ class ReacherError(RuntimeError):
 class ReacherClient:
     """Minimal client for the local reacherhq/backend HTTP API (https://github.com/reacherhq/check-if-email-exists)."""
 
-    def __init__(self, base_url: str, timeout: float):
+    def __init__(self, base_url: str, timeout: float, secret: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.secret = secret or None
         self.path: str | None = None  # remembered after the first successful call
 
     def _request(self, method: str, path: str, body: dict | None = None, timeout: float | None = None) -> dict:
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        request = Request(
-            f"{self.base_url}{path}", data=data, method=method,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.secret:
+            headers["x-reacher-secret"] = self.secret
+        request = Request(f"{self.base_url}{path}", data=data, method=method, headers=headers)
         with urlopen(request, timeout=timeout or self.timeout) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
 
@@ -109,6 +113,8 @@ class ReacherClient:
             except HTTPError as error:
                 if error.code == 404 and path != paths[-1]:
                     continue  # older/newer image exposing the other version prefix
+                if key_refused(error):
+                    raise ReacherUnavailable(KEY_REFUSED) from error
                 raise ReacherError(f"Reacher returned HTTP {error.code}") from error
             except (socket.timeout, TimeoutError) as error:
                 raise ReacherError("Reacher request timed out") from error
@@ -124,8 +130,34 @@ class ReacherClient:
                 raise ReacherError("Reacher returned an unreadable response") from error
         raise ReacherError("Reacher exposes no check_email endpoint")
 
+    def check_key(self) -> None:
+        """Reacher answers /version without the secret, so the key is tried on an address that is not one (answered
+        at once, no mail server is contacted). Raises ReacherUnavailable when it is refused."""
+        try:
+            self.check("not-an-address")
+        except ReacherError:
+            pass  # the key was accepted; anything else shows up on the first real check
+
+
+KEY_REFUSED = "Reacher refused the key: REACHER_SECRET must equal its RCH__HEADER_SECRET."
+
+
+def key_refused(error: HTTPError) -> bool:
+    """Reacher answers 400 'Missing/Invalid request header "x-reacher-secret"'; nginx or a proxy may answer 401/403."""
+    if error.code in (401, 403):
+        return True
+    try:
+        body = error.read().decode("utf-8", "replace")
+    except (OSError, AttributeError):
+        return False
+    return error.code == 400 and "x-reacher-secret" in body
+
 
 # ---------------------------------------------------------------- Docker setup
+
+
+def is_local(url: str) -> bool:
+    return (urlsplit(url).hostname or "") in LOCAL_HOSTS
 
 
 def reacher_env(mail_from: str | None, helo: str | None) -> dict[str, str]:
@@ -173,12 +205,18 @@ def ensure_reacher(client: ReacherClient, mail_from: str | None, helo: str | Non
 
     Creates the container if missing, starts it if stopped, and recreates it when its sender/HELO settings
     differ from the wanted ones (a wrong HELO makes mail servers refuse every check, giving false results).
-    Returns the Reacher version. Raises ReacherUnavailable with an actionable message otherwise.
+    A remote Reacher (your own server) is never managed: it must be https with REACHER_SECRET, and its sender/HELO
+    are set on that server. Returns the Reacher version. Raises ReacherUnavailable with an actionable message otherwise.
     """
     wanted = reacher_env(mail_from, helo)
     parts = urlsplit(client.base_url)
-    if (parts.hostname or "") not in LOCAL_HOSTS:
-        raise ReacherUnavailable(f"REACHER_URL {client.base_url} is not local; only a local Docker Reacher is supported.")
+    if not is_local(client.base_url):
+        if parts.scheme != "https" or not client.secret:
+            raise ReacherUnavailable(f"REACHER_URL {client.base_url} is not local: a remote Reacher must use https "
+                                     "and REACHER_SECRET (its RCH__HEADER_SECRET).")
+        version = client.version()
+        client.check_key()
+        return version
     if not auto_start:
         return client.version()  # raises ReacherUnavailable when it is not running
     if shutil.which("docker") is None:
@@ -359,7 +397,8 @@ def check_address(address: str, client: ReacherClient, delay: float, last_call: 
 def add_reacher_arguments(parser) -> None:
     """Options for talking to the local Reacher container."""
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Minimum seconds between checks to one domain.")
-    parser.add_argument("--reacher-url", help=f"Local Reacher base URL (default: REACHER_URL or {REACHER_DEFAULT_URL}).")
+    parser.add_argument("--reacher-url", help=f"Reacher base URL: local Docker or your own https server (default: "
+                                              f"REACHER_URL or {REACHER_DEFAULT_URL}).")
     parser.add_argument("--reacher-timeout", type=float, default=DEFAULT_REACHER_TIMEOUT,
                         help="Seconds to wait for one Reacher check (default: 90).")
     parser.add_argument("--mail-from", help="Sender address Reacher announces (default: VERIFY_MAIL_FROM).")
@@ -383,7 +422,8 @@ def prepare_reacher(options: dict) -> ReacherClient | None:
         if value and is_reserved_domain(value):
             raise CommandError(f"{label} uses the reserved placeholder domain '{value}', which cannot receive mail; mail servers "
                                "reject checks sent from it and Reacher then reports real mailboxes as invalid. Use a domain you own.")
-    if not helo and not options["no_auto_start"]:
+    url = options["reacher_url"] or os.environ.get("REACHER_URL") or REACHER_DEFAULT_URL
+    if not helo and not options["no_auto_start"] and is_local(url):  # a remote Reacher has its HELO set on its server
         raise CommandError(
             "VERIFY_HELO is not set. Without it Reacher announces 'localhost' and mail servers refuse every check "
             "(results would all be 'unknown'). Set VERIFY_HELO=mail.yourdomain.com (and VERIFY_MAIL_FROM) in .env, "
@@ -393,15 +433,15 @@ def prepare_reacher(options: dict) -> ReacherClient | None:
         print(f"Warning: sender '{mail_from}' is on a consumer provider; servers check SPF for the sender and may "
               "refuse or block the checks. Use an address on a domain you control.")
 
-    client = ReacherClient(options["reacher_url"] or os.environ.get("REACHER_URL") or REACHER_DEFAULT_URL, options["reacher_timeout"])
+    client = ReacherClient(url, options["reacher_timeout"], os.environ.get("REACHER_SECRET", "").strip())
     try:
         version = ensure_reacher(client, mail_from, helo, not options["no_auto_start"], options["reacher_container"])
     except ReacherUnavailable as error:
         print(error)
-        print("Reacher must run locally in Docker (see README).")
+        print("Reacher must run in local Docker or on your own server (see README).")
         return None
-    print(f"Using Reacher {version} at {client.base_url}. Outbound port 25 must be open for it. No email is sent.")
-    if mail_from:
+    print(f"Using Reacher {version} at {client.base_url}. Outbound port 25 must be open where it runs. No email is sent.")
+    if mail_from and not options.get("skip_sender_check"):
         problem = check_sender(client, mail_from)
         if problem:
             print(f"Sender problem: {problem}. Mail servers would reject every check and Reacher would report real "
@@ -558,6 +598,9 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
+    """Check the contacts' addresses. In batches (pipeline/webruns.py) `options` also carries "progress" (a dict kept
+    between batches: the addresses this run already checked are skipped; "more" says whether any are left) and
+    "deadline" (time.monotonic() after which no new check starts)."""
     if options["delay"] < 0 or options["reacher_timeout"] <= 0 or options["max_candidates"] < 0:
         raise CommandError("--delay and --max-candidates cannot be negative and --reacher-timeout must be > 0")
     if options["limit"] is not None and options["limit"] < 1:
@@ -586,11 +629,19 @@ def run(options: dict) -> int:
         counts: dict[str, int] = {}
         report: list[dict] = []
         skipped = streak = deliverable_count = stored_count = 0
-        aborted = False
+        aborted = out_of_time = False
+        progress, deadline = options.get("progress"), options.get("deadline")
+        checked = set(progress.setdefault("checked", [])) if progress is not None else set()
         for contact in queue:
-            addresses = candidate_addresses(contact, options["max_candidates"])
+            addresses = [address for address in candidate_addresses(contact, options["max_candidates"])
+                         if f"{contact['id']}:{address}" not in checked]
+            if not addresses and progress is not None:
+                continue  # done in an earlier batch
             print(f"Contact {contact['id']} ({contact['name']}), business {contact['business_id']}: {len(addresses)} address(es)")
             for address in addresses:
+                if deadline is not None and time.monotonic() >= deadline:
+                    out_of_time = True
+                    break
                 prospect_status = known.get((contact["id"], address))
                 if not options["recheck"] and already_decided(prospect_status):
                     skipped += 1
@@ -640,13 +691,17 @@ def run(options: dict) -> int:
                     "status": status, "verdict": outcome["reason"], "probed": probed,
                     "catch_all": summary.get("is_catch_all"), "role_account": summary.get("is_role_account"), "note": note,
                 })
+                if progress is not None:
+                    progress["checked"].append(f"{contact['id']}:{address}")
                 if streak >= MAX_CONSECUTIVE_NO_SMTP:
                     print(f"Reacher could not open an SMTP connection to {streak} servers in a row; outbound port 25 is "
                           "probably blocked for Docker or your network. Stopping. Results so far are saved.")
                     aborted = True
                     break
-            if aborted:
+            if aborted or out_of_time:
                 break
+        if progress is not None:
+            progress["more"] = out_of_time and not aborted
 
         total = sum(counts.values())
         saved = "nothing saved (dry run)" if dry_run else f"{stored_count} saved to prospects"

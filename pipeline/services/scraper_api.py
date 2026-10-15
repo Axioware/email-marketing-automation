@@ -1,7 +1,8 @@
 """Module 1, second lead source: the Google Maps scraper container (github.com/conor-is-my-name/google-maps-scraper).
 
-The container is a FastAPI service (port 8001 by default; MAPS_SCRAPER_URL in .env) that runs its own headless
-Chromium. `GET /scrape-get?query=...&max_places=...&lang=...&concurrency=...` searches Google Maps, opens every place
+The container is a FastAPI service (port 8001 by default; MAPS_SCRAPER_URL in .env, e.g. https://your-vps/scraper
+behind nginx) that runs its own headless Chromium. Every request sends `X-API-Key: MAPS_SCRAPER_KEY` (the container's
+SCRAPER_API_KEY). `GET /scrape-get?query=...&max_places=...&lang=...&concurrency=...` searches Google Maps, opens every place
 and answers with a JSON list once it is done (it gives up after 5 minutes); `GET /` answers when it is up. Each place:
 name, place_id, coordinates, address, rating, reviews_count, categories, website, phone (digits with the country code),
 hours, link. They are turned into the same records the built-in browser produces, so de-duplication, saving and every
@@ -21,6 +22,7 @@ REQUEST_TIMEOUT = 330  # seconds; the container stops a search after 300
 MAX_PLACES_PER_SEARCH = 40  # one search must finish inside the container's 5 minutes
 DEFAULT_CONCURRENCY = 5  # the container's own default; 1-20, higher is faster but more likely to be blocked
 DEFAULT_LANG = "en"
+KEY_REFUSED = "refused the key (MAPS_SCRAPER_KEY must equal the container's SCRAPER_API_KEY)"
 
 
 class ScraperUnavailable(RuntimeError):
@@ -31,8 +33,13 @@ def base_url(url: str | None = None) -> str:
     return (url or os.environ.get("MAPS_SCRAPER_URL", "").strip() or DEFAULT_URL).rstrip("/")
 
 
+def _headers() -> dict:
+    key = os.environ.get("MAPS_SCRAPER_KEY", "").strip()
+    return {"Accept": "application/json", **({"X-API-Key": key} if key else {})}
+
+
 def _get(url: str, timeout: float):
-    request = Request(url, headers={"Accept": "application/json"})
+    request = Request(url, headers=_headers())
     with urlopen(request, timeout=timeout) as response:  # noqa: S310 - a URL from our own settings
         return json.loads(response.read().decode("utf-8") or "null")
 
@@ -43,7 +50,7 @@ def status(url: str | None = None, timeout: float = 3) -> str | None:
         _get(base_url(url) + "/", timeout)
         return None
     except HTTPError as error:
-        return f"answered HTTP {error.code}"
+        return KEY_REFUSED if error.code == 401 else f"answered HTTP {error.code}"
     except (URLError, OSError, ValueError) as error:
         return f"not reachable ({getattr(error, 'reason', error)})"
 
@@ -64,6 +71,8 @@ def search(query: str, max_places: int, url: str | None = None, lang: str = DEFA
             detail = json.loads(error.read().decode("utf-8")).get("detail", "")
         except (ValueError, AttributeError, OSError):
             pass
+        if error.code == 401:
+            raise ScraperUnavailable(f"the scraper container {KEY_REFUSED}") from error
         raise ScraperUnavailable(f"the scraper container answered HTTP {error.code} {detail}".strip()) from error
     except (URLError, OSError) as error:
         raise ScraperUnavailable(f"the scraper container at {base_url(url)} is not reachable "
@@ -73,6 +82,57 @@ def search(query: str, max_places: int, url: str | None = None, lang: str = DEFA
     if not isinstance(places, list):
         raise ScraperUnavailable("the scraper container answered something other than a list of places")
     return [place for place in places if isinstance(place, dict)]
+
+
+def _call(url: str, method: str, timeout: float):
+    """A JSON request to the container's job endpoints; errors become ScraperUnavailable (404 stays an HTTPError)."""
+    request = Request(url, method=method, headers=_headers(), data=b"" if method == "POST" else None)
+    try:
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - a URL from our own settings
+            return json.loads(response.read().decode("utf-8") or "null")
+    except HTTPError as error:
+        if error.code == 404:
+            raise
+        if error.code == 401:
+            raise ScraperUnavailable(f"the scraper container {KEY_REFUSED}") from error
+        raise ScraperUnavailable(f"the scraper container answered HTTP {error.code}") from error
+    except (URLError, OSError, ValueError) as error:
+        raise ScraperUnavailable(f"the scraper container at {base_url()} is not reachable "
+                                 f"({getattr(error, 'reason', error)})") from error
+
+
+JOB_REQUEST_TIMEOUT = 30
+
+
+def start_job(query: str, max_places: int, lang: str = DEFAULT_LANG, concurrency: int = DEFAULT_CONCURRENCY) -> str:
+    """Start a search in the background on the container (POST /jobs); returns its id at once. For callers with a
+    short request limit (Vercel); the container runs one search at a time."""
+    params = urlencode({"query": query, "max_places": max_places, "lang": lang, "concurrency": concurrency})
+    try:
+        answer = _call(f"{base_url()}/jobs?{params}", "POST", JOB_REQUEST_TIMEOUT)
+    except HTTPError as error:
+        raise ScraperUnavailable("the scraper container has no /jobs endpoint; update it") from error
+    if not isinstance(answer, dict) or not answer.get("id"):
+        raise ScraperUnavailable("the scraper container did not answer a job id")
+    return str(answer["id"])
+
+
+def job(job_id: str) -> dict | None:
+    """The job's state: {"status": queued|running|done|failed, "error", "results" (when done)}; None when the
+    container no longer knows it (it restarted)."""
+    try:
+        answer = _call(f"{base_url()}/jobs/{job_id}", "GET", JOB_REQUEST_TIMEOUT)
+    except HTTPError:
+        return None
+    if not isinstance(answer, dict) or answer.get("status") not in ("queued", "running", "done", "failed"):
+        raise ScraperUnavailable("the scraper container answered an unreadable job")
+    if answer["status"] == "done":
+        answer["results"] = [place for place in answer.get("results") or [] if isinstance(place, dict)]
+    return answer
+
+
+def is_local(url: str | None = None) -> bool:
+    return (urlsplit(base_url(url)).hostname or "") in ("127.0.0.1", "localhost", "::1")
 
 
 def normalize_phone(value, country: str | None) -> str | None:

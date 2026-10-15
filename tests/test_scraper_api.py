@@ -33,8 +33,8 @@ PLACES = [
 class FakeContainer:
     """GET / answers; GET /scrape-get answers `places` (or `status`), recording each request's parameters."""
 
-    def __init__(self, places=PLACES, status=200):
-        self.places, self.status, self.requests = places, status, []
+    def __init__(self, places=PLACES, status=200, key=None):
+        self.places, self.status, self.requests, self.key = places, status, [], key
         container = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -43,7 +43,9 @@ class FakeContainer:
 
             def do_GET(self):
                 url = urlsplit(self.path)
-                if url.path == "/scrape-get":
+                if container.key is not None and self.headers.get("X-API-Key") != container.key:
+                    code, body = 401, {"detail": "Wrong or missing X-API-Key header."}
+                elif url.path == "/scrape-get":
                     container.requests.append({key: values[0] for key, values in parse_qs(url.query).items()})
                     code, body = container.status, container.places if container.status == 200 else {"detail": "boom"}
                 else:
@@ -157,6 +159,27 @@ class FetchTests(ScraperCase):
         self.assertEqual(self.container.requests[0]["max_places"], str(scraper_api.MAX_PLACES_PER_SEARCH))
         self.assertEqual(run_command("fetch_businesses", "--campaign-id", self.campaign.pk, "--limit", 1,
                                      "--concurrency", 50).returncode, 1)
+
+
+class KeyTests(TestCase):
+    """The container behind nginx answers only requests with X-API-Key = MAPS_SCRAPER_KEY."""
+
+    def setUp(self):
+        self.container = FakeContainer(key="s3cret")
+        self.addCleanup(self.container.close)
+
+    def test_key_is_sent(self):
+        with mock.patch.dict("os.environ", {"MAPS_SCRAPER_KEY": "s3cret"}):
+            self.assertIsNone(scraper_api.status(self.container.url))
+            self.assertEqual(len(scraper_api.search("dentist", 2, self.container.url)), 2)
+
+    def test_wrong_or_missing_key_is_reported(self):
+        for env in ({"MAPS_SCRAPER_KEY": "wrong"}, {"MAPS_SCRAPER_KEY": ""}):
+            with mock.patch.dict("os.environ", env):
+                self.assertIn("refused the key", scraper_api.status(self.container.url))
+                with self.assertRaisesRegex(scraper_api.ScraperUnavailable, "refused the key"):
+                    scraper_api.search("dentist", 2, self.container.url)
+        self.assertEqual(self.container.requests, [])
 
 
 class AdminAndApiTests(ScraperCase):

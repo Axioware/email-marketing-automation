@@ -229,9 +229,10 @@ class PipelineRunSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PipelineRun
-        fields = ["id", "command", "arguments", "options", "command_line", "status", "exit_code", "output",
+        fields = ["id", "command", "arguments", "options", "command_line", "status", "runs_on", "exit_code", "output",
                   "created_by", "created_at", "started_at", "finished_at"]
-        read_only_fields = ["status", "exit_code", "output", "created_by", "created_at", "started_at", "finished_at"]
+        read_only_fields = ["status", "runs_on", "exit_code", "output", "created_by", "created_at", "started_at",
+                            "finished_at"]
         extra_kwargs = {"arguments": {"required": False, "help_text": 'Raw arguments, e.g. ["--limit", "5"].'}}
 
     def validate_command(self, value):
