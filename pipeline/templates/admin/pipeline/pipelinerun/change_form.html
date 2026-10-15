@@ -1,0 +1,36 @@
+{% extends "admin/change_form.html" %}
+{% block extrahead %}
+  {{ block.super }}
+  {% if run and not run.is_finished %}<meta http-equiv="refresh" content="3">{% endif %}
+{% endblock %}
+
+{% block object-tools-items %}
+  {% if rerun_url %}<li><a href="{{ rerun_url }}">Run again</a></li>{% endif %}
+  {{ block.super }}
+{% endblock %}
+
+{% block content %}
+{% if run and not run.is_finished %}
+  <form method="post" action="{% url 'admin:pipeline_pipelinerun_cancel' run.pk %}" class="pipeline-actions">{% csrf_token %}
+    <span>This page refreshes every few seconds while the run is {{ run.get_status_display|lower }}.</span>
+    <input type="submit" class="danger" value="Stop this run">
+  </form>
+{% endif %}
+{{ block.super }}
+{% if commands %}
+<div class="pipeline-help">
+  <h2>Commands and their options</h2>
+  <p class="help">Runs execute in the background exactly like <code>python manage.py &lt;command&gt; &lt;arguments&gt;</code>; you can follow the output on the next page.</p>
+  {% for command in commands %}
+    <details>
+      <summary>{{ command.command }} - {{ command.description }}</summary>
+      <table>
+        {% for option in command.options %}
+          <tr><td><code>{{ option.flag }}</code></td><td>{{ option.type }}</td><td>{{ option.help }}{% if option.default is not None and option.default is not False %} (default: {{ option.default }}){% endif %}</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

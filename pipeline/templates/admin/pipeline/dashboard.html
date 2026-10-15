@@ -1,0 +1,100 @@
+{% extends "admin/index.html" %}
+{% block coltype %}colM{% endblock %}
+{% block sidebar %}{% endblock %}
+{% block content %}
+<div id="content-main">
+  <div class="pipeline-dash">
+    {% if warnings %}
+      <ul class="pipeline-warnings">{% for warning in warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+    {% endif %}
+
+    <div class="pipeline-funnel">
+      {% for label, count, url, note in funnel %}
+        <a href="{{ url }}"><b>{{ count }}</b><span>{{ label }}</span><small>{{ note }}</small></a>
+      {% endfor %}
+    </div>
+
+    <div class="module">
+      <h2>What to do next</h2>
+      {% if steps %}
+        <ul class="pipeline-steps">
+          {% for text, label, url in steps %}
+            <li><span>{{ text }}</span><a class="button" href="{{ url }}">{{ label }}</a></li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="pipeline-empty">Nothing waiting. Start a new campaign or fetch more businesses to keep the pipeline moving.</p>
+      {% endif %}
+    </div>
+
+    {% if worker %}
+    <p class="pipeline-source-status">Worker: {% if worker.alive %}<span class="pipeline-badge pipeline-succeeded">running</span> on {{ worker.name }}{% else %}<span class="pipeline-badge pipeline-failed">not running</span>{% if worker.last_seen %} (last seen {{ worker.last_seen|timesince }} ago){% endif %}{% endif %}. Pipeline runs started here execute on the worker.</p>
+    {% endif %}
+
+    <div class="module">
+      <h2>Get leads</h2>
+      <p class="pipeline-source-status">
+        Two ways to find businesses on Google Maps: the <b>built-in browser</b> (this app's own Chromium) or the
+        <b>scraper container</b> at <code>{{ leads.scraper_url }}</code>:
+        {% if leads.scraper_problem %}<span class="pipeline-badge pipeline-failed">{{ leads.scraper_problem }}</span>
+        {% else %}<span class="pipeline-badge pipeline-succeeded">running</span>{% endif %}
+      </p>
+      {% if leads.campaigns %}
+        <table class="pipeline-leads">
+          <thead><tr><th>Campaign</th><th>Lead source</th><th>Businesses</th><th>Fetch 20 more with</th></tr></thead>
+          <tbody>{% for row in leads.campaigns %}
+            <tr>
+              <td><a href="{{ row.url }}">{{ row.campaign.name }}</a></td>
+              <td>{{ row.campaign.get_lead_source_display }}</td>
+              <td>{{ row.campaign.business_total }}</td>
+              <td class="pipeline-leads-actions">
+                <a class="button" href="{{ row.browser_url }}">Built-in browser</a>
+                <a class="button{% if leads.scraper_problem %} pipeline-disabled{% endif %}" href="{{ row.scraper_url }}"
+                   {% if leads.scraper_problem %}title="The scraper container is {{ leads.scraper_problem }}"{% endif %}>Scraper container</a>
+              </td>
+            </tr>
+          {% endfor %}</tbody>
+        </table>
+      {% else %}
+        <p class="pipeline-empty">No campaigns yet. <a href="{% url 'admin:pipeline_discoverycampaign_add' %}">Create one</a> to start finding businesses.</p>
+      {% endif %}
+    </div>
+
+    {% if results %}
+    <div class="module">
+      <h2>Results by step and initial-email prompt (A/B)</h2>
+      <table>
+        <thead><tr><th>Step</th><th>Initial-email prompt</th><th>Sent</th><th>Replies</th><th>Reply rate</th></tr></thead>
+        <tbody>{% for row in results %}
+          <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    <div class="module">
+      <h2>Recent pipeline runs {% if running %}<small>({{ running }} running)</small>{% endif %}</h2>
+      {% if recent_runs %}
+        <table class="pipeline-runs">
+          <thead><tr><th>Run</th><th>Command</th><th>Status</th><th>Started by</th><th>When</th></tr></thead>
+          <tbody>
+          {% for run in recent_runs %}
+            <tr>
+              <td><a href="{% url 'admin:pipeline_pipelinerun_change' run.pk %}">#{{ run.pk }}</a></td>
+              <td>{{ run.command }} {{ run.arguments|join:" "|truncatechars:50 }}</td>
+              <td><span class="pipeline-badge pipeline-{{ run.status }}">{{ run.get_status_display }}</span></td>
+              <td>{{ run.created_by|default:"-" }}</td>
+              <td>{{ run.created_at|timesince }} ago</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="pipeline-empty">No runs yet. Every step you start from here appears in this list.</p>
+      {% endif %}
+      <p class="pipeline-empty"><a href="{% url 'admin:pipeline_pipelinerun_add' %}?command=run_pipeline">Run the full pipeline</a> · <a href="{% url 'admin:pipeline_pipelinerun_add' %}">Run a pipeline step</a> · <a href="{% url 'admin:pipeline_pipelinerun_changelist' %}">All runs</a> · <a href="{% url 'admin:guide' %}">How to use this</a></p>
+    </div>
+  </div>
+  {% include "admin/app_list.html" with app_list=app_list show_changelinks=True %}
+</div>
+{% endblock %}

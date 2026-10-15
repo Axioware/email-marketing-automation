@@ -1,0 +1,5 @@
+# Only the edge function settings are kept here; the database schema is managed by Alembic migrations.
+
+[functions.email]
+# Email clients load the footer image without any auth header, so JWT verification must be off.
+verify_jwt = false

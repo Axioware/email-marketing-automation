@@ -1,0 +1,9 @@
+{% extends "admin/submit_line.html" %}
+{% block submit-row %}
+{% if add %}
+  <input type="submit" value="Start run" class="default" name="_save">
+  <a href="{% url 'admin:pipeline_pipelinerun_changelist' %}" class="closelink">Cancel</a>
+{% else %}
+  {{ block.super }}
+{% endif %}
+{% endblock %}
