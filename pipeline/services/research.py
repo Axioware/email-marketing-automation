@@ -496,7 +496,10 @@ def research_business(
     jina_reader: JinaReader | None,
     on_page=None,
     deadline: float | None = None,
+    saved_pages: list[dict] | None = None,
 ) -> dict:
+    """Research one business. `saved_pages`: the pages an interrupted run read (with the agent's decision on each, if
+    it made one); the research continues from there instead of starting over."""
     homepage = normalize_url(business.get("website_url") or "")
     if not homepage or not is_public_http_url(homepage):
         raise ResearchError("Business website is missing, invalid, or not publicly accessible.")
@@ -507,44 +510,66 @@ def research_business(
     visited_urls = set()
     visited_identities = set()
     next_url = homepage
-    system_prompt = business["qualification_prompt"].strip()  # the campaign prompt, exactly as stored
-    business = {key: value for key, value in business.items() if key != "qualification_prompt"}  # already in it
+    decide_only = False  # the last saved page still needs the agent's decision
 
-    while len(pages) < MAX_PAGES_PER_BUSINESS:
-        requested = normalize_url(next_url)
-        requested_identity = url_identity(requested) if requested else None
-        if not requested or not requested_identity or requested_identity in visited_identities:
-            raise ResearchError("Refusing to scrape a repeated or invalid page URL.")
-        if not is_same_site(requested, homepage) or not is_public_http_url(requested):
-            raise ResearchError("Requested page is not a public URL on the business website.")
-
-        result = extract_page(requested, homepage, jina_reader, deadline)
-        final_identity = url_identity(result["url"])
-        if not final_identity or final_identity in visited_identities:
-            raise ResearchError("Page redirected to a URL already scraped.")
-        visited_identities.update((requested_identity, final_identity))
-        visited_urls.add(result["url"])
-        emails.update(result["emails"])
-        for link in result["links"]:
+    def remember(page: dict) -> None:
+        visited_identities.add(url_identity(page["url"]))
+        visited_urls.add(page["url"])
+        emails.update(page.get("emails") or [])
+        for link in page.get("links") or []:
             identity = url_identity(link["url"])
-            if link["same_site"] and identity and identity not in discovered_links:
+            if link.get("same_site") and identity and identity not in discovered_links:
                 if len(discovered_links) < MAX_RESEARCH_LINKS:
                     discovered_links[identity] = link
 
-        page_record = {
-            "url": result["url"],
-            "content": result["content"],
-            "links": result["links"],
-            "emails": result["emails"],
-            "summary": "",
-            "relevant_findings": [],
-            "agent_action": None,
-            "requested_next_url": None,
-            "request_reason": None,
-        }
-        pages.append(page_record)
-        if on_page:
-            on_page(pages, emails, list(discovered_links.values()))
+    for page in saved_pages or []:
+        if page.get("url") and url_identity(page["url"]):
+            pages.append({"summary": "", "relevant_findings": [], "agent_action": None, "requested_next_url": None,
+                          "request_reason": None, "links": [], "emails": [], "content": "", **page})
+            remember(page)
+    if pages:
+        last = pages[-1]
+        if last["agent_action"] == "SCRAPE" and last["requested_next_url"]:
+            next_url = last["requested_next_url"]
+        elif last["agent_action"] is None:
+            decide_only = True
+    system_prompt = business["qualification_prompt"].strip()  # the campaign prompt, exactly as stored
+    business = {key: value for key, value in business.items() if key != "qualification_prompt"}  # already in it
+
+    while len(pages) < MAX_PAGES_PER_BUSINESS or decide_only:
+        if decide_only:  # an interrupted run read this page but the agent had not decided on it yet
+            decide_only = False
+            page_record = pages[-1]
+            result = page_record
+        else:
+            requested = normalize_url(next_url)
+            requested_identity = url_identity(requested) if requested else None
+            if not requested or not requested_identity or requested_identity in visited_identities:
+                raise ResearchError("Refusing to scrape a repeated or invalid page URL.")
+            if not is_same_site(requested, homepage) or not is_public_http_url(requested):
+                raise ResearchError("Requested page is not a public URL on the business website.")
+
+            result = extract_page(requested, homepage, jina_reader, deadline)
+            final_identity = url_identity(result["url"])
+            if not final_identity or final_identity in visited_identities:
+                raise ResearchError("Page redirected to a URL already scraped.")
+            visited_identities.add(requested_identity)
+            remember(result)
+
+            page_record = {
+                "url": result["url"],
+                "content": result["content"],
+                "links": result["links"],
+                "emails": result["emails"],
+                "summary": "",
+                "relevant_findings": [],
+                "agent_action": None,
+                "requested_next_url": None,
+                "request_reason": None,
+            }
+            pages.append(page_record)
+            if on_page:
+                on_page(pages, emails, list(discovered_links.values()))
 
         context = {
             "business": business,
@@ -682,8 +707,24 @@ def finalize_profile(profile_id: int, result: dict) -> None:
 
 
 @outside_event_loop
+def interrupted_pages(business_id: int) -> list[dict]:
+    """The pages an interrupted research of the business read (it is pending again or was left running); empty for
+    one that never started, finished or failed."""
+    profile = BusinessWebsiteProfile.objects.filter(business_id=business_id, status__in=("pending", "running")).first()
+    return list(profile.scraped_pages or []) if profile else []
+
+
+@outside_event_loop
+def resume_profile(business_id: int) -> int:
+    profile = BusinessWebsiteProfile.objects.get(business_id=business_id)
+    BusinessWebsiteProfile.objects.filter(pk=profile.pk).update(status="running")
+    return profile.pk
+
+
+@outside_event_loop
 def reset_profile(profile_id: int) -> None:
-    """Back to pending: the research was interrupted (time limit), so the next run does it again."""
+    """Back to pending, keeping the pages read: the research was interrupted (time limit), and the next run
+    continues it."""
     BusinessWebsiteProfile.objects.filter(pk=profile_id).update(status="pending")
 
 
@@ -747,11 +788,14 @@ def run(options: dict) -> int:
         if out_of_time(options, BUSINESS_RESERVE_SECONDS):
             time_limit_note(len(queue) - position, "business(es)")
             break
-        profile_id = start_profile(business["id"])
-        print(f"Researching business {business['id']}: {business['name'] or '(unnamed)'}", flush=True)
+        saved = [] if options["redo"] else interrupted_pages(business["id"])
+        profile_id = resume_profile(business["id"]) if saved else start_profile(business["id"])
+        print(f"Researching business {business['id']}: {business['name'] or '(unnamed)'}"
+              + (f" (continuing after {len(saved)} page(s) read before)" if saved else ""), flush=True)
         try:
             save_page = lambda pages, emails, links: save_progress(profile_id, pages, emails, links)
-            result = research_business(client, model, business, jina_reader, on_page=save_page, deadline=deadline)
+            result = research_business(client, model, business, jina_reader, on_page=save_page, deadline=deadline,
+                                       saved_pages=saved)
             finalize_profile(profile_id, result)
             completed += 1
             score = result.get("qualification_score")

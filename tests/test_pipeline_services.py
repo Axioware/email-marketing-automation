@@ -101,7 +101,7 @@ class ResearchTests(TestCase):
         self.assertFalse(hasattr(research, "research_prompt"))  # the campaign prompt is used as stored
 
         researched = []
-        fake = lambda client, model, business, jina, on_page=None, deadline=None: researched.append(business) or {
+        fake = lambda client, model, business, jina, on_page=None, deadline=None, saved_pages=None: researched.append(business) or {
             "action": "SCORE", "pages_scraped": 1, "scraped_urls": [], "scraped_pages": [], "discovered_links": [],
             "emails": [], "qualification_score": 80, "qualification_reasons": ["fits"], "agent_reasoning": "ok"}
         with mock.patch.object(research, "make_llm_client", return_value=(object(), "m", "test")), \
@@ -245,6 +245,55 @@ class TimeLimitTests(TestCase):
         self.assertIn("Time limit reached: 2 business(es)", result.stdout)
         self.assertEqual(BusinessWebsiteProfile.objects.get(business=first).status, "pending")
         self.assertEqual(len(research.load_businesses(None, None)), 2)  # both are picked up again
+
+
+class ResumeTests(TestCase):
+    """An interrupted research continues where it stopped (each run on Vercel may only get a few AI answers)."""
+
+    PAGE = {"url": "https://clinic.pk/", "content": "Home", "emails": ["a@clinic.pk"], "summary": "Home page",
+            "relevant_findings": ["f"], "request_reason": "team page",
+            "links": [{"url": "https://clinic.pk/team", "text": "Team", "same_site": True}]}
+    SCORED = {"action": "SCORE", "summary": "s", "relevant_findings": [], "qualification_score": 66,
+              "qualification_reasons": ["r"], "agent_reasoning": "x"}
+
+    def research(self, saved, pages_read):
+        with mock.patch.object(research, "extract_page", side_effect=lambda url, *a: {
+                    "url": url, "content": "Team", "links": [], "emails": []}) as extract, \
+                mock.patch.object(research, "validate_agent_response", return_value=self.SCORED) as agent:
+            result = research.research_business(mock.Mock(), "m", {"website_url": "https://clinic.pk",
+                                                                   "qualification_prompt": "C"}, None,
+                                                saved_pages=saved)
+        self.assertEqual(result["pages_scraped"], pages_read)
+        return extract, agent
+
+    def test_continues_with_the_page_the_agent_chose(self):
+        saved = [{**self.PAGE, "agent_action": "SCRAPE", "requested_next_url": "https://clinic.pk/team"}]
+        extract, agent = self.research(saved, 2)
+        extract.assert_called_once()
+        self.assertEqual(extract.call_args.args[0], "https://clinic.pk/team")  # not the home page again
+        context = agent.call_args.args[2]
+        self.assertEqual(context["previously_scraped_pages"][0]["summary"], "Home page")
+
+    def test_decides_on_a_page_read_but_not_decided(self):
+        saved = [{**self.PAGE, "agent_action": None, "requested_next_url": None}]
+        extract, agent = self.research(saved, 1)
+        extract.assert_not_called()  # the saved page is used as it is
+        self.assertEqual(agent.call_args.args[2]["current_page_url"], "https://clinic.pk/")
+
+    def test_run_resumes_a_pending_profile_and_redo_starts_over(self):
+        business = make_business(make_campaign(), "Clinic", website_url="https://clinic.pk")
+        BusinessWebsiteProfile.objects.create(business=business, status="pending", pages_scraped=1,
+                                              scraped_pages=[{**self.PAGE, "agent_action": None}])
+        seen = []
+        fake = lambda client, model, b, jina, on_page=None, deadline=None, saved_pages=None: seen.append(
+            len(saved_pages or [])) or {**self.SCORED, "pages_scraped": 1, "scraped_urls": [], "scraped_pages": [],
+                                        "discovered_links": [], "emails": []}
+        with mock.patch.object(research, "make_llm_client", return_value=(object(), "m", "test")), \
+                mock.patch.object(research, "research_business", fake):
+            result = run_command("research_websites", "--local-only")
+            self.assertIn("continuing after 1 page(s) read before", result.stdout)
+            run_command("research_websites", "--local-only", "--redo", "--business-id", business.pk)
+        self.assertEqual(seen, [1, 0])
 
 
 class StakeholderTests(TestCase):
