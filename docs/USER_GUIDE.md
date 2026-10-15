@@ -200,15 +200,16 @@ To approve or reject many emails at once: on the Emails list tick them, choose *
 
 ### Step 8: Sending (through GoHighLevel)
 
-GoHighLevel sends the emails from your connected mailbox; this app decides what and when.
+GoHighLevel sends the emails from your connected mailbox, at the time this app gives each one.
 
-- **Contacts:** every prospect ready to email (verified, or approved by you) is created in GoHighLevel with the tags `outreach-app` and `campaign-<name>`. Your GHL workflow turns them into **New Lead** opportunities.
-- **Approve = schedule.** Each approved email gets a send time: the campaign's previous one plus the gap (default 2 minutes plus a random 3-5 minutes), only inside the send window, at most the daily cap per day. A follow-up never goes before its days after the previous email. Its contact gets **Email Due At** (the date) and, for an initial email, **Initial Email Type** (the prompt's name).
-- **At the send time** the app writes the email into the contact (**Email Subject**, **Email Body**, **Follow-up Count**), and the GHL workflow sends it at once and reports back. The email becomes **Sent**.
-- **Changed your mind?** Edit, reject or send a scheduled email back to review before its time: it loses its slot and is not sent.
+- **Contacts:** every prospect ready to email (verified, or approved by you) is created in GoHighLevel with the tags `outreach-app` and `campaign-<name>` (the full pipeline does it at the end; **Create GHL contacts** on the dashboard does it any time). Your GHL workflow turns them into **New Lead** opportunities. One email address gets one sequence, even if two prospects share it.
+- **Approve = hand to GoHighLevel.** Each approved email gets a send time: the campaign's previous one plus the gap (default 2 minutes plus a random 3-5 minutes), only inside the send window, at most the daily cap per day. A follow-up never goes before its days after the previous email. The email is written into its contact at once (**Email Subject**, **Email Body**, **Follow-up Count**, **Email Due At**, and **Initial Email Type** for a first email), and GoHighLevel waits until Email Due At and sends it. The email shows **In GoHighLevel** with its due time.
+- **If GoHighLevel could not take it**, the email stays **Approved** with the reason shown; click **Hand to GoHighLevel** on it (or the dashboard button) once the problem is fixed. It is never sent twice.
+- **Changed your mind?** Edit, reject or send it back to review before it is sent: it is taken back out of GoHighLevel first. If GoHighLevel cannot be reached, nothing changes and you are told (it could still be sent).
+- **After it is sent**, GoHighLevel tells the app, the email becomes **Sent**, and the next follow-up is written for your review.
 - **Replies:** when someone replies (or you move their opportunity by hand), GHL tells the app: that person's sequence stops and anything not sent yet is cancelled. Other people at the same business are not affected. **Mark replied** in the app does the same.
 
-Statuses: In review → Approved → **Scheduled** → **Handed to GoHighLevel** → **Sent** (→ Replied). The dashboard warns if GoHighLevel is not set up, if an email was handed over 30 minutes ago and never reported sent (check the GHL workflow), or if a GHL update failed (retried every minute).
+Statuses: In review → Approved → **In GoHighLevel** → **Sent** (→ Replied). The dashboard warns if GoHighLevel is not set up, if approved emails are not in GoHighLevel yet, or if an email is over a day past its send time and was never reported sent (check the GHL workflow).
 
 ### Follow-ups
 
@@ -216,7 +217,7 @@ A campaign can have follow-up emails for people who did not reply.
 
 **1. Set the steps.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** (1, 2, ...), **Days after previous** (e.g. 3, then 7) and **Email prompt** (a follow-up prompt). The first email is step 0.
 
-**2. Written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next follow-up is written for review (automatically every 10 minutes, or the **Write follow-ups** button on the dashboard). You have the days in between to review it. The AI sees the emails already sent.
+**2. Written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next follow-up is written for review (if the AI fails then, use **Write follow-ups** on the dashboard). You have the days in between to review it. The AI sees the emails already sent.
 
 **3. Review and approve** like first emails. Approving schedules it for no earlier than the previous email's send time plus its days.
 
@@ -303,8 +304,7 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
 | `SENDER_NAME` | Optional: the name in each email's sign-off (empty: "The Axioware team") |
 | `GHL_API_KEY`, `GHL_LOCATION_ID` | Sending: the GoHighLevel sub-account's Private Integration token and location id |
-| `GHL_WEBHOOK_SECRET` | Sending: GoHighLevel sends it with its webhooks (header `X-Webhook-Secret`) |
-| `CRON_SECRET` | The cron endpoints (Vercel Cron sends it) |
+| `GHL_WEBHOOK_SECRET` | Sending: GoHighLevel sends it with its webhooks (Custom Data key `secret`) |
 | `MAPS_SCRAPER_URL` | Optional: where the scraper container answers (default `http://127.0.0.1:8001`) |
 
 ## 10. Troubleshooting
@@ -316,8 +316,8 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
 | Verify: "Cannot reach Reacher" | Docker is not running; start Docker and run again |
 | "No worker is running" | Start `python manage.py run_worker` on the machine with the browsers and Docker (only when the app runs on Vercel) |
-| "handed to GoHighLevel ... never reported sent" | The GHL sending workflow is not published, or its webhook to `/api/ghl/email-sent/` fails (check the URL and the `X-Webhook-Secret` header) |
-| An email shows a GoHighLevel error | Check `GHL_API_KEY`/`GHL_LOCATION_ID` and the custom fields; it is retried every minute |
+| "past their send time ... never reported sent" | The GHL sending workflow is not published, or its webhook to `/api/ghl/email-sent/` fails (check the URL and the Custom Data key `secret`) |
+| An email shows a GoHighLevel error | Check `GHL_API_KEY`/`GHL_LOCATION_ID` and the custom fields, then click **Hand to GoHighLevel** on it |
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
 | Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
 | Find decision makers: "Google presented a CAPTCHA" | Run again later, or add `--headed` and solve it in the window. DuckDuckGo is used meanwhile |

@@ -175,7 +175,15 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
     @extend_schema(request=None, responses={200: OpenApiResponse(description="Approved"), 409: OpenApiResponse(description="Not allowed now")})
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
+        """Approve and hand to GoHighLevel (it waits until the email's send time and sends it)."""
         return self._act(request, review.approve)
+
+    @extend_schema(request=None, responses={200: OpenApiResponse(description="Handed over"),
+                                            409: OpenApiResponse(description="Not allowed now")})
+    @action(detail=True, methods=["post"], url_path="hand-over")
+    def hand_over(self, request, pk=None):
+        """Hand an approved email whose hand-over failed to GoHighLevel again."""
+        return self._act(request, review.hand_over)
 
     @extend_schema(request=s.RejectSerializer)
     @action(detail=True, methods=["post"])

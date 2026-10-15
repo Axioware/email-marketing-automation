@@ -1057,7 +1057,7 @@ class EmailAdmin(PipelineAdmin):
     list_filter = ["status", "sequence_step", "email_prompt", "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
     list_select_related = ["business", "prospect", "email_prompt"]
-    actions = ["approve_selected", "reject_selected", "mark_replied_selected"]
+    actions = ["approve_selected", "hand_over_selected", "reject_selected", "mark_replied_selected"]
     inlines = [OpenEventInline]
     change_form_template = "admin/pipeline/email/change_form.html"
     change_list_template = "admin/pipeline/email/change_list.html"
@@ -1168,6 +1168,18 @@ class EmailAdmin(PipelineAdmin):
         extra = f", {skipped} skipped (not sent yet)" if skipped else ""
         self.message_user(request, f"{done} email(s) marked replied{extra}.")
 
+    @admin.action(description="Hand approved emails to GoHighLevel (those whose hand-over failed)")
+    def hand_over_selected(self, request, queryset):
+        done, errors = 0, []
+        for email in queryset.filter(status="approved"):
+            try:
+                review.hand_over(email)
+                done += 1
+            except review.ReviewError as error:
+                errors.append(f"#{email.pk}: {error}")
+        self.message_user(request, f"{done} email(s) handed to GoHighLevel." + (" " + " ".join(errors[:5]) if errors else ""),
+                          messages.WARNING if errors else messages.SUCCESS)
+
     @admin.action(description="Approve selected emails (in review only)")
     def approve_selected(self, request, queryset):
         done, skipped = review.bulk("approve", list(queryset.values_list("pk", flat=True)))
@@ -1187,7 +1199,7 @@ class EmailAdmin(PipelineAdmin):
             path(f"<int:object_id>/{name}/", self.admin_site.admin_view(view), name=f"pipeline_email_{name}")
             for name, view in (("approve", self.approve_view), ("reject", self.reject_view),
                                ("reopen", self.reopen_view), ("regenerate", self.regenerate_view),
-                               ("replied", self.replied_view))
+                               ("replied", self.replied_view), ("handover", self.handover_view))
         ]
         return actions + super().get_urls()
 
@@ -1250,6 +1262,9 @@ class EmailAdmin(PipelineAdmin):
 
     def replied_view(self, request, object_id):
         return self._review_action(request, object_id, review.mark_replied)
+
+    def handover_view(self, request, object_id):
+        return self._review_action(request, object_id, review.hand_over)
 
 
 @admin.register(EmailOpenEvent)

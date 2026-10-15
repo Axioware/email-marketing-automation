@@ -6,9 +6,10 @@
       "excludeFiles": "{.venv/**,tests/**,assets/**,results.csv,supabase/**,config/**}"
     }
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
-  "crons": [
-    { "path": "/api/cron/release/", "schedule": "* * * * *" },
-    { "path": "/api/cron/followups/", "schedule": "*/10 * * * *" }
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
   ]
 }

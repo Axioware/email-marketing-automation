@@ -99,6 +99,16 @@ def next_in_review(after_id: int) -> int | None:
     return queue.filter(id__gt=after_id).first() or queue.exclude(id=after_id).first()
 
 
+def _take_back(email: Email) -> None:
+    """A handed-over email is taken back out of GoHighLevel before it changes here; if GHL cannot be reached
+    nothing changes (it could still be sent)."""
+    if email.status in (*outreach.HANDED, "approved"):
+        try:
+            outreach.withdraw(email)
+        except outreach.OutreachError as error:
+            raise ReviewError(str(error)) from error
+
+
 def save_edit(email: Email, subject: str, body: str) -> str:
     subject, body = " ".join((subject or "").split()), (body or "").replace("\r\n", "\n").strip()
     if not subject or not body:
@@ -107,6 +117,8 @@ def save_edit(email: Email, subject: str, body: str) -> str:
         raise ReviewError(f"Keep the subject under {MAX_SUBJECT} and the body under {MAX_BODY} characters.")
     if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
         raise ReviewError("Cannot build the tracking URL; set EMAIL_TRACKING_BASE_URL.")
+    if email.status in EDITABLE:
+        _take_back(email)
     changed = _transition(
         email.pk, EDITABLE,
         subject=subject,
@@ -117,14 +129,12 @@ def save_edit(email: Email, subject: str, body: str) -> str:
     )
     if not changed:
         raise ReviewError("This email can no longer be edited.")
-    if email.status == "scheduled":
-        outreach.withdraw_schedule(email)
     return "Saved." + (" It went back to review." if email.status != "in_review" else "")
 
 
 def approve(email: Email) -> str:
-    """Approve and schedule: the email gets its send time, and GoHighLevel is told the date (and, for an initial
-    email, its type) so the lead can move to Ready to Send."""
+    """Approve and hand over: the email gets its send time and is written into its GoHighLevel contact, which waits
+    until then and sends it. If GHL cannot take it, it stays approved with the error; hand it over again later."""
     if has_placeholder(email):
         raise ReviewError("This email still contains placeholder text; edit it first.")
     if not prospect_ready(email):
@@ -136,29 +146,39 @@ def approve(email: Email) -> str:
     except outreach.OutreachError as error:
         _transition(email.pk, ("approved",), status="in_review", reviewed_at=None)
         raise ReviewError(f"Not approved: {error}") from error
-    if ghl.configured():
-        outreach.announce_schedule(Email.objects.select_related(
-            "prospect__contact", "prospect__business__discovery_campaign", "business__discovery_campaign",
-            "email_prompt").get(pk=email.pk))
-    local = slot.astimezone(ZoneInfo(email.business.discovery_campaign.send_timezone))
-    return f"Approved; scheduled for {local.strftime('%Y-%m-%d %H:%M')} ({email.business.discovery_campaign.send_timezone})."
+    zone = email.business.discovery_campaign.send_timezone
+    when = f"{slot.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M')} ({zone})"
+    if not ghl.configured():
+        return f"Approved for {when}; GoHighLevel is not set up, so it waits here (hand it over once it is)."
+    try:
+        outreach.hand_over(email)
+    except (outreach.OutreachError, ghl.GhlError) as error:
+        return f"Approved for {when}, but not handed to GoHighLevel: {error}"
+    return f"Approved and handed to GoHighLevel; due {when}."
+
+
+def hand_over(email: Email) -> str:
+    """Hand an approved email (whose earlier hand-over failed or was interrupted) to GoHighLevel."""
+    try:
+        due = outreach.hand_over(email)
+    except (outreach.OutreachError, ghl.GhlError) as error:
+        raise ReviewError(f"Not handed over: {error}") from error
+    return f"Handed to GoHighLevel; due {due}."
 
 
 def reject(email: Email, note: str = "") -> str:
+    _take_back(email)
     if not _transition(email.pk, ("in_review", "approved", "scheduled"), status="rejected", reviewed_at=_now(),
                        review_note=(note or "").strip()[:2000] or None, scheduled_at=None):
         raise ReviewError("Only emails in review, approved or scheduled can be rejected.")
-    if email.status == "scheduled":
-        outreach.withdraw_schedule(email)
     return "Rejected."
 
 
 def reopen(email: Email) -> str:
+    _take_back(email)
     if not _transition(email.pk, ("rejected", "approved", "scheduled"), status="in_review", reviewed_at=None,
                        scheduled_at=None):
         raise ReviewError("Only rejected, approved or scheduled emails can go back to review.")
-    if email.status == "scheduled":
-        outreach.withdraw_schedule(email)
     return "Back in review."
 
 

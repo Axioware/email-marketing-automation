@@ -423,9 +423,9 @@ class Email(models.Model):
     class Status(models.TextChoices):
         IN_REVIEW = "in_review", "In review"
         APPROVED = "approved", "Approved"
-        SCHEDULED = "scheduled", "Scheduled"
+        SCHEDULED = "scheduled", "In GoHighLevel"
         REJECTED = "rejected", "Rejected"
-        SENDING = "sending", "Handed to GoHighLevel"
+        SENDING = "sending", "Sending"
         SENT = "sent", "Sent"
         OPENED = "opened", "Opened"
         FAILED = "failed", "Failed"
@@ -451,9 +451,10 @@ class Email(models.Model):
     review_note = models.TextField(null=True, blank=True)
     edited_at = models.DateTimeField(null=True, blank=True)
     scheduled_at = models.DateTimeField(null=True, blank=True, db_index=True,
-                                        help_text="When it goes out: the slot given when it was approved.")
+                                        help_text="When it goes out: the slot given when it was approved (written to "
+                                                  "GoHighLevel as Email Due At).")
     released_at = models.DateTimeField(null=True, blank=True,
-                                       help_text="When it was written into the GoHighLevel contact for sending.")
+                                       help_text="When it was handed to GoHighLevel (written into the contact).")
     ghl_error = models.TextField(null=True, blank=True, help_text="The last GoHighLevel error for this email.")
     sent_at = models.DateTimeField(null=True, blank=True)
     sent_from = models.CharField(max_length=320, null=True, blank=True)

@@ -22,6 +22,4 @@ urlpatterns = [
     path("stats/", views.StatsView.as_view(), name="api-stats"),
     path("ghl/email-sent/", hooks.EmailSentView.as_view(), name="ghl-email-sent"),
     path("ghl/stop-sequence/", hooks.StopSequenceView.as_view(), name="ghl-stop-sequence"),
-    path("cron/release/", hooks.ReleaseCronView.as_view(), name="cron-release"),
-    path("cron/followups/", hooks.FollowupsCronView.as_view(), name="cron-followups"),
 ]

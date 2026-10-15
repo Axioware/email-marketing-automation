@@ -1,20 +1,21 @@
-"""Handing approved emails to GoHighLevel, which sends them.
+"""Handing approved emails to GoHighLevel, which waits until their time and sends them. Nothing runs on a timer.
 
-1. Contacts: every ready prospect (one address per person) becomes a GHL contact tagged `outreach-app` and its
-   campaign (`sync_contacts`); a GHL workflow turns new tagged contacts into New Lead opportunities.
-2. Scheduling: approving an email gives it a send time (`schedule`): the campaign's previous slot plus a fixed gap
-   plus a random gap, inside the campaign's send window and daily cap; a follow-up never before "previous email
-   sent + its days". The approval also writes Email Due At (a date) and, for an initial email, Initial Email Type
-   to the contact, which lets a GHL workflow move the lead to Ready to Send.
-3. Release: GHL date fields hold no time of day, so GHL cannot wait for the minute; this app does. When an email's
-   time comes (`release_due`, run every minute by cron) its subject, body, Follow-up Count and Email Due At are
-   written to the contact; the GHL sending workflow, triggered by Email Body becoming non-empty, sends it at once.
-4. Sent (`record_sent`, the email-sent webhook): the email is marked sent; the contact's Email Subject, Body and Due
+1. Contacts: every ready prospect (one sequence per email address) becomes a GHL contact tagged `outreach-app` and
+   its campaign (`sync_contacts`: the full pipeline's last step, the ghl_sync command, approval); a GHL workflow
+   turns new tagged contacts into New Lead opportunities.
+2. Approval = hand-over (`hand_over`): the email gets its send time (`schedule`): the campaign's previous slot plus
+   a fixed gap plus a random gap, inside the campaign's send window and daily cap; a follow-up never before
+   "previous email sent + its days". The time is stored here (`emails.scheduled_at`) and written with the email
+   into the contact at once: Email Subject, Email Body, Follow-up Count (0 = initial, n = follow-up n), Email Due
+   At and, for an initial email, Initial Email Type. Status: scheduled. GHL waits until Email Due At and sends.
+   A write that fails leaves the email approved, with the error shown; handing it over again first reads the
+   contact and does not write again if GHL already has it (so a timed-out write is never sent twice).
+3. Sent (`record_sent`, the email-sent webhook): the email is marked sent; the contact's Email Subject, Body and Due
    At are emptied and Follow-up Count set to the next follow-up's number, or emptied too when the sequence is over
-   (the workflow then moves the lead to Quota Exhausted). The next follow-up is written for review by the
-   follow-up cron and released the same way once approved.
-5. Stop (`stop_sequence`, the stop webhook): a reply or a manual stage move ends the prospect's sequence: pending
-   emails are cancelled and the contact's fields emptied.
+   (the workflow then moves the lead to Quota Exhausted). The next follow-up is then written for review; approving
+   it hands it over the same way.
+4. Stop (`stop_sequence`, the stop webhook): a reply or a manual stage move ends the prospect's sequence: emails not
+   sent yet are cancelled and the contact's fields emptied.
 """
 import random
 import re
@@ -22,21 +23,21 @@ from datetime import date, datetime, time as day_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.utils.text import slugify
 
 from pipeline.models import DiscoveryCampaign, Email, FollowUp, Prospect
 from pipeline.services import generation, ghl
 
-SCHEDULED_OR_LATER = ("scheduled", "sending", "sent", "opened", "replied")  # emails that hold a send slot
+HOLDS_SLOT = ("approved", "scheduled", "sending", "sent", "opened", "replied")  # with scheduled_at set
+HANDED = ("scheduled", "sending")  # in GoHighLevel, waiting to be sent
 SENT_STATUSES = ("sent", "opened")
-RELEASE_BATCH = 25  # emails released per cron call
-SYNC_BATCH = 25  # contacts created per cron call
-STUCK_AFTER = timedelta(minutes=30)  # handed to GHL this long ago without the email-sent webhook: shown as a problem
+SYNC_BATCH = 200  # contacts created per call
+STUCK_AFTER = timedelta(days=1)  # due this long ago and never reported sent: shown as a problem
 
 
 class OutreachError(RuntimeError):
-    """The email cannot be scheduled or recorded; the message says why."""
+    """The email cannot be scheduled, handed over or recorded; the message says why."""
 
 
 def now() -> datetime:
@@ -55,13 +56,16 @@ def local_day_bounds(campaign: DiscoveryCampaign, day: date) -> tuple[datetime, 
     return datetime.combine(day, day_time.min, tzinfo=tz), datetime.combine(day + timedelta(days=1), day_time.min, tzinfo=tz)
 
 
+def slot_holders(campaign: DiscoveryCampaign):
+    return Email.objects.filter(business__discovery_campaign=campaign, status__in=HOLDS_SLOT, scheduled_at__isnull=False)
+
+
 def next_slot(campaign: DiscoveryCampaign, earliest: datetime, rng: random.Random | None = None) -> datetime:
     """The send time for a newly approved email of the campaign: at least `earliest`, at least the fixed plus a
     random gap after the campaign's latest slot, inside the send window, on a day under the daily cap. Call it
     inside a transaction that locked the campaign row, so two approvals never take the same slot."""
     rng = rng or random
-    latest = (Email.objects.filter(business__discovery_campaign=campaign, status__in=SCHEDULED_OR_LATER)
-              .aggregate(latest=Max("scheduled_at"))["latest"])
+    latest = slot_holders(campaign).aggregate(latest=Max("scheduled_at"))["latest"]
     candidate = earliest
     if latest is not None:
         gap = campaign.gap_fixed_seconds + rng.uniform(campaign.gap_random_min_seconds, campaign.gap_random_max_seconds)
@@ -75,10 +79,7 @@ def next_slot(campaign: DiscoveryCampaign, earliest: datetime, rng: random.Rando
         if candidate >= finish:
             candidate = local_day_bounds(campaign, day + timedelta(days=1))[0]
             continue
-        day_start, day_end = local_day_bounds(campaign, day)
-        used = Email.objects.filter(business__discovery_campaign=campaign, status__in=SCHEDULED_OR_LATER,
-                                    scheduled_at__gte=day_start, scheduled_at__lt=day_end).count()
-        if used >= campaign.daily_cap:
+        if slot_holders(campaign).filter(scheduled_at__gte=begin, scheduled_at__lt=finish).count() >= campaign.daily_cap:
             candidate = local_day_bounds(campaign, day + timedelta(days=1))[0]
             continue
         return candidate
@@ -98,14 +99,13 @@ def earliest_send(email: Email) -> datetime:
 
 
 def schedule(email: Email) -> datetime:
-    """Give an approved email its send time (status scheduled). Returns the time."""
+    """Give an approved email its send time (kept while it is approved or handed over). Returns the time."""
     with transaction.atomic():
         campaign = DiscoveryCampaign.objects.select_for_update().get(pk=email.business.discovery_campaign_id)
         slot = next_slot(campaign, earliest_send(email))
-        if not Email.objects.filter(pk=email.pk, status="approved").update(status="scheduled", scheduled_at=slot,
-                                                                            released_at=None, ghl_error=None):
+        if not Email.objects.filter(pk=email.pk, status="approved").update(scheduled_at=slot):
             raise OutreachError("Only approved emails can be scheduled.")
-    email.status, email.scheduled_at = "scheduled", slot
+    email.scheduled_at = slot
     return slot
 
 
@@ -118,14 +118,24 @@ def body_for_ghl(email: Email) -> str:
     return (match.group(1) if match else email.body_html or "").strip()
 
 
-def due_date(email: Email) -> str | None:
+def due_value(email: Email) -> str | None:
+    """Email Due At: the send time in the campaign's time zone, ISO format."""
     if email.scheduled_at is None:
         return None
-    return email.scheduled_at.astimezone(ZoneInfo(email.business.discovery_campaign.send_timezone)).date().isoformat()
+    zone = ZoneInfo(email.business.discovery_campaign.send_timezone)
+    return email.scheduled_at.astimezone(zone).replace(microsecond=0).isoformat()
 
 
 def initial_type(email: Email) -> str | None:
     return email.email_prompt.name if email.sequence_step == generation.SEQUENCE_STEP and email.email_prompt else None
+
+
+def email_fields(email: Email) -> dict:
+    values = {"subject": email.subject, "body": body_for_ghl(email),
+              "count": email.sequence_step - generation.SEQUENCE_STEP, "due": due_value(email)}
+    if initial_type(email):
+        values["type"] = initial_type(email)
+    return values
 
 
 def contact_payload(prospect: Prospect) -> dict:
@@ -141,116 +151,95 @@ def contact_payload(prospect: Prospect) -> dict:
     return {key: value for key, value in payload.items() if value}
 
 
-def ensure_contact(prospect: Prospect, client: ghl.Client) -> str:
-    """The prospect's GHL contact id, creating (or matching by email) the contact when it has none."""
-    if prospect.ghl_contact_id:
-        return prospect.ghl_contact_id
-    contact_id, _ = client.upsert_contact(contact_payload(prospect))
+def link_contact(prospect: Prospect, contact_id: str) -> None:
+    """Store the GHL contact on the prospect; refuse a contact another prospect already uses (GHL matches contacts
+    by email, and two sequences in one contact would overwrite each other's emails)."""
+    other = Prospect.objects.filter(ghl_contact_id=contact_id).exclude(pk=prospect.pk).first()
+    if other is not None:
+        raise OutreachError(f"GoHighLevel contact {contact_id} already belongs to prospect {other.pk} "
+                            f"({other.email}); one email address gets one sequence.")
     Prospect.objects.filter(pk=prospect.pk).update(ghl_contact_id=contact_id)
     prospect.ghl_contact_id = contact_id
-    return contact_id
 
 
-def announce_schedule(email: Email, client: ghl.Client | None = None) -> None:
-    """After approval: write Email Due At (and Initial Email Type for an initial email) to the contact, so a GHL
-    workflow can move the lead to Ready to Send. Errors are kept on the email and retried by the next sync."""
-    try:
-        client = client or ghl.Client()
-        contact_id = ensure_contact(email.prospect, client)
-        values = {"due": due_date(email)}
-        if initial_type(email):
-            values["type"] = initial_type(email)
-        client.set_fields(contact_id, values)
-        Email.objects.filter(pk=email.pk).update(ghl_error=None)
-    except ghl.GhlError as error:
-        Email.objects.filter(pk=email.pk).update(ghl_error=f"Ready-to-send update failed: {error}"[:2000])
+def ensure_contact(prospect: Prospect, client: ghl.Client) -> str:
+    """The prospect's GHL contact id, creating (or matching by email) the contact when it has none."""
+    if not prospect.ghl_contact_id:
+        contact_id, _ = client.upsert_contact(contact_payload(prospect))
+        link_contact(prospect, contact_id)
+    return prospect.ghl_contact_id
 
 
-def withdraw_schedule(email: Email, client: ghl.Client | None = None) -> None:
-    """A scheduled email went back to review or was rejected: empty its due date in GHL (never the count, which
-    would end the sequence)."""
-    if not email.prospect.ghl_contact_id or not ghl.configured():
-        return
-    try:
-        (client or ghl.Client()).set_fields(email.prospect.ghl_contact_id, {"due": None})
-    except ghl.GhlError:
-        pass  # only a date shown in GHL; nothing is sent without release
+def load(email_id: int) -> Email:
+    return Email.objects.select_related(
+        "prospect__contact", "prospect__business__discovery_campaign", "business__discovery_campaign",
+        "email_prompt").get(pk=email_id)
 
 
-def release(email: Email, client: ghl.Client) -> None:
-    """Write a due email into its contact's fields (status scheduled -> sending); GHL sends it right away."""
+def hand_over(email: Email, client: ghl.Client | None = None) -> str:
+    """Write an approved email into its contact (status approved -> scheduled); GHL waits until Email Due At and
+    sends it. Raises OutreachError (or ghl.GhlError) and leaves it approved, with the error kept, when it cannot."""
+    email = load(email.pk)
+    if email.status != "approved":
+        raise OutreachError(f"Only approved emails are handed over (this one is {email.get_status_display()}).")
     prospect = email.prospect
-    if not prospect.is_ready and not (email.sequence_step > generation.SEQUENCE_STEP
-                                      and prospect.outreach_status == "contacted" and not prospect.do_not_contact):
-        Email.objects.filter(pk=email.pk, status="scheduled").update(
-            status="rejected", review_note="Not sent: the prospect can no longer be emailed.", scheduled_at=None)
-        return
-    if prospect.sequence_stopped_at is not None:
-        Email.objects.filter(pk=email.pk, status="scheduled").update(
-            status="rejected", review_note="Not sent: the sequence was stopped.", scheduled_at=None)
-        return
-    contact_id = ensure_contact(prospect, client)
-    if not Email.objects.filter(pk=email.pk, status="scheduled").update(status="sending", released_at=now()):
-        return  # released by another run meanwhile
-    values = {"subject": email.subject, "body": body_for_ghl(email),
-              "count": email.sequence_step - generation.SEQUENCE_STEP, "due": due_date(email)}
-    if initial_type(email):
-        values["type"] = initial_type(email)
+    if prospect.sequence_stopped_at is not None or prospect.do_not_contact:
+        raise OutreachError("The prospect can no longer be emailed (stopped or do-not-contact).")
+    waiting = prospect.emails.filter(status__in=HANDED).exclude(pk=email.pk).first()
+    if waiting is not None:
+        raise OutreachError(f"Email {waiting.pk} of this prospect is still waiting in GoHighLevel.")
+    if email.scheduled_at is None:
+        schedule(email)
+    client = client or ghl.Client()
+    values = email_fields(email)
     try:
-        client.set_fields(contact_id, values)
-    except ghl.GhlError as error:  # back to scheduled, tried again on the next run
-        Email.objects.filter(pk=email.pk, status="sending").update(status="scheduled", released_at=None,
-                                                                   ghl_error=str(error)[:2000])
+        contact_id = ensure_contact(prospect, client)
+        current = client.get_fields(contact_id)
+        already = (current.get("subject") == values["subject"] and current.get("count") in (values["count"],
+                                                                                           str(values["count"])))
+        if not already:  # a timed-out write that GHL did save is never written (and sent) a second time
+            client.set_fields(contact_id, values)
+    except (ghl.GhlError, OutreachError) as error:
+        Email.objects.filter(pk=email.pk).update(ghl_error=str(error)[:2000])
         raise
-    Email.objects.filter(pk=email.pk).update(ghl_error=None)
+    Email.objects.filter(pk=email.pk, status="approved").update(status="scheduled", released_at=now(), ghl_error=None)
+    return due_value(email)
 
 
-def release_due(limit: int = RELEASE_BATCH) -> dict:
-    """Release every scheduled email whose time has come. Returns counts."""
-    due = list(Email.objects.filter(status="scheduled", scheduled_at__lte=now())
-               .select_related("prospect__contact", "prospect__business__discovery_campaign", "business__discovery_campaign",
-                               "email_prompt")
-               .order_by("scheduled_at", "id")[:limit])
-    result = {"released": 0, "failed": 0, "cancelled": 0}
-    if not due:
-        return result
-    client = ghl.Client()
-    for email in due:
-        try:
-            release(email, client)
-        except ghl.GhlError:
-            result["failed"] += 1
-            continue
-        status = Email.objects.filter(pk=email.pk).values_list("status", flat=True).first()
-        result["released" if status == "sending" else "cancelled"] += 1
-    return result
+def withdraw(email: Email, client: ghl.Client | None = None) -> None:
+    """Take a handed-over email back out of GoHighLevel before it is sent (edit, reject, back to review): its
+    subject, body and due date are emptied, the Follow-up Count stays (emptying it would end the sequence). Raises
+    if GHL cannot be reached, so the email is never shown as withdrawn while GHL could still send it."""
+    email = load(email.pk)
+    may_be_in_ghl = email.status in HANDED or (email.status == "approved" and email.ghl_error)  # a timed-out write
+    if not may_be_in_ghl or not email.prospect.ghl_contact_id or not ghl.configured():
+        return
+    try:
+        (client or ghl.Client()).set_fields(email.prospect.ghl_contact_id, {"subject": None, "body": None, "due": None})
+    except ghl.GhlError as error:
+        raise OutreachError(f"Could not take it back out of GoHighLevel ({error}); it may still be sent. "
+                            "Try again.") from error
 
 
 # ---------------------------------------------------------------- contacts
 
 
 def sync_contacts(limit: int = SYNC_BATCH) -> dict:
-    """Create GHL contacts for ready prospects that have none yet, and retry failed ready-to-send updates."""
-    result = {"created": 0, "matched": 0, "failed": 0, "retried": 0}
+    """Create GHL contacts for ready prospects that have none yet."""
+    result = {"created": 0, "matched": 0, "failed": 0}
     pending = list(generation.ready_prospects().filter(ghl_contact_id__isnull=True)
                    .select_related("contact", "business__discovery_campaign").order_by("id")[:limit])
-    retry = list(Email.objects.filter(status="scheduled", ghl_error__isnull=False)
-                 .select_related("prospect__contact", "prospect__business__discovery_campaign",
-                                 "business__discovery_campaign", "email_prompt")[:limit])
-    if not pending and not retry:
+    if not pending:
         return result
     client = ghl.Client()
     for prospect in pending:
         try:
             contact_id, new = client.upsert_contact(contact_payload(prospect))
-        except ghl.GhlError:
+            link_contact(prospect, contact_id)
+        except (ghl.GhlError, OutreachError):
             result["failed"] += 1
             continue
-        Prospect.objects.filter(pk=prospect.pk).update(ghl_contact_id=contact_id)
         result["created" if new else "matched"] += 1
-    for email in retry:
-        announce_schedule(email, client)
-        result["retried"] += 1
     return result
 
 
@@ -258,13 +247,10 @@ def sync_contacts(limit: int = SYNC_BATCH) -> dict:
 
 
 def prospect_for_contact(contact_id: str) -> Prospect:
-    prospects = list(Prospect.objects.filter(ghl_contact_id=contact_id).select_related("business__discovery_campaign"))
-    if not prospects:
+    prospect = Prospect.objects.filter(ghl_contact_id=contact_id).select_related("business__discovery_campaign").first()
+    if prospect is None:
         raise OutreachError(f"No prospect has GoHighLevel contact {contact_id}.")
-    if len(prospects) > 1:  # the same address under two contacts: the one with an email waiting wins
-        waiting = [p for p in prospects if p.emails.filter(status="sending").exists()]
-        prospects = waiting or prospects
-    return prospects[0]
+    return prospect
 
 
 def sequence_state(prospect: Prospect, sent_step: int) -> dict:
@@ -275,11 +261,31 @@ def sequence_state(prospect: Prospect, sent_step: int) -> dict:
     return {"subject": None, "body": None, "due": None, "count": sent_step if has_next else None}
 
 
-def record_sent(contact_id: str, followup_count=None, client: ghl.Client | None = None) -> dict:
-    """The email-sent webhook: mark the email GHL just sent, then set the contact's fields for what comes next.
-    Safe to call twice for the same email (GHL may retry a webhook)."""
+def write_next_followup(prospect: Prospect) -> str:
+    """Write the prospect's next follow-up for review right away (the webhook does this; nothing runs on a timer).
+    Returns what happened; a failure leaves it for Write follow-ups (dashboard) or the generate_followups command."""
+    from pipeline.services import followups
+
+    due = followups.find_due({"prospect_id": [prospect.pk]})
+    if not due:
+        return "no follow-up to write"
+    llm = generation.make_llm_client()
+    if llm is None:
+        return "follow-up not written: no LLM key"
+    try:
+        outcome, detail = followups.write_followup(due[0], llm)
+    except Exception as error:  # noqa: BLE001 - the email was sent either way; report and let a person retry
+        return f"follow-up not written ({type(error).__name__}); use Write follow-ups"
+    return f"follow-up {due[0]['sequence']} written for review" if outcome == "saved" else f"follow-up {outcome}: {detail}"
+
+
+def record_sent(contact_id: str, followup_count=None, client: ghl.Client | None = None,
+                write_followup: bool = True) -> dict:
+    """The email-sent webhook: mark the email GHL just sent, set the contact's fields for what comes next, then
+    write the next follow-up for review. Safe to call twice for the same email (GHL may retry a webhook)."""
     prospect = prospect_for_contact(contact_id)
     emails = prospect.emails.all()
+    handed = Q(status__in=HANDED) | Q(status="approved", scheduled_at__isnull=False)  # approved: a timed-out write
     if followup_count not in (None, ""):
         try:
             step = int(float(followup_count)) + generation.SEQUENCE_STEP
@@ -287,13 +293,13 @@ def record_sent(contact_id: str, followup_count=None, client: ghl.Client | None 
             raise OutreachError(f"Follow-up Count must be a number, got {followup_count!r}.") from error
         email = emails.filter(sequence_step=step).first()
     else:
-        email = emails.filter(status="sending").order_by("sequence_step").first() \
+        email = emails.filter(handed).order_by("sequence_step").first() \
             or emails.filter(status__in=SENT_STATUSES).order_by("-sequence_step").first()
     if email is None:
         raise OutreachError("This contact has no email waiting to be sent.")
-    if email.status == "sending":
+    if Email.objects.filter(pk=email.pk).filter(handed).exists():
         sent_at = now()
-        if Email.objects.filter(pk=email.pk, status="sending").update(status="sent", sent_at=sent_at):
+        if Email.objects.filter(pk=email.pk).filter(handed).update(status="sent", sent_at=sent_at, ghl_error=None):
             Prospect.objects.filter(pk=prospect.pk).update(outreach_status="contacted", last_contacted_at=sent_at)
             outcome = "recorded"
         else:
@@ -305,8 +311,11 @@ def record_sent(contact_id: str, followup_count=None, client: ghl.Client | None 
     prospect.refresh_from_db()
     state = sequence_state(prospect, email.sequence_step)
     (client or ghl.Client()).set_fields(contact_id, state)
-    return {"email": email.pk, "outcome": outcome,
-            "next": f"follow-up {state['count']}" if state["count"] is not None else "sequence finished"}
+    result = {"email": email.pk, "outcome": outcome,
+              "next": f"follow-up {state['count']}" if state["count"] is not None else "sequence finished"}
+    if write_followup and state["count"] is not None:
+        result["follow_up"] = write_next_followup(prospect)
+    return result
 
 
 def stop_prospect(prospect: Prospect, reason: str = "stopped", client: ghl.Client | None = None,
@@ -316,7 +325,7 @@ def stop_prospect(prospect: Prospect, reason: str = "stopped", client: ghl.Clien
     reason = (reason or "stopped").strip()[:64]
     Prospect.objects.filter(pk=prospect.pk, sequence_stopped_at__isnull=True).update(
         sequence_stopped_at=now(), sequence_stop_reason=reason)
-    cancelled = Email.objects.filter(prospect=prospect, status__in=("in_review", "approved", "scheduled")).update(
+    cancelled = Email.objects.filter(prospect=prospect, status__in=("in_review", "approved", *HANDED)).update(
         status="rejected", review_note=f"Sequence stopped ({reason}).", scheduled_at=None)
     if prospect.ghl_contact_id and ghl.configured():
         try:
@@ -329,8 +338,8 @@ def stop_prospect(prospect: Prospect, reason: str = "stopped", client: ghl.Clien
 
 
 def stop_sequence(contact_id: str, reason: str = "stopped", client: ghl.Client | None = None) -> dict:
-    """The stop webhook (a reply or a manual stage move in GHL): no more emails to this prospect. A reply also
-    marks the latest sent email replied."""
+    """The stop webhook (a reply, a bounce, an unsubscribe or a manual stage move in GHL): no more emails to this
+    prospect. A reply also marks the latest sent email replied."""
     prospect = prospect_for_contact(contact_id)
     reason = (reason or "stopped").strip()[:64]
     if reason.lower().startswith("repl"):
@@ -345,5 +354,11 @@ def stop_sequence(contact_id: str, reason: str = "stopped", client: ghl.Client |
 
 
 def stuck_emails():
-    """Emails handed to GHL long ago that it never reported as sent: the sending workflow is missing or failing."""
-    return Email.objects.filter(status="sending", released_at__lt=now() - STUCK_AFTER)
+    """Emails in GoHighLevel whose send time passed over a day ago and that it never reported sent: the sending
+    workflow is missing, not published, or its webhook fails."""
+    return Email.objects.filter(status__in=HANDED, scheduled_at__lt=now() - STUCK_AFTER)
+
+
+def not_handed_over():
+    """Approved emails not in GoHighLevel yet (a failed or interrupted hand-over): hand them over again."""
+    return Email.objects.filter(status="approved")

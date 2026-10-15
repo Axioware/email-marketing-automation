@@ -201,6 +201,14 @@ class PipelineAdminSite(admin.AdminSite):
             steps.append((f"{business_reviews} business(es) scored below their campaign's minimum or could not be "
                           "researched: approve or reject them.", "Review businesses",
                           changelist("business", qualification="review")))
+        not_handed = outreach.not_handed_over().count()
+        if not_handed and ghl.configured():
+            steps.append((f"{not_handed} approved email(s) are not in GoHighLevel yet (the hand-over failed or was "
+                          "interrupted): hand them over.", "Hand to GoHighLevel", run_url("ghl_sync")))
+        missing_contacts = ready.filter(ghl_contact_id__isnull=True).count()
+        if missing_contacts and ghl.configured():
+            steps.append((f"{missing_contacts} ready prospect(s) are not GoHighLevel contacts yet.",
+                          "Create GHL contacts", run_url("ghl_sync", "--contacts-only")))
         if prospect_reviews:
             steps.append((f"{prospect_reviews} prospect address(es) could not be verified: approve or reject them.",
                           "Review prospects", changelist("prospect", outreach_status__exact="needs_review")))
@@ -238,12 +246,8 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("GHL_WEBHOOK_SECRET is not set: GoHighLevel cannot report sent emails or replies.")
         stuck = outreach.stuck_emails().count()
         if stuck:
-            warnings.append(f"{stuck} email(s) were handed to GoHighLevel over 30 minutes ago and never reported sent: "
-                            "check the sending workflow and its email-sent webhook.")
-        ghl_errors = Email.objects.filter(status="scheduled", ghl_error__isnull=False).count()
-        if ghl_errors:
-            warnings.append(f"{ghl_errors} scheduled email(s) could not be updated in GoHighLevel; see the error on "
-                            "each email (retried every minute).")
+            warnings.append(f"{stuck} email(s) in GoHighLevel are over a day past their send time and were never reported "
+                            "sent: check the sending workflow (published?) and its email-sent webhook.")
         worker = worker_status()
         if jobs.queue_mode() and not worker["alive"]:
             warnings.append("No worker is running: queued runs wait until `python manage.py run_worker` is started on "

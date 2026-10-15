@@ -86,7 +86,6 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
 | Email sign-off | `SENDER_NAME` (optional; empty: "The Axioware team") |
 | Sending through GoHighLevel | `GHL_API_KEY` (sub-account Private Integration token), `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET` (the workflows send it) |
-| Cron endpoints | `CRON_SECRET` (Vercel Cron sends it as `Authorization: Bearer ...`) |
 | Pipeline runs | `RUN_MODE` (`local`, default; `queue` on Vercel, set automatically there) |
 
 ### Docker setup (Google Maps scraper, optional second lead source)
@@ -124,7 +123,7 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 5b. Review unverified addresses | Prospects > filter Needs review > **Approve** / **Reject** | - |
 | 6. Write emails | Prospects or Businesses > action **Generate outreach emails** | `python manage.py generate_emails [--email-prompt-id N]` |
 | 7. Review | Emails: edit, Approve (= schedule), Reject, Regenerate | - |
-| 8. Send | GoHighLevel, once each email's time comes | `python manage.py ghl_sync` every minute (or the cron endpoints) |
+| 8. Send | Approving hands the email to GoHighLevel, which waits until Email Due At and sends it | `python manage.py ghl_sync` (contacts; re-hands emails whose hand-over failed) |
 | 9. Follow-ups | Campaign > **Follow-ups** table (days + prompt per step); written for review once the previous email is sent | `python manage.py generate_followups` |
 
 Every command has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
@@ -155,8 +154,8 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | `/api/campaigns/` | list, create, edit, delete: `lead_source`, `campaign_prompt`, `initial_email_prompts` (ids; several = A/B), `min_score`, `gap_fixed_seconds`, `gap_random_min_seconds`, `gap_random_max_seconds`, `daily_cap`, `send_window_start`/`send_window_end`, `send_timezone`; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20, "source": "scraper_api"}` |
 | `/api/follow-ups/` | a campaign's follow-up steps (sequence, days after previous, `email_prompt`); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops that prospect's sequence |
 | `/api/campaign-prompts/`, `/api/email-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored; shared by campaigns); email prompts write emails (`kind`: `initial` or `follow_up`) |
-| `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/` | GoHighLevel webhooks (header `X-Webhook-Secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
-| `/api/cron/release/`, `/api/cron/followups/` | cron endpoints (header `Authorization: Bearer <CRON_SECRET>`) |
+| `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/` | GoHighLevel webhooks (Custom Data `secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
+| `POST /api/emails/{id}/hand-over/` | hand an approved email whose hand-over failed to GoHighLevel again |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
 | `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |
 | `/api/emails/` | list, view, `PATCH` `subject`/`body` (goes back to review), delete |
@@ -359,33 +358,34 @@ Statuses: `in_review` -> `approved` -> `scheduled` (send time given) -> `sending
 
 ## Sending through GoHighLevel
 
-GoHighLevel sends every email from your connected mailbox; this app decides what and when.
+GoHighLevel waits until each email's due time and sends it from your connected mailbox; this app decides what and when. Nothing in the app runs on a timer.
 
-1. **Contacts.** Every ready prospect (deliverable, or approved by a person; one address per person) becomes a GHL contact tagged `outreach-app` and `campaign-<name>` (`ghl_sync`, also the last step of `run_pipeline`). A GHL workflow turns new tagged contacts into **New Lead** opportunities.
-2. **Approval = schedule.** Approving an email gives it a send time: the campaign's previous slot + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day; a follow-up never before "previous email sent + its days". The contact's **Email Due At** (date) and, for an initial email, **Initial Email Type** (the prompt's name) are written at once, so a workflow can move the lead to **Ready to Send**.
-3. **Release.** GHL date fields hold no time of day (checked against the API), so GHL cannot wait for the minute; this app does. Every minute (`ghl_sync`, `GET /api/cron/release/`, or `run_worker --cron`) emails whose time has come are written into the contact: **Email Subject**, **Email Body** (HTML incl. footer), **Follow-up Count** (0 = initial, n = follow-up n), **Email Due At**. The GHL sending workflow, triggered by Email Body becoming non-empty, sends at once.
-4. **Sent.** The workflow calls `POST /api/ghl/email-sent/`. The app marks the email sent and, before answering, empties Subject, Body and Due At and sets **Follow-up Count** to the next follow-up's number, or empties it when the sequence is over (the workflow then moves the lead to **Quota Exhausted**). The next follow-up is written for review by `/api/cron/followups/` (or `generate_followups`) and released the same way once approved. GHL may retry the webhook; a repeat changes nothing.
-5. **Stop.** On a reply or a manual stage move the workflow calls `POST /api/ghl/stop-sequence/`: the prospect's sequence ends, emails not sent yet are cancelled and its fields are emptied, so a later release can never re-trigger sending. Each prospect has its own sequence; colleagues at the same business are not affected.
+1. **Contacts.** Every ready prospect (deliverable, or approved by a person) becomes a GHL contact tagged `outreach-app` and `campaign-<name>`: the full pipeline does it as its last step, `ghl_sync` (or the dashboard button) does it any time, and approving an email does it for that prospect. One email address gets one sequence, even if several prospects share it. A GHL workflow turns new tagged contacts into **New Lead** opportunities.
+2. **Approval = hand-over.** Approving an email gives it a send time (stored in `emails.scheduled_at`): the campaign's previous one + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day; a follow-up never before "previous email sent + its days". The email is written into the contact at once: **Email Subject**, **Email Body** (HTML incl. footer), **Follow-up Count** (0 = initial, n = follow-up n), **Email Due At** (the send time, ISO; GHL's date field keeps the date) and, for an initial email, **Initial Email Type** (the prompt's name). Status: **In GoHighLevel**. The GHL workflow waits until Email Due At and sends.
+3. **Failures.** A write GHL refuses leaves the email **Approved** with the error shown (dashboard: "not in GoHighLevel yet"; **Hand to GoHighLevel** on the email, the Emails action, `ghl_sync`, or `POST /api/emails/{id}/hand-over/`). Writes are never retried automatically (only a 429 rate limit is), and handing over again first reads the contact: if GHL already has the email (a write that timed out after GHL saved it), it is not written again, so it is never sent twice.
+4. **Sent.** The workflow calls `POST /api/ghl/email-sent/`. The app marks the email sent, empties Subject, Body and Due At and sets **Follow-up Count** to the next follow-up's number, or empties it when the sequence is over (the workflow then moves the lead to **Quota Exhausted**), and then writes the next follow-up for review (if the AI fails, **Write follow-ups** on the dashboard retries). Approving the follow-up hands it over the same way. GHL may retry the webhook; a repeat changes nothing.
+5. **Changes after hand-over.** Editing, rejecting or sending a handed-over email back to review first empties its Subject, Body and Due At in GHL; if GHL cannot be reached nothing changes here and you are told, because GHL could still send it.
+6. **Stop.** On a reply, a bounce, an unsubscribe or a manual stage move the workflow calls `POST /api/ghl/stop-sequence/`: the prospect's sequence ends, emails not sent yet are cancelled and its fields emptied. Each prospect has its own sequence; colleagues at the same business are not affected.
 
 Contact custom fields the app writes (create them in GHL; their keys must be exactly these): `contact.email_subject` (text), `contact.email_body` (large text), `contact.email_due_at` (date), `contact.followup_count` (number), `contact.initial_email_type` (text).
 
-Webhooks (header `X-Webhook-Secret: <GHL_WEBHOOK_SECRET>`, JSON body):
+Webhooks: in the workflow's **Webhook** action, Method POST, and these **Custom Data** keys (GHL sends them under `customData`, next to the contact's standard fields; `contact_id` is always at the top). `secret` is the value of `GHL_WEBHOOK_SECRET`; the header `X-Webhook-Secret` or `?secret=` on the URL work too.
 
 | Endpoint | Body | Answers |
 |---|---|---|
-| `POST /api/ghl/email-sent/` | `{"contact_id": "{{contact.id}}", "followup_count": "{{contact.followup_count}}"}` | `200` `{"email", "outcome", "next"}`; `401` wrong secret, `404` unknown contact, `409` nothing was handed to GHL, `502` GHL error (safe to retry) |
-| `POST /api/ghl/stop-sequence/` | `{"contact_id": "{{contact.id}}", "reason": "replied"}` (any reason; `replied...` also marks the last email replied) | `200` `{"prospect", "reason", "cancelled"}` |
+| `POST /api/ghl/email-sent/` | `secret`, `followup_count` = `{{contact.followup_count}}` | `200` `{"email", "outcome", "next", "follow_up"}`; `401` wrong secret, `404` unknown contact, `409` nothing was handed to GHL, `502` GHL error (safe to retry) |
+| `POST /api/ghl/stop-sequence/` | `secret`, `reason` = `replied` (any reason; `replied...` also marks the last email replied) | `200` `{"prospect", "reason", "cancelled"}` |
 
-Cron (header `Authorization: Bearer <CRON_SECRET>` or the API's `Auth` header): `GET /api/cron/release/` every minute (contacts + release; at most 25 of each per call), `GET /api/cron/followups/` every 10 minutes (writes up to 5 follow-ups for review, `?limit=` up to 20). The dashboard warns when GHL is not set up, when an email was handed to GHL over 30 minutes ago without the email-sent webhook, and when a GHL update failed (retried every minute).
+The dashboard warns when GHL is not set up, when approved emails are not in GHL yet, when ready prospects are not GHL contacts yet, and when an email is over a day past its send time without the email-sent webhook.
 
 ## Deploying on Vercel (web app + worker)
 
-Vercel runs short web requests only: no background processes, browsers or Docker. So the **web app** (admin, API, webhooks, cron endpoints) runs on Vercel, and the **pipeline steps** (fetching, research, decision makers, verification, writing emails) run on a **worker**: a machine with Chromium, Firefox, Docker (Reacher, the scraper container) and the same `DATABASE_URL`.
+Vercel runs short web requests only: no background processes, browsers or Docker. So the **web app** (admin, API, webhooks) runs on Vercel, and the **pipeline steps** (fetching, research, decision makers, verification, writing emails) run on a **worker**: a machine with Chromium, Firefox, Docker (Reacher, the scraper container) and the same `DATABASE_URL`.
 
-- `vercel.json` routes every request to `api/index.py` (the Django WSGI app), allows 60 s per request, and schedules the two cron endpoints (every-minute crons need a Vercel Pro plan; on Hobby use `run_worker --cron` or any external scheduler calling the endpoints). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
-- Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `CRON_SECRET`, `SENDER_NAME`. On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
+- `vercel.json` routes every request to `api/index.py` (the Django WSGI app) and allows 60 s per request (the email-sent webhook writes the next follow-up with the AI inside that time; bulk-approve around 30-40 emails at a time, since each approval writes to GHL). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
+- Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `SENDER_NAME`. On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
 - Run `python manage.py migrate` from your machine (not on deploy).
-- On the worker: `python manage.py run_worker` (add `--cron` to also release emails and write follow-ups there). Runs started in the admin or the API wait in the queue until the worker picks them up; **Stop** reaches the worker through the database. The dashboard shows when the worker was last seen. Run one worker.
+- On the worker: `python manage.py run_worker`. Runs started in the admin or the API wait in the queue until the worker picks them up; **Stop** reaches the worker through the database. The dashboard shows when the worker was last seen. Run one worker.
 
 ### Placeholders to fill
 
@@ -400,7 +400,7 @@ python manage.py test
 npx deno test supabase/functions/email/handler_test.ts
 ```
 
-Tests never use the `.env` database or real services: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set), the test runner removes the GoHighLevel, cron and LLM keys from the environment, and the GHL client refuses the real API during tests. Reacher, the scraper container, GoHighLevel and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
+Tests never use the `.env` database or real services: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set), the test runner removes the GoHighLevel and LLM keys from the environment, and the GHL client refuses the real API during tests. Reacher, the scraper container, GoHighLevel and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
 
 ## Project layout
 

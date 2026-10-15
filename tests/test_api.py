@@ -182,7 +182,7 @@ class EmailApiTests(ApiCase):
         email = make_email()
         response = self.api.post(f"/api/emails/{email.pk}/approve/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["email"]["status"], "scheduled")
+        self.assertEqual(response.json()["email"]["status"], "approved")  # GoHighLevel is not set up in this test: it waits, with its time
         self.assertIsNotNone(response.json()["email"]["scheduled_at"])
         self.assertEqual(self.api.post(f"/api/emails/{email.pk}/approve/").status_code, 409)  # not in review any more
         self.api.post(f"/api/emails/{email.pk}/reject/", {"note": "Too long"}, format="json")

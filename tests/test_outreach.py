@@ -1,4 +1,4 @@
-"""Sending through GoHighLevel: scheduling, contact and field writes, release, the webhooks, the cron endpoints,
+"""Sending through GoHighLevel: scheduling, hand-over at approval, contact and field writes, the webhooks,
 the review queues, queue mode with the worker, and the Vercel settings. GoHighLevel is a local fake server."""
 import json
 import os
@@ -43,6 +43,7 @@ class FakeGhl:
 
     def __init__(self):
         self.contacts, self.requests, self.fail_with = {}, [], None
+        self.apply_then_fail = False  # a write GHL saves but answers with an error (like a timeout after saving)
         ghl._field_cache.clear()
         fake = self
 
@@ -76,6 +77,8 @@ class FakeGhl:
                 if method == "PUT" and cid in fake.contacts:
                     for field in body.get("customFields", []):
                         fake.contacts[cid]["fields"][field["id"]] = field["field_value"]
+                    if fake.apply_then_fail:
+                        return self.reply(504, {"message": "gateway timeout"})
                     return self.reply(200, {"succeded": True})
                 if method == "GET" and cid in fake.contacts:
                     fields = [{"id": k, "value": v} for k, v in fake.contacts[cid]["fields"].items() if v not in ("", None)]
@@ -111,8 +114,7 @@ class OutreachCase(TestCase):
         self.llm = FakeLLM()
         self.addCleanup(self.llm.close)
         env = mock.patch.dict(os.environ, {**review_env(self.llm), "GHL_API_KEY": "pit-test", "GHL_LOCATION_ID": "loc1",
-                                           "GHL_BASE_URL": self.ghl.url, "GHL_WEBHOOK_SECRET": SECRET,
-                                           "CRON_SECRET": "cron-secret"})
+                                           "GHL_BASE_URL": self.ghl.url, "GHL_WEBHOOK_SECRET": SECRET})
         env.start()
         self.addCleanup(env.stop)
         self.initial = make_email_prompt("Initial A", "INITIAL A")
@@ -133,6 +135,9 @@ class OutreachCase(TestCase):
 
     def contact_id(self, email):
         return Prospect.objects.get(pk=email.prospect_id).ghl_contact_id
+
+    def puts(self):
+        return [r for r in self.ghl.requests if r[0] == "PUT"]
 
 
 class ScheduleTests(OutreachCase):
@@ -162,24 +167,28 @@ class ScheduleTests(OutreachCase):
         full = outreach.next_slot(self.campaign, datetime(2026, 10, 21, 9, 30, tzinfo=KARACHI))
         self.assertEqual(full, datetime(2026, 10, 22, 9, 0, tzinfo=KARACHI))  # cap of 2 reached that day
 
-    def test_approve_schedules_and_tells_ghl(self):
+    def test_approve_hands_the_email_to_ghl(self):
         email = self.email()
         message = review.approve(email)
-        self.assertIn("scheduled for", message)
+        self.assertIn("Approved and handed to GoHighLevel; due", message)
         email.refresh_from_db()
         self.assertEqual(email.status, "scheduled")
+        self.assertIsNotNone(email.released_at)
         contact = self.contact_id(email)
-        self.assertTrue(contact)
         payload = self.ghl.contacts[contact]["contact"]
         self.assertEqual(payload["email"], email.recipient)
         self.assertIn(ghl.OUTREACH_TAG, payload["tags"])
         self.assertIn("campaign-clinics", payload["tags"])
-        self.assertEqual(self.ghl.fields(contact), {
-            "due": email.scheduled_at.astimezone(KARACHI).date().isoformat(), "type": "Initial A"})
-        method, path, _, auth, agent = self.ghl.requests[0]
+        fields = self.ghl.fields(contact)
+        self.assertEqual((fields["subject"], fields["count"], fields["type"]), (email.subject, 0, "Initial A"))
+        self.assertEqual(fields["due"], email.scheduled_at.astimezone(KARACHI).replace(microsecond=0).isoformat())
+        self.assertIn("<p>", fields["body"])
+        self.assertNotIn("<html", fields["body"])
+        self.assertIn("unsubscribe", fields["body"])  # the footer is part of the body
+        _, _, _, auth, agent = self.ghl.requests[0]
         self.assertEqual((auth, agent), ("Bearer pit-test", ghl.USER_AGENT))
 
-    def test_follow_up_is_not_scheduled_before_its_days(self):
+    def test_follow_up_is_not_due_before_its_days(self):
         first = self.email("sent")
         sent_at = outreach.now() - timedelta(days=1)
         Email.objects.filter(pk=first.pk).update(sent_at=sent_at)
@@ -191,73 +200,103 @@ class ScheduleTests(OutreachCase):
         review.approve(follow_up)
         follow_up.refresh_from_db()
         self.assertGreaterEqual(follow_up.scheduled_at, sent_at + timedelta(days=3))
-        self.assertNotIn("type", self.ghl.fields(self.contact_id(first)))  # only initial emails set the type
+        fields = self.ghl.fields(self.contact_id(first))
+        self.assertEqual(fields["count"], 1)
+        self.assertNotIn("type", fields)  # only initial emails set the type
 
-    def test_reject_or_reopen_a_scheduled_email_frees_it(self):
+    def test_reject_or_reopen_takes_it_back_out_of_ghl(self):
         email = self.email()
         review.approve(email)
         email.refresh_from_db()
         review.reopen(email)
         email.refresh_from_db()
         self.assertEqual((email.status, email.scheduled_at), ("in_review", None))
-        self.assertNotIn("due", self.ghl.fields(self.contact_id(email)))
+        self.assertEqual(self.ghl.fields(self.contact_id(email)), {"count": 0, "type": "Initial A"})  # nothing to send
         review.approve(email)
         email.refresh_from_db()
-        review.reject(email, "no")
+        self.ghl.fail_with = 500
+        with self.assertRaisesMessage(review.ReviewError, "Could not take it back out of GoHighLevel"):
+            review.reject(email, "no")
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "scheduled")  # unchanged: GHL could still send it
+        self.ghl.fail_with = None
+        review.reject(Email.objects.get(pk=email.pk), "no")
         self.assertEqual(Email.objects.get(pk=email.pk).status, "rejected")
+        self.assertNotIn("body", self.ghl.fields(self.contact_id(email)))
 
-    def test_ghl_failure_keeps_the_schedule_and_is_retried(self):
+    def test_editing_a_handed_over_email_takes_it_back(self):
+        email = self.email()
+        review.approve(email)
+        review.save_edit(Email.objects.get(pk=email.pk), "New subject", "Hi Ali,\n\nChanged.")
+        email.refresh_from_db()
+        self.assertEqual((email.status, email.scheduled_at), ("in_review", None))
+        self.assertNotIn("subject", self.ghl.fields(self.contact_id(email)))
+
+    def test_a_failed_hand_over_stays_approved_and_can_be_retried(self):
         self.ghl.fail_with = 500
         email = self.email()
-        with mock.patch("pipeline.services.ghl.time.sleep"):
-            review.approve(email)
+        message = review.approve(email)
+        self.assertIn("not handed to GoHighLevel", message)
         email.refresh_from_db()
-        self.assertEqual(email.status, "scheduled")
+        self.assertEqual(email.status, "approved")
         self.assertIn("HTTP 500", email.ghl_error)
+        self.assertIsNotNone(email.scheduled_at)  # its slot is kept
+        self.assertEqual(list(outreach.not_handed_over()), [email])
         self.ghl.fail_with = None
-        result = outreach.sync_contacts()
-        self.assertEqual(result["retried"], 1)
-        self.assertIsNone(Email.objects.get(pk=email.pk).ghl_error)
+        self.assertIn("Handed to GoHighLevel", review.hand_over(email))
+        email.refresh_from_db()
+        self.assertEqual((email.status, email.ghl_error), ("scheduled", None))
 
+    def test_a_write_ghl_saved_despite_an_error_is_never_written_twice(self):
+        email = self.email()
+        self.ghl.apply_then_fail = True  # GHL saves the email but answers with a timeout
+        review.approve(email)
+        email.refresh_from_db()
+        self.assertEqual(email.status, "approved")
+        self.assertEqual(len(self.puts()), 1)  # no automatic retry of the write
+        self.ghl.apply_then_fail = False
+        review.hand_over(email)
+        self.assertEqual(len(self.puts()), 1)  # GHL already had it: marked handed over without writing again
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "scheduled")
 
-class ReleaseAndWebhookTests(OutreachCase):
-    def scheduled(self, when):
+    def test_only_one_email_of_a_prospect_waits_in_ghl(self):
         email = self.email()
         review.approve(email)
-        Email.objects.filter(pk=email.pk).update(scheduled_at=when)
+        second = Email.objects.create(prospect=email.prospect, business=email.business, contact=email.contact,
+                                      sequence_step=2, recipient=email.recipient, subject="F", body_text="b",
+                                      body_html="h", tracking_token="v" * 40, status="approved")
+        with self.assertRaisesMessage(outreach.OutreachError, "is still waiting in GoHighLevel"):
+            outreach.hand_over(second)
+
+
+class WebhookTests(OutreachCase):
+    def handed_over(self):
+        email = self.email()
+        review.approve(email)
         return Email.objects.get(pk=email.pk)
 
-    def test_due_emails_are_written_into_the_contact(self):
-        due = self.scheduled(outreach.now() - timedelta(minutes=1))
-        later = self.scheduled(outreach.now() + timedelta(hours=1))
-        result = outreach.release_due()
-        self.assertEqual(result["released"], 1)
-        due.refresh_from_db()
-        self.assertEqual((due.status, Email.objects.get(pk=later.pk).status), ("sending", "scheduled"))
-        fields = self.ghl.fields(self.contact_id(due))
-        self.assertEqual((fields["subject"], fields["count"], fields["type"]), (due.subject, 0, "Initial A"))
-        self.assertIn("<p>", fields["body"])
-        self.assertNotIn("<html", fields["body"])
-        self.assertIn("unsubscribe", fields["body"])  # the footer is part of the body
+    def test_ghl_webhook_action_payload(self):
+        """The body GHL's Webhook action sends: contact fields at the top, our keys in customData, no headers."""
+        email = self.handed_over()
+        contact = self.contact_id(email)
+        payload = {"contact_id": contact, "first_name": "Hassam", "email": email.recipient, "tags": "",
+                   "location": {"id": "N5kPOFObjirSmBMBqugi"}, "workflow": {"id": "w", "name": "Send email"},
+                   "triggerData": {}, "contact": {"attributionSource": {}}, "attributionSource": {},
+                   "customData": {"email_subject": "", "email_body": "", "initial_email_type": "Initial A",
+                                  "email_due_at": "", "followup_count": "0", "secret": "wrong"}}
+        self.assertEqual(self.api.post("/api/ghl/email-sent/", payload, format="json").status_code, 401)
+        payload["customData"]["secret"] = SECRET
+        response = self.api.post("/api/ghl/email-sent/", payload, format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
+        payload["customData"].pop("secret")
+        retried = self.api.post(f"/api/ghl/email-sent/?secret={SECRET}", payload, format="json")
+        self.assertEqual(retried.json()["outcome"], "already recorded")
+        stop = {"contact_id": contact, "customData": {"reason": "replied", "secret": SECRET}}
+        self.assertEqual(self.api.post("/api/ghl/stop-sequence/", stop, format="json").status_code, 200)
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "replied")
 
-    def test_a_prospect_no_longer_emailable_is_cancelled_not_sent(self):
-        email = self.scheduled(outreach.now() - timedelta(minutes=1))
-        Prospect.objects.filter(pk=email.prospect_id).update(do_not_contact=True)
-        self.assertEqual(outreach.release_due()["cancelled"], 1)
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "rejected")
-
-    def test_failed_release_goes_back_to_scheduled(self):
-        email = self.scheduled(outreach.now() - timedelta(minutes=1))
-        self.ghl.fail_with = 429
-        with mock.patch("pipeline.services.ghl.time.sleep"):
-            self.assertEqual(outreach.release_due()["failed"], 1)
-        email.refresh_from_db()
-        self.assertEqual(email.status, "scheduled")
-        self.assertIn("HTTP 429", email.ghl_error)
-
-    def test_email_sent_webhook(self):
-        email = self.scheduled(outreach.now() - timedelta(minutes=1))
-        outreach.release_due()
+    def test_email_sent_webhook_writes_the_next_follow_up(self):
+        email = self.handed_over()
         contact = self.contact_id(email)
         self.assertEqual(self.hook("email-sent", {"contact_id": contact}, secret="wrong").status_code, 401)
         with mock.patch.dict(os.environ, {"GHL_WEBHOOK_SECRET": ""}):
@@ -266,70 +305,68 @@ class ReleaseAndWebhookTests(OutreachCase):
         self.assertEqual(self.hook("email-sent", {"contact_id": "nobody"}).status_code, 404)
         response = self.hook("email-sent", {"contact_id": contact, "followup_count": "0"})
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json()["next"], "follow-up 1")
+        self.assertEqual((response.json()["next"], response.json()["follow_up"]),
+                         ("follow-up 1", "follow-up 1 written for review"))
         email.refresh_from_db()
         self.assertEqual(email.status, "sent")
         self.assertIsNotNone(email.sent_at)
         self.assertEqual(Prospect.objects.get(pk=email.prospect_id).outreach_status, "contacted")
         self.assertEqual(self.ghl.fields(contact), {"count": 1, "type": "Initial A"})  # waiting for follow-up 1
+        follow_up = Email.objects.get(prospect_id=email.prospect_id, sequence_step=2)
+        self.assertEqual((follow_up.status, follow_up.email_prompt), ("in_review", self.follow))
         again = self.hook("email-sent", {"contact_id": contact, "followup_count": 0})  # GHL retried
         self.assertEqual(again.json()["outcome"], "already recorded")
+        self.assertEqual(Email.objects.filter(prospect_id=email.prospect_id).count(), 2)  # no second follow-up
         self.assertEqual(Email.objects.get(pk=email.pk).sent_at, email.sent_at)
 
-    def test_custom_data_and_missing_count(self):
-        email = self.scheduled(outreach.now() - timedelta(minutes=1))
-        outreach.release_due()
+    def test_a_follow_up_the_ai_could_not_write_is_left_for_later(self):
+        email = self.handed_over()
+        self.llm.mode = "bad"
+        response = self.hook("email-sent", {"contact_id": self.contact_id(email), "followup_count": "0"})
+        self.assertEqual(response.status_code, 200)  # the email was sent either way
+        self.assertIn("follow-up not written", response.json()["follow_up"])
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
+
+    def test_an_email_whose_hand_over_timed_out_is_still_recorded(self):
+        email = self.email()
+        self.ghl.apply_then_fail = True
+        review.approve(email)
+        self.ghl.apply_then_fail = False
         response = self.hook("email-sent", {"contact_id": self.contact_id(email), "customData": {}})
-        self.assertEqual(response.json()["outcome"], "recorded")  # the email handed to GHL is the one sent
+        self.assertEqual(response.json()["outcome"], "recorded")
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
 
     def test_stop_sequence_webhook(self):
-        first = self.scheduled(outreach.now() - timedelta(minutes=1))
-        outreach.release_due()
+        first = self.handed_over()
         contact = self.contact_id(first)
         self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
-        pending = Email.objects.create(prospect=first.prospect, business=first.business, contact=first.contact,
-                                       sequence_step=2, recipient=first.recipient, subject="F", body_text="b",
-                                       body_html="h", tracking_token="u" * 40, status="in_review")
+        pending = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)  # written by the webhook
         response = self.hook("stop-sequence", {"contact_id": contact, "reason": "replied"})
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["cancelled"], 1)
         self.assertEqual((Email.objects.get(pk=first.pk).status, Email.objects.get(pk=pending.pk).status),
                          ("replied", "rejected"))
-        prospect = Prospect.objects.get(pk=first.prospect_id)
-        self.assertEqual(prospect.sequence_stop_reason, "replied")
+        self.assertEqual(Prospect.objects.get(pk=first.prospect_id).sequence_stop_reason, "replied")
         self.assertEqual(self.ghl.fields(contact), {"type": "Initial A"})  # nothing left to send
 
     def test_full_sequence_until_exhausted(self):
-        email = self.scheduled(outreach.now() - timedelta(minutes=1))
-        outreach.release_due()
+        email = self.handed_over()
         contact = self.contact_id(email)
         self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
-        cron = self.api.get("/api/cron/followups/", HTTP_AUTHORIZATION="Bearer cron-secret")
-        self.assertEqual(cron.json()["saved"], 1, cron.content)
         follow_up = Email.objects.get(prospect_id=email.prospect_id, sequence_step=2)
-        self.assertEqual((follow_up.status, follow_up.email_prompt), ("in_review", self.follow))
         review.approve(follow_up)
-        Email.objects.filter(pk=follow_up.pk).update(scheduled_at=outreach.now() - timedelta(seconds=1))
-        release = self.api.get("/api/cron/release/", HTTP_AUTHORIZATION="Bearer cron-secret")
-        self.assertEqual(release.json()["emails"]["released"], 1, release.content)
         self.assertEqual(self.ghl.fields(contact)["count"], 1)
+        self.assertEqual(Email.objects.get(pk=follow_up.pk).status, "scheduled")
         response = self.hook("email-sent", {"contact_id": contact, "followup_count": 1})
         self.assertEqual(response.json()["next"], "sequence finished")
+        self.assertNotIn("follow_up", response.json())
         self.assertEqual(self.ghl.fields(contact), {"type": "Initial A"})  # Follow-up Count empty: exhausted
         self.assertEqual(Email.objects.get(pk=follow_up.pk).status, "sent")
 
 
-class CronAndContactTests(OutreachCase):
-    def test_cron_needs_its_secret(self):
-        self.assertEqual(self.api.get("/api/cron/release/").status_code, 401)
-        self.assertEqual(self.api.get("/api/cron/release/", HTTP_AUTHORIZATION="Bearer nope").status_code, 401)
-        self.assertEqual(self.api.get("/api/cron/release/", HTTP_AUTHORIZATION="Bearer cron-secret").status_code, 200)
-        with override_settings(AUTH_TOKEN="api-key"):
-            self.assertEqual(self.api.get("/api/cron/followups/", HTTP_AUTH="api-key").status_code, 200)
-
+class ContactTests(OutreachCase):
     def test_contacts_for_ready_prospects_only(self):
-        ready = self.email()
-        ready.delete()
+        self.email().delete()
         business = make_business(self.campaign, "Unverified clinic")
         contact = make_contact(business, name="Sara Khan")
         unverified = Prospect.objects.create(business=business, contact=contact, email="sara@unverified.org",
@@ -340,17 +377,51 @@ class CronAndContactTests(OutreachCase):
         Prospect.objects.filter(pk=unverified.pk).update(outreach_status="ready", approved_by_person=True)
         self.assertEqual(outreach.sync_contacts()["created"], 1)
         self.assertTrue(Prospect.objects.get(pk=unverified.pk).ghl_contact_id)
-        self.assertEqual(outreach.sync_contacts(), {"created": 0, "matched": 0, "failed": 0, "retried": 0})
+        self.assertEqual(outreach.sync_contacts(), {"created": 0, "matched": 0, "failed": 0})
 
-    def test_ghl_sync_command_and_not_configured(self):
+    def test_one_sequence_per_email_address(self):
+        from pipeline.services import generation
+
+        first = self.email()
+        first.delete()
+        other_business = make_business(self.campaign, "Second branch")
+        other_contact = make_contact(other_business, name="Front desk")
+        shared = Prospect.objects.create(business=other_business, contact=other_contact,
+                                         email=first.recipient.upper(), email_status="deliverable",
+                                         outreach_status="ready")
+        ready = [p.pk for p in generation.ready_prospects()]
+        self.assertEqual(ready, [first.prospect_id])  # the address gets one sequence: the oldest prospect's
+        outreach.sync_contacts()
+        self.assertIsNone(Prospect.objects.get(pk=shared.pk).ghl_contact_id)
+        Prospect.objects.filter(pk=first.prospect_id).update(do_not_contact=True)
+        self.assertEqual(list(generation.ready_prospects()), [])  # an opted-out address is out everywhere
+        with self.assertRaisesMessage(outreach.OutreachError, "one email address gets one sequence"):
+            outreach.link_contact(shared, self.contact_id(first))
+
+    def test_ghl_sync_command_hands_over_and_creates_contacts(self):
         from tests.support import run_command
 
-        self.email().delete()
+        self.ghl.fail_with = 500
+        email = self.email()
+        review.approve(email)
+        self.ghl.fail_with = None
         result = run_command("ghl_sync")
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("Contacts: 1 created", result.stdout)
+        self.assertIn("Approved emails handed to GoHighLevel: 1", result.stdout)
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "scheduled")
         with mock.patch.dict(os.environ, {"GHL_API_KEY": ""}):
             self.assertIn("GoHighLevel is not set up", run_command("ghl_sync").stdout)
+
+    def test_writes_are_never_retried_but_rate_limits_are(self):
+        client = ghl.Client()
+        self.ghl.fail_with = 500
+        with mock.patch("pipeline.services.ghl.time.sleep"), self.assertRaises(ghl.GhlError):
+            client.request("PUT", "/contacts/x", {})
+        self.assertEqual(len(self.puts()), 1)
+        self.ghl.fail_with = 429
+        with mock.patch("pipeline.services.ghl.time.sleep"), self.assertRaises(ghl.GhlError):
+            client.request("PUT", "/contacts/x", {})
+        self.assertEqual(len(self.puts()), 1 + ghl.RETRIES)  # a 429 applied nothing: retried
 
     def test_missing_custom_fields_are_named(self):
         client = ghl.Client()
@@ -412,9 +483,15 @@ class ReviewQueueTests(OutreachCase):
     def test_dashboard_warnings(self):
         email = self.email()
         review.approve(email)
-        Email.objects.filter(pk=email.pk).update(status="sending", released_at=outreach.now() - timedelta(hours=1))
+        Email.objects.filter(pk=email.pk).update(scheduled_at=outreach.now() - timedelta(days=2))
         page = self.client.get(reverse("admin:index")).content.decode()
         self.assertIn("never reported sent", page)
+        failed = self.email()
+        self.ghl.fail_with = 500
+        review.approve(failed)
+        self.ghl.fail_with = None
+        page = self.client.get(reverse("admin:index")).content.decode()
+        self.assertIn("1 approved email(s) are not in GoHighLevel yet", page)
         with mock.patch.dict(os.environ, {"GHL_API_KEY": "", "GHL_WEBHOOK_SECRET": ""}):
             page = self.client.get(reverse("admin:index")).content.decode()
         self.assertIn("GoHighLevel is not set up", page)

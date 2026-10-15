@@ -40,7 +40,7 @@ COMMANDS = {
     "verify_emails": "Module 4 - verify emails with Reacher (creates prospects)",
     "generate_emails": "Module 5 - generate outreach emails for review",
     "generate_followups": "Follow-ups - write the next follow-ups for review",
-    "ghl_sync": "GoHighLevel - create contacts and hand due emails to GoHighLevel",
+    "ghl_sync": "GoHighLevel - create contacts and hand approved emails to GoHighLevel",
 }
 # Options every Django command has; they are not pipeline options.
 DJANGO_OPTIONS = {"help", "version", "verbosity", "settings", "pythonpath", "traceback", "no_color", "force_color",

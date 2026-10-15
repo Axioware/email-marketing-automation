@@ -15,7 +15,9 @@ BASE_URL = "https://services.leadconnectorhq.com"
 API_VERSION = "2021-07-28"
 USER_AGENT = "email-marketing-automation/1.0"
 TIMEOUT = 30
-RETRIES = 3  # on 429 (rate limit: 100 requests per 10 s) and 5xx answers
+RETRIES = 3  # a 429 (rate limit: 100 requests per 10 s) is always retried: GHL applied nothing. A timeout or 5xx is
+# retried only for reads: a write may have been applied, and writing the email fields again would make the sending
+# workflow run (and send) twice.
 
 # The contact custom fields the GHL workflows use, by their GHL keys.
 FIELD_KEYS = {
@@ -66,13 +68,13 @@ class Client:
                     return json.loads(response.read() or b"{}")
             except HTTPError as error:
                 detail = _error_detail(error)
-                if (error.code == 429 or error.code >= 500) and attempt < RETRIES:
+                if (error.code == 429 or (error.code >= 500 and method == "GET")) and attempt < RETRIES:
                     time.sleep(2 * attempt)
                     continue
                 raise GhlError(f"GoHighLevel answered HTTP {error.code} to {method} {path.split('?')[0]}: {detail}") \
                     from error
             except (URLError, OSError, ValueError) as error:
-                if attempt < RETRIES:
+                if method == "GET" and attempt < RETRIES:
                     time.sleep(2 * attempt)
                     continue
                 raise GhlError(f"GoHighLevel could not be reached ({getattr(error, 'reason', error)})") from error

@@ -11,6 +11,7 @@
 {% url 'admin:pipeline_email_reopen' email.pk as reopen_url %}
 {% url 'admin:pipeline_email_regenerate' email.pk as regenerate_url %}
 {% url 'admin:pipeline_email_replied' email.pk as replied_url %}
+{% url 'admin:pipeline_email_handover' email.pk as handover_url %}
 <div class="pipeline-review">
   <div class="pipeline-card">
     <h2>{% if email.sequence_step > 1 %}Follow-up {{ email.sequence_step|add:"-1" }}{% else %}First email{% endif %}
@@ -37,6 +38,9 @@
       {% if email.status == "rejected" or email.status == "approved" or email.status == "scheduled" %}
         <form method="post" action="{{ reopen_url }}">{% csrf_token %}<input type="submit" value="Back to review"></form>
       {% endif %}
+      {% if email.status == "approved" %}
+        <form method="post" action="{{ handover_url }}">{% csrf_token %}<input type="submit" class="default" value="Hand to GoHighLevel"></form>
+      {% endif %}
       {% if email.status == "sent" or email.status == "opened" %}
         <form method="post" action="{{ replied_url }}">{% csrf_token %}<input type="submit" value="Mark replied"></form>
       {% endif %}
@@ -50,10 +54,10 @@
       {% endif %}
     </div>
 
-    {% if email.status == "scheduled" %}
-      <p class="pipeline-note">Scheduled for {{ email.scheduled_at|date:"Y-m-d H:i T" }}. At that time it is written into the GoHighLevel contact and GoHighLevel sends it. Editing, rejecting or sending it back to review cancels the slot.</p>
-    {% elif email.status == "sending" %}
-      <p class="pipeline-note">Handed to GoHighLevel on {{ email.released_at|date:"Y-m-d H:i T" }}; waiting for GoHighLevel to report it sent.</p>
+    {% if email.status == "scheduled" or email.status == "sending" %}
+      <p class="pipeline-note">In GoHighLevel since {{ email.released_at|date:"Y-m-d H:i T" }}, due {{ email.scheduled_at|date:"Y-m-d H:i T" }}; GoHighLevel sends it then. Editing, rejecting or sending it back to review takes it back out of GoHighLevel first.</p>
+    {% elif email.status == "approved" %}
+      <p class="pipeline-note">Approved{% if email.scheduled_at %} for {{ email.scheduled_at|date:"Y-m-d H:i T" }}{% endif %} but not in GoHighLevel yet. Hand it over when GoHighLevel can take it.</p>
     {% endif %}
 
     <h3>What we know about them</h3>

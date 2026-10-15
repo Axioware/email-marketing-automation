@@ -21,6 +21,7 @@ from urllib.parse import quote, urlsplit
 from django.core.management.base import CommandError
 from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
+from django.db.models.functions import Lower
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -349,15 +350,24 @@ PROSPECT_FIELDS = {
 
 
 def ready_prospects():
-    """Prospects that may get emails, one address per person: several addresses of a contact can be deliverable
-    (each checked guess is stored), so only the contact's first ready address (candidate order: its own email, then
-    the likeliest guesses) counts, and none once another address of the contact has an email or is do-not-contact."""
+    """Prospects that may get emails: one address per person and one sequence per address.
+
+    Several addresses of a contact can be deliverable (each checked guess is stored), so only the contact's first
+    ready address (candidate order: its own email, then the likeliest guesses) counts, and none once another address
+    of the contact has an email or is do-not-contact. And one address can belong to several prospects (an info@ of
+    two branches, a person found at two businesses): it gets one sequence, from the prospect that has emails or a
+    GoHighLevel contact, else the oldest; none if any of them is do-not-contact."""
     same_contact = Prospect.objects.filter(contact_id=OuterRef("contact_id")).exclude(pk=OuterRef("pk"))
+    same_address = (Prospect.objects.annotate(address=Lower("email")).filter(address=OuterRef("address"))
+                    .exclude(pk=OuterRef("pk")))
     return (
-        Prospect.objects.filter(READY_PROSPECT)
+        Prospect.objects.filter(READY_PROSPECT).annotate(address=Lower("email"))
         .exclude(Exists(Email.objects.filter(contact_id=OuterRef("contact_id")).exclude(prospect_id=OuterRef("pk"))))
         .exclude(Exists(same_contact.filter(do_not_contact=True)))
         .exclude(Exists(same_contact.filter(READY_PROSPECT, id__lt=OuterRef("pk"))))
+        .exclude(Exists(same_address.filter(do_not_contact=True)))
+        .exclude(Exists(same_address.filter(Q(ghl_contact_id__isnull=False) | Q(emails__isnull=False))))
+        .exclude(Exists(same_address.filter(READY_PROSPECT, id__lt=OuterRef("pk"))))
     )
 
 

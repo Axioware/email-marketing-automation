@@ -25,7 +25,7 @@ def free_port() -> int:
 
 # Real external services must never be reached from a test: .env is loaded by the settings, so these are removed
 # before any test runs (tests that need one set a fake value themselves).
-EXTERNAL_SERVICE_ENV = ("GHL_API_KEY", "GHL_LOCATION_ID", "GHL_WEBHOOK_SECRET", "GHL_BASE_URL", "CRON_SECRET",
+EXTERNAL_SERVICE_ENV = ("GHL_API_KEY", "GHL_LOCATION_ID", "GHL_WEBHOOK_SECRET", "GHL_BASE_URL",
                         "GROQ_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "RUN_MODE", "VERCEL")
 
 
