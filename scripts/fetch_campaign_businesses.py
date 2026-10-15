@@ -331,6 +331,19 @@ def extract_business_details(
 
     place_id_match = re.search(r"\bChIJ[A-Za-z0-9_-]+", page.url)
     coordinates_match = re.search(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)", page.url)
+    raw_data = {
+        "search_result": card,
+        "name": name,
+        "category": category,
+        "website_url": website_url,
+        "phone": phone,
+        "address": address,
+        "rating": rating_text,
+        "opening_hours": opening_hours,
+        "google_maps_url": page.url,
+        "google_place_id": place_id_match.group(0) if place_id_match else None,
+        "coordinates": coordinates_match.groups() if coordinates_match else None,
+    }
     name = normalize_text(name)
     category = normalize_text(category)
     website_url = normalize_website(website_url)
@@ -345,22 +358,25 @@ def extract_business_details(
             opening_hours = None
 
     return {
-        "name": name[:255] if name else None,
-        "category": category,
-        "website_url": website_url,
-        "domain": domain.removeprefix("www.") if domain else None,
-        "phone": phone,
-        "address": address,
-        "country": target_country,
-        "latitude": float(coordinates_match.group(1)) if coordinates_match else None,
-        "longitude": float(coordinates_match.group(2)) if coordinates_match else None,
-        "google_place_id": place_id_match.group(0) if place_id_match else None,
-        "google_maps_url": page.url,
-        "google_rating": google_rating,
-        "google_review_count": google_review_count,
-        "opening_hours": opening_hours,
-        "source": "google_maps",
-        "source_url": page.url,
+        "business": {
+            "name": name[:255] if name else None,
+            "category": category,
+            "website_url": website_url,
+            "domain": domain.removeprefix("www.") if domain else None,
+            "phone": phone,
+            "address": address,
+            "country": target_country,
+            "latitude": float(coordinates_match.group(1)) if coordinates_match else None,
+            "longitude": float(coordinates_match.group(2)) if coordinates_match else None,
+            "google_place_id": place_id_match.group(0) if place_id_match else None,
+            "google_maps_url": page.url,
+            "google_rating": google_rating,
+            "google_review_count": google_review_count,
+            "opening_hours": opening_hours,
+            "source": "google_maps",
+            "source_url": page.url,
+        },
+        "raw_data": raw_data,
     }
 
 
@@ -441,7 +457,7 @@ def scrape_campaign(
                 break
             time.sleep(delay)
             try:
-                details = extract_business_details(
+                extracted = extract_business_details(
                     page, card, campaign["target_country"], headed
                 )
             except RuntimeError:
@@ -450,6 +466,7 @@ def scrape_campaign(
                 print(f"Skipping a Maps result ({type(error).__name__}).")
                 continue
 
+            details = extracted["business"]
             if any(same_business(details, seen) for seen in seen_businesses):
                 continue
 
@@ -459,7 +476,7 @@ def scrape_campaign(
                 first_discovered_at=discovered_at,
                 last_discovered_at=discovered_at,
             )
-            records.append(details)
+            records.append(extracted)
             seen_businesses.append(details)
 
     return records
@@ -493,6 +510,7 @@ def main() -> int:
     try:
         campaigns = Table("discovery_campaigns", metadata, autoload_with=engine)
         businesses = Table("businesses", metadata, autoload_with=engine)
+        business_sources = Table("business_sources", metadata, autoload_with=engine)
         with engine.connect() as connection:
             campaign = choose_campaign(connection, campaigns)
         if campaign is None:
@@ -530,7 +548,23 @@ def main() -> int:
                     browser.close()
             if records:
                 with engine.begin() as connection:
-                    connection.execute(insert(businesses), records)
+                    for record in records:
+                        business = record["business"]
+                        business_id = connection.execute(
+                            insert(businesses)
+                            .values(**business)
+                            .returning(businesses.c.id)
+                        ).scalar_one()
+                        connection.execute(
+                            insert(business_sources).values(
+                                business_id=business_id,
+                                source="google_maps",
+                                source_business_id=business["google_place_id"],
+                                source_url=business["google_maps_url"],
+                                raw_data=record["raw_data"],
+                                discovered_at=business["first_discovered_at"],
+                            )
+                        )
             update_campaign_status(engine, campaigns, campaign["id"], "completed")
         except Exception as error:
             try:
