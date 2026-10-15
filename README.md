@@ -382,7 +382,7 @@ The dashboard warns when GHL is not set up, when approved emails are not in GHL 
 
 Vercel runs short web requests only: no background processes, browsers or Docker. So the **web app** (admin, API, webhooks) runs on Vercel, and the **pipeline steps** (fetching, research, decision makers, verification, writing emails) run on a **worker**: a machine with Chromium, Firefox, Docker (Reacher, the scraper container) and the same `DATABASE_URL`.
 
-- `vercel.json` routes every request to `api/index.py` (the Django WSGI app) and allows 60 s per request (the email-sent webhook writes the next follow-up with the AI inside that time; bulk-approve around 30-40 emails at a time, since each approval writes to GHL). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
+- Vercel finds Django through `manage.py` and serves `WSGI_APPLICATION` (`emailautomation/wsgi.py`) as one function; static files go to its CDN. `vercel.json` only allows that function 60 s per request (the email-sent webhook writes the next follow-up with the AI inside that time; bulk-approve around 30-40 emails at a time, since each approval writes to GHL). `requirements.txt` holds only the web app's packages; the worker installs `requirements-worker.txt`.
 - Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `SENDER_NAME`. On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies and `RUN_MODE=queue`, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
 - Run `python manage.py migrate` from your machine (not on deploy).
 - On the worker: `python manage.py run_worker`. Runs started in the admin or the API wait in the queue until the worker picks them up; **Stop** reaches the worker through the database. The dashboard shows when the worker was last seen. Run one worker.
@@ -409,7 +409,7 @@ Tests never use the `.env` database or real services: they run against a throwaw
 | `emailautomation/` | Django settings and URLs |
 | `pipeline/models.py` | one model per table |
 | `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` + `ghl.py` (scheduling and GoHighLevel) |
-| `api/index.py`, `vercel.json` | the Vercel entry point and configuration |
+| `vercel.json` | the Vercel function settings (time limit, files left out) |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |
 | `pipeline/api/` | the REST API |
