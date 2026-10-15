@@ -1,0 +1,13 @@
+{
+  "target_roles": [
+    {"name": "Practice Owner", "role_type": "owner", "keywords": ["practice owner", "owner", "proprietor", "founder", "co-founder", "principal dentist", "managing partner", "managing director", "ceo", "chief executive"]},
+    {"name": "Dentist Owner", "role_type": "owner", "keywords": ["dentist owner", "owner dentist", "doctor owner", "owner and dentist", "dentist and owner"]},
+    {"name": "Practice Manager", "role_type": "manager", "keywords": ["practice manager", "clinic manager", "general manager", "centre manager", "center manager"]},
+    {"name": "Office Manager", "role_type": "manager", "keywords": ["office manager", "front office manager", "business manager", "administrator"]},
+    {"name": "Operations Manager", "role_type": "operations", "keywords": ["operations manager", "director of operations", "operations director", "coo"]}
+  ],
+  "fallback_roles": [
+    {"name": "Dentist", "role_type": "dentist", "keywords": ["dentist", "doctor", "dds", "dmd", "bds", "orthodontist", "prosthodontist", "periodontist", "endodontist", "oral surgeon", "implantologist"]}
+  ],
+  "exclude_keywords": ["associate", "hygienist", "receptionist", "assistant", "front desk", "coordinator", "technician", "nurse", "intern", "student", "trainee", "patient", "testimonial", "locum", "visiting", "consultant"]
+}
