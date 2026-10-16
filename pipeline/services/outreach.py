@@ -340,7 +340,7 @@ def stop_prospect(prospect: Prospect, reason: str = "stopped", client: ghl.Clien
     Prospect.objects.filter(pk=prospect.pk, sequence_stopped_at__isnull=True).update(
         sequence_stopped_at=now(), sequence_stop_reason=reason)
     cancelled = Email.objects.filter(prospect=prospect, status__in=("in_review", "approved", *HANDED)).update(
-        status="rejected", review_note=f"Sequence stopped ({reason}).", scheduled_at=None)
+        status="rejected", review_note=f"{STOP_NOTE}{reason}).", scheduled_at=None)
     if prospect.ghl_contact_id and ghl.configured():
         try:
             (client or ghl.Client()).set_fields(prospect.ghl_contact_id,
@@ -362,6 +362,40 @@ def stop_sequence(contact_id: str, reason: str = "stopped", client: ghl.Client |
             Email.objects.filter(pk=latest.pk, status__in=SENT_STATUSES).update(status="replied")
     cancelled = stop_prospect(prospect, reason, client or ghl.Client(), raise_errors=True)
     return {"prospect": prospect.pk, "reason": reason, "cancelled": cancelled}
+
+
+STOP_NOTE = "Sequence stopped ("  # the review note stop_prospect leaves on the emails it cancels
+
+
+def resume_sequence(contact_id: str, client: ghl.Client | None = None) -> dict:
+    """The resume webhook: the stop was a mistake (e.g. an automatic reply was taken for a reply). Undoes
+    stop_sequence: the email marked replied is sent again, the emails the stop cancelled go back to review (approve
+    them again to hand them over), the contact's Follow-up Count is set for the next follow-up, and that follow-up is
+    written for review if it does not exist yet. Does nothing for a prospect whose sequence is not stopped, so a
+    workflow may call it on every move to the Follow-up stage."""
+    prospect = prospect_for_contact(contact_id)
+    if prospect.sequence_stopped_at is None:
+        return {"prospect": prospect.pk, "outcome": "not stopped; nothing to resume"}
+    if prospect.do_not_contact:
+        raise OutreachError("This prospect is marked do-not-contact; clear that in the admin before resuming.")
+    previous_reason = prospect.sequence_stop_reason
+    with transaction.atomic():
+        unreplied = Email.objects.filter(prospect=prospect, status="replied").update(status="sent")
+        restored = Email.objects.filter(prospect=prospect, status="rejected", review_note__startswith=STOP_NOTE).update(
+            status="in_review", review_note=None, reviewed_at=None, scheduled_at=None)
+        Prospect.objects.filter(pk=prospect.pk).update(sequence_stopped_at=None, sequence_stop_reason=None)
+    prospect.refresh_from_db()
+    latest_sent = prospect.emails.filter(status__in=SENT_STATUSES).order_by("-sequence_step").first()
+    state = (sequence_state(prospect, latest_sent.sequence_step) if latest_sent
+             else {"subject": None, "body": None, "due": None, "count": None})
+    (client or ghl.Client()).set_fields(contact_id, state)
+    result = {"prospect": prospect.pk, "outcome": "resumed", "previous_stop_reason": previous_reason,
+              "unmarked_replied": unreplied, "back_in_review": restored,
+              "next": f"follow-up {state['count']}" if state["count"] is not None else "sequence finished"}
+    if state["count"] is not None and not prospect.emails.filter(
+            sequence_step=latest_sent.sequence_step + 1).exists():
+        result["follow_up"] = write_next_followup(prospect)
+    return result
 
 
 # ---------------------------------------------------------------- health

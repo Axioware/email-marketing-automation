@@ -155,7 +155,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | `/api/settings/` | the global sending settings: `daily_cap`, `gap_fixed_seconds`, `gap_random_min_seconds`, `gap_random_max_seconds` (`GET`, `PATCH`, `PUT`) |
 | `/api/follow-ups/` | a campaign's follow-up steps (sequence, days after previous, `email_prompt`); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops that prospect's sequence |
 | `/api/campaign-prompts/`, `/api/email-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored; shared by campaigns); email prompts write emails (`kind`: `initial` or `follow_up`) |
-| `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/` | GoHighLevel webhooks (Custom Data `secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
+| `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/`, `/api/ghl/resume-sequence/` | GoHighLevel webhooks (Custom Data `secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
 | `POST /api/emails/{id}/hand-over/` | hand an approved email whose hand-over failed to GoHighLevel again |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
 | `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |
@@ -376,6 +376,7 @@ Webhooks: in the workflow's **Webhook** action, Method POST, and these **Custom 
 |---|---|---|
 | `POST /api/ghl/email-sent/` | `secret`, `followup_count` = `{{contact.followup_count}}` | `200` `{"email", "outcome", "next", "follow_up"}`; `401` wrong secret, `404` unknown contact, `409` nothing was handed to GHL, `502` GHL error (safe to retry) |
 | `POST /api/ghl/stop-sequence/` | `secret`, `reason` = `replied` (any reason; `replied...` also marks the last email replied) | `200` `{"prospect", "reason", "cancelled"}` |
+| `POST /api/ghl/resume-sequence/` | `secret` | `200` `{"outcome": "resumed", "previous_stop_reason", "unmarked_replied", "back_in_review", "next", "follow_up"}`, or `"not stopped; nothing to resume"` (safe to call on every move to Follow-up); `409` for a do-not-contact prospect. Undoes a stop made by mistake (an automatic reply): the email marked replied is sent again, the emails the stop cancelled go back to review (approve them again), Follow-up Count is set for the next follow-up, which is written if it does not exist yet |
 
 The dashboard warns when GHL is not set up, when approved emails are not in GHL yet, when ready prospects are not GHL contacts yet, and when an email is over a day past its send time without the email-sent webhook.
 

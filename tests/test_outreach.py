@@ -362,6 +362,52 @@ class WebhookTests(OutreachCase):
         self.assertEqual(Prospect.objects.get(pk=first.prospect_id).sequence_stop_reason, "replied")
         self.assertEqual(self.ghl.fields(contact), {"type": "Initial A"})  # nothing left to send
 
+    def test_resume_after_an_automatic_reply(self):
+        first = self.handed_over()
+        contact = self.contact_id(first)
+        self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
+        pending = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)
+        self.hook("stop-sequence", {"contact_id": contact, "reason": "replied"})
+        self.assertEqual(self.hook("resume-sequence", {"contact_id": contact}, secret="wrong").status_code, 401)
+        response = self.hook("resume-sequence", {"contact_id": contact})
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        self.assertEqual((body["outcome"], body["previous_stop_reason"], body["unmarked_replied"],
+                          body["back_in_review"], body["next"]), ("resumed", "replied", 1, 1, "follow-up 1"))
+        self.assertNotIn("follow_up", body)  # the follow-up written before the stop is reused, not written again
+        self.assertEqual((Email.objects.get(pk=first.pk).status, Email.objects.get(pk=pending.pk).status),
+                         ("sent", "in_review"))
+        self.assertIsNone(Email.objects.get(pk=pending.pk).review_note)
+        prospect = Prospect.objects.get(pk=first.prospect_id)
+        self.assertEqual((prospect.sequence_stopped_at, prospect.sequence_stop_reason), (None, None))
+        self.assertEqual(self.ghl.fields(contact), {"count": 1, "type": "Initial A"})  # waiting for follow-up 1
+        review.approve(Email.objects.get(pk=pending.pk))  # and the sequence carries on as before
+        self.assertEqual(Email.objects.get(pk=pending.pk).status, "scheduled")
+        again = self.hook("resume-sequence", {"contact_id": contact})  # e.g. a later move to Follow-up
+        self.assertEqual(again.json()["outcome"], "not stopped; nothing to resume")
+        self.assertEqual(Email.objects.get(pk=pending.pk).status, "scheduled")  # untouched
+
+    def test_resume_writes_the_follow_up_when_there_was_none(self):
+        first = self.handed_over()
+        contact = self.contact_id(first)
+        with mock.patch.object(outreach, "write_next_followup", return_value="later"):
+            self.hook("email-sent", {"contact_id": contact, "followup_count": 0})  # no follow-up written yet
+        self.hook("stop-sequence", {"contact_id": contact, "reason": "replied"})
+        response = self.hook("resume-sequence", {"contact_id": contact})
+        self.assertEqual(response.json()["follow_up"], "follow-up 1 written for review")
+        self.assertEqual(Email.objects.get(prospect_id=first.prospect_id, sequence_step=2).status, "in_review")
+
+    def test_do_not_contact_is_never_resumed(self):
+        first = self.handed_over()
+        contact = self.contact_id(first)
+        self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
+        self.hook("stop-sequence", {"contact_id": contact, "reason": "unsubscribed"})
+        Prospect.objects.filter(pk=first.prospect_id).update(do_not_contact=True)
+        response = self.hook("resume-sequence", {"contact_id": contact})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("do-not-contact", response.json()["detail"])
+        self.assertIsNotNone(Prospect.objects.get(pk=first.prospect_id).sequence_stopped_at)
+
     def test_full_sequence_until_exhausted(self):
         email = self.handed_over()
         contact = self.contact_id(email)

@@ -7,6 +7,8 @@
   for what comes next and writes the next follow-up for review.
 - POST /api/ghl/stop-sequence/   customData {"secret": ..., "reason": "replied"}
   when the contact replied, bounced, unsubscribed, or a person moved the opportunity: no more emails to them.
+- POST /api/ghl/resume-sequence/ customData {"secret": ...}
+  when a stop was a mistake (an automatic reply taken for a reply): the sequence continues where it stopped.
 """
 import hmac
 import os
@@ -77,6 +79,12 @@ class EmailSentView(GhlWebhookView):
     def post(self, request):
         return self.handle(request, lambda contact_id, data: outreach.record_sent(
             contact_id, _first(data, "followup_count", "follow_up_count", "Follow-up Count")))
+
+
+class ResumeSequenceView(GhlWebhookView):
+    @extend_schema(exclude=True)
+    def post(self, request):
+        return self.handle(request, lambda contact_id, data: outreach.resume_sequence(contact_id))
 
 
 class StopSequenceView(GhlWebhookView):

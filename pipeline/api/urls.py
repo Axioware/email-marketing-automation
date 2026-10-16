@@ -23,4 +23,5 @@ urlpatterns = [
     path("settings/", views.SendingSettingsView.as_view(), name="api-settings"),
     path("ghl/email-sent/", hooks.EmailSentView.as_view(), name="ghl-email-sent"),
     path("ghl/stop-sequence/", hooks.StopSequenceView.as_view(), name="ghl-stop-sequence"),
+    path("ghl/resume-sequence/", hooks.ResumeSequenceView.as_view(), name="ghl-resume-sequence"),
 ]
