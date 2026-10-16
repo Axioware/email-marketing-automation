@@ -17,7 +17,6 @@ from django.http import HttpResponseNotAllowed, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
-from django.core.exceptions import ValidationError
 from django.utils.html import format_html, format_html_join
 from django.utils.text import Truncator
 
@@ -35,7 +34,6 @@ from pipeline.models import (
     PipelineRun,
     Prospect,
     SendingSettings,
-    check_output_fields,
     default_output_fields,
 )
 from pipeline.services import generation, qualify
@@ -320,13 +318,16 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
 
 
 class CampaignPromptForm(forms.ModelForm):
-    output_fields_text = forms.CharField(
-        label="Output fields", required=False,
-        widget=forms.Textarea(attrs={"rows": 6, "class": "vLargeTextField"}),
-        help_text="Extra facts the agent returns when it scores a business, one per line: name | type | description. "
-                  "Types: text, integer, number, yes/no, text list, integer list. Each is null when the website does "
-                  "not state it. E.g. <code>existing_call_tool | text | The AI receptionist, call-answering service or "
-                  "chat widget the site shows.</code> Saved on the business's website research.")
+    answer_schema_text = forms.CharField(
+        label="Answer format (JSON schema)", required=False,
+        widget=forms.Textarea(attrs={"rows": 30, "class": "vLargeTextField pipeline-code", "spellcheck": "false"}),
+        help_text="The JSON schema the AI answers in, sent with every research request. Change any description to "
+                  "tell the AI how to fill a field. Add your own fields as properties, each "
+                  '{"type": "string" | "integer" | "number" | "boolean", or {"type": "array", "items": {"type": '
+                  '"string"}}, "description": "..."}; they may be null and are saved on the business\'s website '
+                  "research. The app's own fields (action, url, score, reasons, reasoning, reason, summary, "
+                  "relevant_findings) must stay, with only their descriptions changed. Empty it to go back to the "
+                  "app's default.")
 
     class Meta:
         model = CampaignPrompt
@@ -334,27 +335,31 @@ class CampaignPromptForm(forms.ModelForm):
         widgets = {"prompt": forms.Textarea(attrs={"rows": 24, "class": "vLargeTextField"})}
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        fields = self.instance.output_fields if self.instance.pk else default_output_fields()
-        self.initial.setdefault("output_fields_text", "\n".join(
-            f"{field['name']} | {field['type']} | {field['description']}" for field in fields or []))
+        from pipeline.services.research import answer_format
 
-    def clean_output_fields_text(self):
-        fields = []
-        for number, line in enumerate((self.cleaned_data.get("output_fields_text") or "").splitlines(), start=1):
-            if not line.strip():
-                continue
-            parts = [part.strip() for part in line.split("|", 2)]
-            if len(parts) != 3:
-                raise forms.ValidationError(f"Line {number}: write it as name | type | description.")
-            fields.append({"name": parts[0], "type": parts[1], "description": parts[2]})
+        super().__init__(*args, **kwargs)
+        instance = self.instance
+        self.initial.setdefault("answer_schema_text", answer_format(
+            instance.output_fields if instance.pk else default_output_fields(),
+            instance.answer_schema if instance.pk else None))
+
+    def clean_answer_schema_text(self):
+        from pipeline.services.research import SchemaError, check_answer_schema
+
+        text = (self.cleaned_data.get("answer_schema_text") or "").strip()
+        if not text:
+            return None  # back to the default: the app's fields plus team_size and languages
         try:
-            return check_output_fields(fields)
-        except ValidationError as error:
-            raise forms.ValidationError(error.messages) from error
+            return check_answer_schema(text)
+        except SchemaError as error:
+            raise forms.ValidationError(str(error)) from error
 
     def save(self, commit=True):
-        self.instance.output_fields = self.cleaned_data.get("output_fields_text") or []
+        checked = self.cleaned_data.get("answer_schema_text")
+        if checked is None:
+            self.instance.answer_schema, self.instance.output_fields = None, default_output_fields()
+        else:
+            self.instance.answer_schema, self.instance.output_fields = checked
         return super().save(commit)
 
 
@@ -363,20 +368,18 @@ class CampaignPromptAdmin(PipelineAdmin):
     form = CampaignPromptForm
     list_display = ["name", "campaigns_list", "updated_at"]
     search_fields = ["name", "prompt"]
-    readonly_fields = ["campaigns_list", "created_at", "updated_at", "answer_format_display"]
+    readonly_fields = ["campaigns_list", "created_at", "updated_at"]
     fieldsets = [
         (None, {"fields": ["name", "campaigns_list", "prompt"],
                 "description": "The research agent's instructions, used exactly as written (nothing is added): it "
                                "reads each business's website and scores it 0-100 by this text; businesses scoring at "
                                "least their campaign's minimum score go on to finding decision makers. Do not describe "
-                               "an answer format here: the app sets it (below), and a second format makes the AI's "
-                               "answers get refused and retried."}),
-        ("Output fields", {"fields": ["output_fields_text"],
-                           "description": "Your own facts to extract, on top of the app's fields (action, url, score, "
-                                          "reasons, reasoning, reason, summary, relevant_findings), which drive the "
-                                          "research and cannot be changed."}),
-        ("Answer format (the app's fields plus your output fields)", {"fields": ["answer_format_display"],
-                                                                      "classes": ["collapse"]}),
+                               "an answer format here: edit the Answer format below instead; a second format in the "
+                               "text makes the AI's answers get refused and retried."}),
+        ("Answer format", {"fields": ["answer_schema_text"],
+                           "description": "What the AI's answer contains. Your own fields (e.g. team_size, "
+                                          "languages) are filled when it scores a business and shown on the "
+                                          "business."}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
@@ -386,12 +389,6 @@ class CampaignPromptAdmin(PipelineAdmin):
             return "-"
         campaigns = list(obj.campaigns.all())
         return format_html_join(", ", "{}", ((admin_link(c),) for c in campaigns)) if campaigns else "Not used yet"
-
-    @admin.display(description="JSON schema")
-    def answer_format_display(self, obj):
-        from pipeline.services.research import answer_format
-
-        return format_html('<pre class="pipeline-pre">{}</pre>', answer_format(obj.output_fields if obj.pk else None))
 
 
 class EmailPromptForm(forms.ModelForm):

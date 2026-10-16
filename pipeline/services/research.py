@@ -24,6 +24,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.management.base import CommandError
 from django.db.models import F, Q
 from django.utils import timezone
@@ -119,9 +120,94 @@ def response_model(output_fields: list[dict] | None = None) -> type[BaseModel]:
     return _response_models[key]
 
 
-def answer_format(output_fields: list[dict] | None = None) -> str:
-    """The answer schema as the model receives it, for showing next to a campaign prompt."""
-    return json.dumps(response_model(output_fields).model_json_schema(), indent=2)
+SCHEMA_TYPES = {  # an output field's JSON schema (without null) -> its type name
+    json.dumps({"type": "string"}): "text",
+    json.dumps({"type": "integer"}): "integer",
+    json.dumps({"type": "number"}): "number",
+    json.dumps({"type": "boolean"}): "yes/no",
+    json.dumps({"items": {"type": "string"}, "type": "array"}): "text list",
+    json.dumps({"items": {"type": "integer"}, "type": "array"}): "integer list",
+}
+LABELS = ("title", "description")
+
+
+class SchemaError(ValueError):
+    """The edited answer schema cannot be used; the message says what to fix."""
+
+
+def _without_labels(definition: dict) -> dict:
+    return {key: value for key, value in definition.items() if key not in LABELS}
+
+
+def _field_type(name: str, definition) -> str:
+    """The type name of an output field's schema: plain, nullable through anyOf, or "type": [x, "null"]."""
+    if not isinstance(definition, dict):
+        raise SchemaError(f'"{name}" must be an object such as {{"type": "string", "description": "..."}}.')
+    core = _without_labels(definition)
+    if "anyOf" in core and len(core) == 1 and isinstance(core["anyOf"], list):
+        options = [option for option in core["anyOf"] if option != {"type": "null"}]
+        core = options[0] if len(options) == 1 and isinstance(options[0], dict) else None
+    elif isinstance(core.get("type"), list):
+        kinds = [kind for kind in core["type"] if kind != "null"]
+        core = {**core, "type": kinds[0]} if len(kinds) == 1 else None
+    kind = SCHEMA_TYPES.get(json.dumps(_without_labels(core), sort_keys=True)) if isinstance(core, dict) else None
+    if kind is None:
+        raise SchemaError(f'"{name}" has a type the app cannot store; use string, integer, number, boolean, or an '
+                          'array of strings or integers (e.g. {"type": "array", "items": {"type": "string"}}).')
+    return kind
+
+
+def check_answer_schema(value) -> tuple[dict, list[dict]]:
+    """(the schema as the AI receives it, the output fields in it) for an edited answer schema, a JSON text or object.
+    The app's own fields must keep their types (only their descriptions may change); any other property is an output
+    field: a text, integer, number, yes/no, text list or integer list that may be null."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as error:
+            raise SchemaError(f"This is not valid JSON: {error}.") from error
+    if not isinstance(value, dict) or not isinstance(value.get("properties"), dict):
+        raise SchemaError('The schema must be a JSON object with "properties".')
+    app = AgentResponse.model_json_schema()
+    properties = value["properties"]
+    missing = [name for name in app["properties"] if name not in properties]
+    if missing:
+        raise SchemaError(f"The app's own fields must stay: {', '.join(missing)} missing. Only their descriptions "
+                          "may change.")
+    schema_properties, output_fields = {}, []
+    for name, definition in properties.items():
+        if name in app["properties"]:
+            if not isinstance(definition, dict) or _without_labels(definition) != _without_labels(app["properties"][name]):
+                raise SchemaError(f'"{name}" is one of the app\'s own fields: only its "description" may change.')
+            description = str(definition.get("description") or app["properties"][name].get("description") or "")
+            schema_properties[name] = {**app["properties"][name], "description": description}
+            continue
+        kind = _field_type(name, definition)
+        description = " ".join(str(definition.get("description") or "").split())
+        output_fields.append({"name": name, "type": kind, "description": description})
+    try:
+        output_fields = check_output_fields(output_fields)
+    except DjangoValidationError as error:
+        raise SchemaError(" ".join(error.messages).replace("Field ", "Property ")) from error
+    for field in output_fields:
+        definition = properties[field["name"]]
+        plain = response_model([field]).model_json_schema()["properties"][field["name"]]
+        schema_properties[field["name"]] = {**plain, "title": definition.get("title") or plain["title"],
+                                            "description": field["description"]}
+    schema = {"additionalProperties": False, "description": str(value.get("description") or app.get("description")),
+              "properties": schema_properties, "required": list(schema_properties),
+              "title": str(value.get("title") or "AgentResponse"), "type": "object"}
+    return schema, output_fields
+
+
+def schema_for(answer_schema: dict | None, output_fields: list[dict] | None) -> dict:
+    """The JSON schema the AI answers in: the prompt's edited one, or the app's fields plus the output fields."""
+    return answer_schema or response_model(output_fields).model_json_schema()
+
+
+def answer_format(output_fields: list[dict] | None = None, answer_schema: dict | None = None) -> str:
+    """The answer schema as the model receives it, for showing (and editing) on a campaign prompt's page."""
+    return json.dumps(schema_for(answer_schema, output_fields), indent=2)
 
 
 def clean_value(value, kind: str):
@@ -411,7 +497,7 @@ def parse_decision(content: str, output_fields: list[dict] | None = None) -> Bas
 
 def validate_agent_response(client: OpenAI, model: str, context: dict, must_score: bool, system_prompt: str,
                             score_note: str = PAGE_LIMIT_NOTE, deadline: float | None = None,
-                            output_fields: list[dict] | None = None) -> dict:
+                            output_fields: list[dict] | None = None, answer_schema: dict | None = None) -> dict:
     """One agent decision. With must_score the agent has to SCORE now; score_note says why (shown to the agent and
     added to its reasoning)."""
     feedback = None
@@ -420,7 +506,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
         "json_schema": {
             "name": "business_research_action",
             "strict": True,
-            "schema": response_model(output_fields).model_json_schema(),
+            "schema": schema_for(answer_schema, output_fields),
         },
     }
     for _ in range(MAX_AGENT_RETRIES):
@@ -589,8 +675,9 @@ def research_business(
             decide_only = True
     system_prompt = business["qualification_prompt"].strip()  # the campaign prompt, exactly as stored
     output_fields = business.get("output_fields") or []
+    answer_schema = business.get("answer_schema")
     business = {key: value for key, value in business.items()
-                if key not in ("qualification_prompt", "output_fields")}  # already in the prompt and the format
+                if key not in ("qualification_prompt", "output_fields", "answer_schema")}  # in the prompt and format
 
     while len(pages) < MAX_PAGES_PER_BUSINESS or decide_only:
         if decide_only:  # an interrupted run read this page but the agent had not decided on it yet
@@ -660,14 +747,15 @@ def research_business(
         note = TIME_LIMIT_NOTE if out_of_time_now and len(pages) < MAX_PAGES_PER_BUSINESS else PAGE_LIMIT_NOTE
         try:
             decision = validate_agent_response(client, model, context, must_score, system_prompt, score_note=note,
-                                               deadline=deadline, output_fields=output_fields)
+                                               deadline=deadline, output_fields=output_fields,
+                                               answer_schema=answer_schema)
         except ResearchError:
             if must_score:
                 raise
             # The agent could not pick a readable page: score from the pages read so far instead of failing.
             decision = validate_agent_response(client, model, context, True, system_prompt,
                                                score_note="no further useful page could be chosen", deadline=deadline,
-                                               output_fields=output_fields)
+                                               output_fields=output_fields, answer_schema=answer_schema)
         page_record.update(
             summary=decision["summary"],
             relevant_findings=decision["relevant_findings"],
@@ -749,7 +837,8 @@ def load_businesses(limit: int | None, business_ids: list[int] | None, retry_fai
     if limit is not None:
         queryset = queryset[:limit]
     return list(queryset.values(*BUSINESS_FIELDS, qualification_prompt=F("discovery_campaign__campaign_prompt__prompt"),
-                                output_fields=F("discovery_campaign__campaign_prompt__output_fields")))
+                                output_fields=F("discovery_campaign__campaign_prompt__output_fields"),
+                                answer_schema=F("discovery_campaign__campaign_prompt__answer_schema")))
 
 
 @outside_event_loop

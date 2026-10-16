@@ -257,54 +257,110 @@ class CampaignAdminTests(PromptCase):
                     reverse("admin:pipeline_emailprompt_add")):
             self.assertEqual(self.client.get(url).status_code, 200, url)
         detail = self.client.get(reverse("admin:pipeline_campaignprompt_change", args=[campaign_prompt.pk])).content.decode()
-        self.assertIn("Answer format (the app&#x27;s fields plus your output fields)", detail)
+        self.assertIn("Answer format (JSON schema)", detail)  # editable on the page
         self.assertIn("SCRAPE: read one more page", detail)
-        self.assertIn("team_size | integer | How many staff", detail)  # the default output fields, editable
+        self.assertIn("&quot;team_size&quot;", detail)  # the default output fields are in it
         self.assertIn("Mine", detail)  # used by campaigns
         detail = self.client.get(reverse("admin:pipeline_emailprompt_change", args=[first.pk])).content.decode()
         self.assertNotIn("CAMPAIGN RULES Dental", detail)  # the email prompt is used on its own
         self.assertIn("initial email", detail)
 
 
-class OutputFieldTests(PromptCase):
-    def test_edit_output_fields_on_the_prompt_page(self):
-        campaign_prompt, _, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
+class AnswerSchemaTests(PromptCase):
+    def schema_text(self, campaign_prompt):
         url = reverse("admin:pipeline_campaignprompt_change", args=[campaign_prompt.pk])
-        text = ("team_size | integer | Staff the site states.\n"
-                "existing_call_tool | text | The AI receptionist or call service the site shows.\n"
-                "\n"
-                "offers_emergency_care | yes/no | Whether the clinic offers emergency appointments.")
-        response = self.client.post(url, {"name": campaign_prompt.name, "prompt": campaign_prompt.prompt,
-                                          "output_fields_text": text})
-        self.assertEqual(response.status_code, 302, response.content[:500])
+        return url, self.client.get(url).context["adminform"].form.initial["answer_schema_text"]
+
+    def post(self, campaign_prompt, url, text):
+        return self.client.post(url, {"name": campaign_prompt.name, "prompt": campaign_prompt.prompt,
+                                      "answer_schema_text": text})
+
+    def test_edit_the_json_schema_on_the_prompt_page(self):
+        import json
+
+        from pipeline.services import research
+
+        campaign_prompt, _, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
+        url, text = self.schema_text(campaign_prompt)
+        schema = json.loads(text)  # the editor starts with exactly what the AI receives
+        self.assertEqual(set(schema["properties"]), {*research.AgentResponse.model_fields, "team_size", "languages"})
+        schema["properties"]["score"]["description"] = "SCORE only: 0-100 by our bands."
+        schema["properties"]["existing_call_tool"] = {"type": "string", "description": "The call tool the site shows."}
+        schema["properties"]["offers_emergency_care"] = {"type": ["boolean", "null"], "description": "Emergency care?"}
+        del schema["properties"]["languages"]
+        response = self.post(campaign_prompt, url, json.dumps(schema))
+        self.assertEqual(response.status_code, 302, response.content[:600])
         campaign_prompt.refresh_from_db()
         self.assertEqual([(f["name"], f["type"]) for f in campaign_prompt.output_fields],
                          [("team_size", "integer"), ("existing_call_tool", "text"), ("offers_emergency_care", "yes/no")])
-        page = self.client.get(url).content.decode()
-        self.assertIn("existing_call_tool", page)  # in the editor and in the answer format the AI receives
-        self.assertIn("SCORE only: The AI receptionist or call service the site shows.", page)
-        for bad, message in (("score | integer | x", "one of the app&#x27;s own fields"),
-                             ("Team Size | integer | x", "must start with a lowercase letter"),
-                             ("a | date | x", "the type must be one of"),
-                             ("a | text", "name | type | description"),
-                             ("a | text | x\na | integer | y", "listed twice")):
-            response = self.client.post(url, {"name": campaign_prompt.name, "prompt": campaign_prompt.prompt,
-                                              "output_fields_text": bad})
-            self.assertContains(response, message, msg_prefix=bad)
+        sent = research.schema_for(campaign_prompt.answer_schema, campaign_prompt.output_fields)
+        self.assertEqual(sent["properties"]["score"]["description"], "SCORE only: 0-100 by our bands.")
+        self.assertEqual(sent["properties"]["existing_call_tool"]["anyOf"], [{"type": "string"}, {"type": "null"}])
+        self.assertEqual(set(sent["required"]), set(sent["properties"]))  # strict: every field, null allowed
+        self.assertFalse(sent["additionalProperties"])
+        self.assertIn("SCORE only: 0-100 by our bands.", self.schema_text(campaign_prompt)[1])  # shown as saved
+
+    def test_mistakes_are_explained_and_nothing_is_saved(self):
+        import json
+
+        campaign_prompt, _, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
+        url, text = self.schema_text(campaign_prompt)
+        good = json.loads(text)
+
+        def changed(edit):
+            schema = json.loads(text)
+            edit(schema["properties"])
+            return json.dumps(schema)
+
+        for bad, message in (
+                ("{not json", "not valid JSON"),
+                (changed(lambda p: p.pop("action")), "action missing"),
+                (changed(lambda p: p["score"].update(type="string")), "only its &quot;description&quot; may change"),
+                (changed(lambda p: p.update(when={"type": "string", "format": "date", "description": "x"})),
+                 "a type the app cannot store"),
+                (changed(lambda p: p.update(Bad_Name={"type": "string", "description": "x"})),
+                 "must start with a lowercase letter"),
+                (changed(lambda p: p.update(nothing={"type": "string"})), "describe what to put in it")):
+            self.assertContains(self.post(campaign_prompt, url, bad), message, msg_prefix=bad[:80])
+        campaign_prompt.refresh_from_db()
+        self.assertIsNone(campaign_prompt.answer_schema)  # still the default
+        self.assertEqual(json.loads(self.schema_text(campaign_prompt)[1]), good)
+
+    def test_empty_goes_back_to_the_default(self):
+        import json
+
+        campaign_prompt, _, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
+        url, text = self.schema_text(campaign_prompt)
+        schema = json.loads(text)
+        schema["properties"]["score"]["description"] = "Mine."
+        self.post(campaign_prompt, url, json.dumps(schema))
+        self.post(campaign_prompt, url, "")
+        campaign_prompt.refresh_from_db()
+        self.assertIsNone(campaign_prompt.answer_schema)
+        self.assertEqual([f["name"] for f in campaign_prompt.output_fields], ["team_size", "languages"])
 
     @override_settings(AUTH_TOKEN="t" * 20)
-    def test_output_fields_over_the_api(self):
+    def test_answer_schema_over_the_api(self):
         from rest_framework.test import APIClient
+
+        from pipeline.services import research
 
         api = APIClient()
         api.credentials(HTTP_AUTH="t" * 20)
-        created = api.post("/api/campaign-prompts/", {"name": "API", "prompt": "Score it.", "output_fields": [
-            {"name": "has_parking", "type": "yes/no", "description": "Whether parking is mentioned."}]}, format="json")
+        schema = research.response_model([]).model_json_schema()
+        schema["properties"]["has_parking"] = {"type": "boolean", "description": "Whether parking is mentioned."}
+        created = api.post("/api/campaign-prompts/", {"name": "API", "prompt": "Score it.", "answer_schema": schema},
+                           format="json")
         self.assertEqual(created.status_code, 201, created.content)
-        self.assertEqual(created.json()["output_fields"][0]["name"], "has_parking")
-        bad = api.post("/api/campaign-prompts/", {"name": "Bad", "prompt": "x", "output_fields": [
-            {"name": "url", "type": "text", "description": "x"}]}, format="json")
+        self.assertEqual(created.json()["output_fields"], [
+            {"name": "has_parking", "type": "yes/no", "description": "Whether parking is mentioned."}])
+        bad = api.post("/api/campaign-prompts/", {"name": "Bad", "prompt": "x", "answer_schema": {"properties": {}}},
+                       format="json")
         self.assertEqual(bad.status_code, 400)
+        self.assertIn("answer_schema", bad.json())
+        fields = api.post("/api/campaign-prompts/", {"name": "Fields", "prompt": "x", "output_fields": [
+            {"name": "has_parking", "type": "yes/no", "description": "Parking?"}]}, format="json").json()
+        self.assertIsNone(fields["answer_schema"])  # built from the app's fields plus these
         default = api.post("/api/campaign-prompts/", {"name": "Default", "prompt": "x"}, format="json").json()
         self.assertEqual([f["name"] for f in default["output_fields"]], ["team_size", "languages"])
 

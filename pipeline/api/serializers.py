@@ -99,9 +99,11 @@ class CampaignPromptSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CampaignPrompt
-        fields = ["id", "name", "prompt", "output_fields", "campaigns", "created_at", "updated_at"]
+        fields = ["id", "name", "prompt", "answer_schema", "output_fields", "campaigns", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
-        extra_kwargs = {"output_fields": {"help_text": 'Extra facts the agent returns when scoring: [{"name": "team_size", '
+        extra_kwargs = {"answer_schema": {"help_text": "The JSON schema the AI answers in (edit descriptions, add your "
+                                                       "own fields); null: the app's fields plus output_fields."},
+                        "output_fields": {"help_text": 'Extra facts the agent returns when scoring: [{"name": "team_size", '
                                                        '"type": "integer", "description": "..."}]; types: text, integer, '
                                                        'number, yes/no, text list, integer list.'}}
 
@@ -110,6 +112,19 @@ class CampaignPromptSerializer(serializers.ModelSerializer):
             return check_output_fields(value)
         except DjangoValidationError as error:
             raise serializers.ValidationError(error.messages) from error
+
+    def validate(self, attrs):
+        """An edited answer_schema decides the output fields; without one they come from output_fields."""
+        from pipeline.services.research import SchemaError, check_answer_schema
+
+        if attrs.get("answer_schema") is not None:
+            try:
+                attrs["answer_schema"], attrs["output_fields"] = check_answer_schema(attrs["answer_schema"])
+            except SchemaError as error:
+                raise serializers.ValidationError({"answer_schema": str(error)}) from error
+        elif "output_fields" in attrs:
+            attrs["answer_schema"] = None  # rebuilt from the app's fields and these output fields
+        return attrs
 
 
 class BusinessSerializer(serializers.ModelSerializer):

@@ -82,6 +82,10 @@ class CampaignPrompt(models.Model):
                                         "and what each score range (0-100) means. Businesses scoring at least the "
                                         "campaign's minimum score go on to finding decision makers. The answer "
                                         "format is set by the app, plus the output fields below.")
+    answer_schema = models.JSONField(
+        null=True, blank=True,
+        help_text="The research answer's JSON schema as edited on the prompt page (the app's fields with your "
+                  "descriptions, plus your own fields); empty: built from the app's fields and the output fields.")
     output_fields = models.JSONField(
         default=default_output_fields, blank=True,
         help_text="Extra facts the agent returns when it scores a business: [{name, type, description}], type one of "
