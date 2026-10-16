@@ -217,6 +217,7 @@ def prospect_context(row: dict) -> dict:
             "reasons": row["qualification_reasons"] or [],
         },
         "website_findings": website_findings(row.get("scraped_pages")),
+        "website_facts": {name: value for name, value in (row.get("extracted") or {}).items() if value is not None},
         "outreach_facts": row["outreach_facts"] or [],
         "research_summary": row["research_summary"],
     }
@@ -350,6 +351,7 @@ PROSPECT_FIELDS = {
     "role_type": F("contact__role_type"),
     "qualification_reasons": F("business__website_profile__qualification_reasons"),
     "scraped_pages": F("business__website_profile__scraped_pages"),
+    "extracted": F("business__website_profile__extracted"),
     "email_id": F("step_email__id"),
     "current_email_status": F("step_email__status"),
     "tracking_token": F("step_email__tracking_token"),

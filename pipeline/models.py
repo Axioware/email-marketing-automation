@@ -4,6 +4,7 @@ Table and column names are the ones the database already uses (they were created
 `manage.py migrate --fake-initial` adopts an existing database without changing it. The Supabase open-tracking edge
 function writes to `emails` and `email_open_events` through the `record_email_open` database function.
 """
+import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
@@ -11,6 +12,64 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Now
 from django.utils import timezone
+
+
+# Extra fields the research agent fills when it scores a business (Campaign prompt > Output fields). The app's own
+# fields (action, url, score, ...) drive the research and cannot be changed; these come on top.
+OUTPUT_FIELD_TYPES = {
+    "text": {"type": "string"},
+    "integer": {"type": "integer"},
+    "number": {"type": "number"},
+    "yes/no": {"type": "boolean"},
+    "text list": {"type": "array", "items": {"type": "string"}},
+    "integer list": {"type": "array", "items": {"type": "integer"}},
+}
+CORE_ANSWER_FIELDS = ("action", "url", "score", "reasons", "reasoning", "reason", "summary", "relevant_findings")
+MAX_OUTPUT_FIELDS = 20
+DEFAULT_OUTPUT_FIELDS = [
+    {"name": "team_size", "type": "integer",
+     "description": "How many staff the content states (e.g. people listed on a team page, or a stated number)."},
+    {"name": "languages", "type": "text list",
+     "description": "Languages the clinic says it offers patients, e.g. English, Urdu."},
+]
+
+
+def default_output_fields() -> list[dict]:
+    return [dict(field) for field in DEFAULT_OUTPUT_FIELDS]
+
+
+def check_output_fields(value) -> list[dict]:
+    """The output fields as stored ([{name, type, description}]), or ValidationError saying what is wrong."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValidationError("Output fields must be a list of {name, type, description}.")
+    if len(value) > MAX_OUTPUT_FIELDS:
+        raise ValidationError(f"At most {MAX_OUTPUT_FIELDS} output fields.")
+    fields, names = [], set()
+    for number, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise ValidationError(f"Field {number}: give a name, a type and a description.")
+        name = str(item.get("name") or "").strip()
+        kind = str(item.get("type") or "").strip().lower()
+        description = " ".join(str(item.get("description") or "").split())
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", name):
+            raise ValidationError(f"Field {number}: the name '{name}' must start with a lowercase letter and use only "
+                                  "lowercase letters, digits and _ (at most 40), e.g. team_size.")
+        if name in CORE_ANSWER_FIELDS:
+            raise ValidationError(f"Field {number}: '{name}' is one of the app's own fields "
+                                  f"({', '.join(CORE_ANSWER_FIELDS)}); choose another name.")
+        if name in names:
+            raise ValidationError(f"Field {number}: '{name}' is listed twice.")
+        if kind not in OUTPUT_FIELD_TYPES:
+            raise ValidationError(f"Field {number} ({name}): the type must be one of: {', '.join(OUTPUT_FIELD_TYPES)}.")
+        if not description:
+            raise ValidationError(f"Field {number} ({name}): describe what to put in it (the agent reads this).")
+        if len(description) > 500:
+            raise ValidationError(f"Field {number} ({name}): keep the description under 500 characters.")
+        names.add(name)
+        fields.append({"name": name, "type": kind, "description": description})
+    return fields
 
 
 class CampaignPrompt(models.Model):
@@ -22,7 +81,12 @@ class CampaignPrompt(models.Model):
                                         "business a good prospect for this campaign, what to look for on its website "
                                         "and what each score range (0-100) means. Businesses scoring at least the "
                                         "campaign's minimum score go on to finding decision makers. The answer "
-                                        "format is set by the app.")
+                                        "format is set by the app, plus the output fields below.")
+    output_fields = models.JSONField(
+        default=default_output_fields, blank=True,
+        help_text="Extra facts the agent returns when it scores a business: [{name, type, description}], type one of "
+                  "text, integer, number, yes/no, text list, integer list. Each may be null when not stated. Saved on "
+                  "the business's website research (extracted).")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -32,6 +96,12 @@ class CampaignPrompt(models.Model):
 
     def __str__(self):
         return self.name
+
+    def clean(self):
+        try:
+            self.output_fields = check_output_fields(self.output_fields)
+        except ValidationError as error:
+            raise ValidationError({"output_fields": error.messages}) from error
 
 
 class EmailPrompt(models.Model):
@@ -305,11 +375,14 @@ class BusinessWebsiteProfile(models.Model):
     qualification_reasons = models.JSONField(default=list, blank=True)
     agent_reasoning = models.TextField(null=True, blank=True)
     team_size = models.PositiveIntegerField(null=True, blank=True,
-                                            help_text="Staff the website or listing states (as scored); empty when not "
-                                                      "stated.")
+                                            help_text="Staff the website or listing states (the team_size output "
+                                                      "field); empty when not stated.")
     languages = models.JSONField(null=True, blank=True,
                                  help_text='Languages the clinic says it offers, e.g. ["English", "Urdu"]; empty when '
-                                           "not stated.")
+                                           "not stated (the languages output field).")
+    extracted = models.JSONField(null=True, blank=True,
+                                 help_text="The campaign prompt's output fields as the agent filled them when it "
+                                           "scored, e.g. {\"team_size\": 6, \"languages\": [\"English\"]}.")
     contact_discovery_status = models.CharField(
         max_length=32, choices=DiscoveryStatus.choices, null=True, blank=True, db_index=True,
         help_text="Set by contact discovery (Module 3). Clear it to let discovery run again.",

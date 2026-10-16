@@ -16,6 +16,7 @@ from pipeline.models import (
     PipelineRun,
     Prospect,
     SendingSettings,
+    check_output_fields,
 )
 
 
@@ -98,8 +99,17 @@ class CampaignPromptSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CampaignPrompt
-        fields = ["id", "name", "prompt", "campaigns", "created_at", "updated_at"]
+        fields = ["id", "name", "prompt", "output_fields", "campaigns", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"output_fields": {"help_text": 'Extra facts the agent returns when scoring: [{"name": "team_size", '
+                                                       '"type": "integer", "description": "..."}]; types: text, integer, '
+                                                       'number, yes/no, text list, integer list.'}}
+
+    def validate_output_fields(self, value):
+        try:
+            return check_output_fields(value)
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(error.messages) from error
 
 
 class BusinessSerializer(serializers.ModelSerializer):

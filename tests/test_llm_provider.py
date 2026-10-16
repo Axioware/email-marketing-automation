@@ -80,9 +80,12 @@ class AgentCallTests(unittest.TestCase):
                    '"languages":["English"," Urdu ","english","Sindhi"]}')
         client = mock.Mock()
         client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=content))]
+        from pipeline.models import DEFAULT_OUTPUT_FIELDS as fields
+
         decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
-                                                                      must_score=False, system_prompt="SYS")
-        self.assertEqual((decision["team_size"], decision["languages"]), (6, ["English", "Urdu", "Sindhi"]))
+                                                                      must_score=False, system_prompt="SYS",
+                                                                      output_fields=fields)
+        self.assertEqual(decision["extracted"], {"team_size": 6, "languages": ["English", "Urdu", "Sindhi"]})
         schema = client.chat.completions.create.call_args.kwargs["response_format"]["json_schema"]["schema"]
         self.assertIn("team_size", schema["required"])  # strict schemas need every field, null when not stated
         self.assertIn("languages", schema["required"])
@@ -90,13 +93,18 @@ class AgentCallTests(unittest.TestCase):
             '"languages":["English"," Urdu ","english","Sindhi"]', '"languages":[]')
         client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=unstated))]
         decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
-                                                                      must_score=False, system_prompt="SYS")
-        self.assertEqual((decision["team_size"], decision["languages"]), (None, None))
+                                                                      must_score=False, system_prompt="SYS",
+                                                                      output_fields=fields)
+        self.assertEqual(decision["extracted"], {"team_size": None, "languages": None})
         older = content.replace(',"team_size":6,"languages":["English"," Urdu ","english","Sindhi"]', "")
         client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=older))]
         decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
-                                                                      must_score=False, system_prompt="SYS")
-        self.assertEqual((decision["team_size"], decision["languages"]), (None, None))  # left out: null
+                                                                      must_score=False, system_prompt="SYS",
+                                                                      output_fields=fields)
+        self.assertEqual(decision["extracted"], {"team_size": None, "languages": None})  # left out: null
+        without = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
+                                                                     must_score=False, system_prompt="SYS")
+        self.assertEqual(without["extracted"], {})  # a prompt with no output fields
 
     def test_answer_refused_by_groqs_schema_check_is_used_when_only_a_null_field_is_missing(self):
         import httpx

@@ -91,6 +91,8 @@ class PromptAndContextTests(unittest.TestCase):
                "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
                "outreach_facts": [], "research_summary": None, "scraped_pages": []}
         for key in g.prospect_context(row):
+            if key == "website_facts":  # added after the seeded prompt: the campaign prompt's output fields
+                continue
             self.assertIn(key, SEEDED_EMAIL_PROMPT, key)
 
     def test_website_findings_keep_business_facts_only(self):

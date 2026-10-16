@@ -257,12 +257,56 @@ class CampaignAdminTests(PromptCase):
                     reverse("admin:pipeline_emailprompt_add")):
             self.assertEqual(self.client.get(url).status_code, 200, url)
         detail = self.client.get(reverse("admin:pipeline_campaignprompt_change", args=[campaign_prompt.pk])).content.decode()
-        self.assertIn("Answer format (set by the app)", detail)  # only the answer's shape comes from the app
+        self.assertIn("Answer format (the app&#x27;s fields plus your output fields)", detail)
         self.assertIn("SCRAPE: read one more page", detail)
+        self.assertIn("team_size | integer | How many staff", detail)  # the default output fields, editable
         self.assertIn("Mine", detail)  # used by campaigns
         detail = self.client.get(reverse("admin:pipeline_emailprompt_change", args=[first.pk])).content.decode()
         self.assertNotIn("CAMPAIGN RULES Dental", detail)  # the email prompt is used on its own
         self.assertIn("initial email", detail)
+
+
+class OutputFieldTests(PromptCase):
+    def test_edit_output_fields_on_the_prompt_page(self):
+        campaign_prompt, _, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
+        url = reverse("admin:pipeline_campaignprompt_change", args=[campaign_prompt.pk])
+        text = ("team_size | integer | Staff the site states.\n"
+                "existing_call_tool | text | The AI receptionist or call service the site shows.\n"
+                "\n"
+                "offers_emergency_care | yes/no | Whether the clinic offers emergency appointments.")
+        response = self.client.post(url, {"name": campaign_prompt.name, "prompt": campaign_prompt.prompt,
+                                          "output_fields_text": text})
+        self.assertEqual(response.status_code, 302, response.content[:500])
+        campaign_prompt.refresh_from_db()
+        self.assertEqual([(f["name"], f["type"]) for f in campaign_prompt.output_fields],
+                         [("team_size", "integer"), ("existing_call_tool", "text"), ("offers_emergency_care", "yes/no")])
+        page = self.client.get(url).content.decode()
+        self.assertIn("existing_call_tool", page)  # in the editor and in the answer format the AI receives
+        self.assertIn("SCORE only: The AI receptionist or call service the site shows.", page)
+        for bad, message in (("score | integer | x", "one of the app&#x27;s own fields"),
+                             ("Team Size | integer | x", "must start with a lowercase letter"),
+                             ("a | date | x", "the type must be one of"),
+                             ("a | text", "name | type | description"),
+                             ("a | text | x\na | integer | y", "listed twice")):
+            response = self.client.post(url, {"name": campaign_prompt.name, "prompt": campaign_prompt.prompt,
+                                              "output_fields_text": bad})
+            self.assertContains(response, message, msg_prefix=bad)
+
+    @override_settings(AUTH_TOKEN="t" * 20)
+    def test_output_fields_over_the_api(self):
+        from rest_framework.test import APIClient
+
+        api = APIClient()
+        api.credentials(HTTP_AUTH="t" * 20)
+        created = api.post("/api/campaign-prompts/", {"name": "API", "prompt": "Score it.", "output_fields": [
+            {"name": "has_parking", "type": "yes/no", "description": "Whether parking is mentioned."}]}, format="json")
+        self.assertEqual(created.status_code, 201, created.content)
+        self.assertEqual(created.json()["output_fields"][0]["name"], "has_parking")
+        bad = api.post("/api/campaign-prompts/", {"name": "Bad", "prompt": "x", "output_fields": [
+            {"name": "url", "type": "text", "description": "x"}]}, format="json")
+        self.assertEqual(bad.status_code, 400)
+        default = api.post("/api/campaign-prompts/", {"name": "Default", "prompt": "x"}, format="json").json()
+        self.assertEqual([f["name"] for f in default["output_fields"]], ["team_size", "languages"])
 
 
 class GeneratePageTests(PromptCase):

@@ -17,6 +17,7 @@ from django.http import HttpResponseNotAllowed, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
+from django.core.exceptions import ValidationError
 from django.utils.html import format_html, format_html_join
 from django.utils.text import Truncator
 
@@ -34,11 +35,30 @@ from pipeline.models import (
     PipelineRun,
     Prospect,
     SendingSettings,
+    check_output_fields,
+    default_output_fields,
 )
 from pipeline.services import generation, qualify
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def extracted_table(extracted: dict | None):
+    """A research profile's output fields (team size, languages, ...) as a small table."""
+    if not extracted:
+        return "-"
+
+    def shown(value):
+        if value is None:
+            return "not stated"
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        return ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
+
+    rows = format_html_join("", "<tr><th>{}</th><td>{}</td></tr>",
+                            ((name.replace("_", " "), shown(value)) for name, value in extracted.items()))
+    return format_html('<table class="pipeline-facts">{}</table>', rows)
 
 
 def admin_url(obj) -> str:
@@ -300,10 +320,42 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
 
 
 class CampaignPromptForm(forms.ModelForm):
+    output_fields_text = forms.CharField(
+        label="Output fields", required=False,
+        widget=forms.Textarea(attrs={"rows": 6, "class": "vLargeTextField"}),
+        help_text="Extra facts the agent returns when it scores a business, one per line: name | type | description. "
+                  "Types: text, integer, number, yes/no, text list, integer list. Each is null when the website does "
+                  "not state it. E.g. <code>existing_call_tool | text | The AI receptionist, call-answering service or "
+                  "chat widget the site shows.</code> Saved on the business's website research.")
+
     class Meta:
         model = CampaignPrompt
         fields = ["name", "prompt"]
         widgets = {"prompt": forms.Textarea(attrs={"rows": 24, "class": "vLargeTextField"})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        fields = self.instance.output_fields if self.instance.pk else default_output_fields()
+        self.initial.setdefault("output_fields_text", "\n".join(
+            f"{field['name']} | {field['type']} | {field['description']}" for field in fields or []))
+
+    def clean_output_fields_text(self):
+        fields = []
+        for number, line in enumerate((self.cleaned_data.get("output_fields_text") or "").splitlines(), start=1):
+            if not line.strip():
+                continue
+            parts = [part.strip() for part in line.split("|", 2)]
+            if len(parts) != 3:
+                raise forms.ValidationError(f"Line {number}: write it as name | type | description.")
+            fields.append({"name": parts[0], "type": parts[1], "description": parts[2]})
+        try:
+            return check_output_fields(fields)
+        except ValidationError as error:
+            raise forms.ValidationError(error.messages) from error
+
+    def save(self, commit=True):
+        self.instance.output_fields = self.cleaned_data.get("output_fields_text") or []
+        return super().save(commit)
 
 
 @admin.register(CampaignPrompt)
@@ -316,9 +368,15 @@ class CampaignPromptAdmin(PipelineAdmin):
         (None, {"fields": ["name", "campaigns_list", "prompt"],
                 "description": "The research agent's instructions, used exactly as written (nothing is added): it "
                                "reads each business's website and scores it 0-100 by this text; businesses scoring at "
-                               "least their campaign's minimum score go on to finding decision makers. Only the shape "
-                               "of its answer is set by the app (see Answer format)."}),
-        ("Answer format (set by the app)", {"fields": ["answer_format_display"], "classes": ["collapse"]}),
+                               "least their campaign's minimum score go on to finding decision makers. Do not describe "
+                               "an answer format here: the app sets it (below), and a second format makes the AI's "
+                               "answers get refused and retried."}),
+        ("Output fields", {"fields": ["output_fields_text"],
+                           "description": "Your own facts to extract, on top of the app's fields (action, url, score, "
+                                          "reasons, reasoning, reason, summary, relevant_findings), which drive the "
+                                          "research and cannot be changed."}),
+        ("Answer format (the app's fields plus your output fields)", {"fields": ["answer_format_display"],
+                                                                      "classes": ["collapse"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
@@ -333,7 +391,7 @@ class CampaignPromptAdmin(PipelineAdmin):
     def answer_format_display(self, obj):
         from pipeline.services.research import answer_format
 
-        return format_html('<pre class="pipeline-pre">{}</pre>', answer_format())
+        return format_html('<pre class="pipeline-pre">{}</pre>', answer_format(obj.output_fields if obj.pk else None))
 
 
 class EmailPromptForm(forms.ModelForm):
@@ -552,10 +610,10 @@ class BusinessAdmin(PipelineAdmin):
     search_fields = ["name", "category", "city", "state", "address", "domain", "phone", "website_url"]
     change_list_template = "admin/pipeline/business/change_list.html"
     readonly_fields = ["created_at", "updated_at", "first_discovered_at", "last_discovered_at", "profile_link",
-                       "opening_hours_display", "team_size", "languages"]
+                       "opening_hours_display", "extracted"]
     fieldsets = [
         (None, {"fields": ["discovery_campaign", "name", "category", "website_url", "domain", "phone", "profile_link",
-                           "review_status", "team_size", "languages"]}),
+                           "review_status", "extracted"]}),
         ("Location", {"fields": ["address", "city", "state", "country", "postal_code", "latitude", "longitude"]}),
         ("Google Maps", {"fields": ["google_place_id", "google_maps_url", "google_rating", "google_review_count",
                                     "opening_hours_display", "source", "source_url"], "classes": ["collapse"]}),
@@ -659,15 +717,10 @@ class BusinessAdmin(PipelineAdmin):
         score = f", score {profile.qualification_score}" if profile.qualification_score is not None else ""
         return admin_link(profile, f"{profile.get_status_display()}{score}")
 
-    @admin.display(description="Team size")
-    def team_size(self, obj):
+    @admin.display(description="From research")
+    def extracted(self, obj):
         profile = self._profile(obj) if obj.pk else None
-        return profile.team_size if profile and profile.team_size is not None else "-"
-
-    @admin.display(description="Languages")
-    def languages(self, obj):
-        profile = self._profile(obj) if obj.pk else None
-        return ", ".join(profile.languages) if profile and profile.languages else "-"
+        return extracted_table(profile.extracted if profile else None)
 
     @admin.display(description="Opening hours")
     def opening_hours_display(self, obj):
@@ -738,10 +791,10 @@ class BusinessWebsiteProfileAdmin(PipelineAdmin):
     list_select_related = ["business"]
     readonly_fields = ["business", "pages_scraped", "created_at", "updated_at", "contact_discovery_at",
                        "reasons_display", "findings_display", "emails_display", "urls_display", "links_display",
-                       "team_size", "languages_display"]
+                       "team_size", "languages_display", "extracted_display"]
     fieldsets = [
         (None, {"fields": ["business", "status", "qualification_score", "reasons_display", "agent_reasoning",
-                           "team_size", "languages_display"]}),
+                           "extracted_display"]}),
         ("What the agent read", {"fields": ["pages_scraped", "urls_display", "findings_display", "emails_display",
                                             "links_display"]}),
         ("Contact discovery (Module 3)", {"fields": ["contact_discovery_status", "contact_discovery_at"]}),
@@ -759,6 +812,10 @@ class BusinessWebsiteProfileAdmin(PipelineAdmin):
     @admin.display(description="Languages")
     def languages_display(self, obj):
         return ", ".join(obj.languages) if obj.languages else "-"
+
+    @admin.display(description="Output fields")
+    def extracted_display(self, obj):
+        return extracted_table(obj.extracted)
 
     @admin.display(description="Qualification reasons")
     def reasons_display(self, obj):

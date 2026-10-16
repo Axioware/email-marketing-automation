@@ -123,10 +123,19 @@ class ResearchTests(TestCase):
         profile_id = research.start_profile(business.pk)
         research.finalize_profile(profile_id, {"pages_scraped": 1, "scraped_urls": [], "scraped_pages": [],
                                                "discovered_links": [], "emails": [], "qualification_score": 70,
-                                               "qualification_reasons": [], "agent_reasoning": "ok", "team_size": 7,
-                                               "languages": ["English", "Urdu"]})
+                                               "qualification_reasons": [], "agent_reasoning": "ok",
+                                               "extracted": {"team_size": 7, "languages": ["English", "Urdu"],
+                                                             "existing_call_tool": None}})
         profile = BusinessWebsiteProfile.objects.get(pk=profile_id)
-        self.assertEqual((profile.team_size, profile.languages), (7, ["English", "Urdu"]))
+        self.assertEqual((profile.team_size, profile.languages), (7, ["English", "Urdu"]))  # their own columns too
+        self.assertEqual(profile.extracted["existing_call_tool"], None)
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        self.client.force_login(get_user_model().objects.create_superuser("x", "x@example.org", "pw"))
+        page = self.client.get(reverse("admin:pipeline_business_change", args=[business.pk])).content.decode()
+        self.assertIn("<th>team size</th><td>7</td>", page)
+        self.assertIn("<th>existing call tool</th><td>not stated</td>", page)
         research.start_profile(business.pk)  # researched again: cleared until the new answer
         self.assertIsNone(BusinessWebsiteProfile.objects.get(pk=profile_id).team_size)
 

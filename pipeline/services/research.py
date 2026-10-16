@@ -4,7 +4,8 @@ Pages are read over plain HTTP plus Jina Reader (which renders them in its own b
 the step runs on the web app (Vercel) as well.
 
 The model's instructions are the campaign prompt of the business's campaign, exactly as stored (campaign_prompts
-table, edited in the admin); nothing is added to it. The app only fixes the shape of each answer: AgentResponse, sent
+table, edited in the admin); nothing is added to it. The app only fixes the shape of each answer: AgentResponse (plus
+the campaign prompt's output fields, filled when scoring and saved as the profile's `extracted`), sent
 as a strict JSON schema whose field descriptions say how to read another page, score, or stop. A business whose
 campaign has no campaign prompt is not researched."""
 import ipaddress
@@ -22,7 +23,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from django.core.management.base import CommandError
 from django.db.models import F, Q
 from django.utils import timezone
@@ -36,7 +37,7 @@ except ImportError:
     trafilatura = None
 
 from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
-from pipeline.models import Business, BusinessWebsiteProfile
+from pipeline.models import Business, BusinessWebsiteProfile, check_output_fields
 from pipeline.services.llm import complete, make_llm_client, rejected_output
 from pipeline.services.dbthread import outside_event_loop
 
@@ -92,21 +93,61 @@ class AgentResponse(BaseModel):
                                                    "and why (must_score_reason); null otherwise.")
     reason: str | None = Field(..., description="SCRAPE: why that page is worth reading. EXIT: why the website cannot "
                                                 "be used. Null for SCORE.")
-    team_size: int | None = Field(..., ge=1, description="SCORE only: how many staff the content states (e.g. people "
-                                                         "listed on a team page, or a stated number); null when not "
-                                                         "stated or for SCRAPE/EXIT.")
-    languages: list[str] | None = Field(..., description="SCORE only: languages the clinic says it offers patients, "
-                                                         "e.g. [\"English\", \"Urdu\"]; null when not stated or for "
-                                                         "SCRAPE/EXIT.")
     summary: str = Field(..., min_length=1, description="What the current page says about the business, in a "
                                                         "sentence or two.")
     relevant_findings: list[str] = Field(..., description="Facts from the current page that matter for the score "
                                                           "or for writing to the business; empty when none.")
 
 
-def answer_format() -> str:
+FIELD_PYTHON_TYPES = {"text": str, "integer": int, "number": float, "yes/no": bool, "text list": list[str],
+                      "integer list": list[int]}
+_response_models: dict = {}
+
+
+def response_model(output_fields: list[dict] | None = None) -> type[BaseModel]:
+    """AgentResponse plus the campaign prompt's output fields (filled when scoring, null otherwise)."""
+    fields = check_output_fields(output_fields or [])
+    key = json.dumps(fields, sort_keys=True)
+    if key not in _response_models:
+        extra = {
+            field["name"]: (FIELD_PYTHON_TYPES[field["type"]] | None,
+                            Field(..., description=f"SCORE only: {field['description']} Null when not stated, and for "
+                                                   "SCRAPE/EXIT."))
+            for field in fields
+        }
+        _response_models[key] = create_model("AgentResponse", __base__=AgentResponse, **extra) if extra else AgentResponse
+    return _response_models[key]
+
+
+def answer_format(output_fields: list[dict] | None = None) -> str:
     """The answer schema as the model receives it, for showing next to a campaign prompt."""
-    return json.dumps(AgentResponse.model_json_schema(), indent=2)
+    return json.dumps(response_model(output_fields).model_json_schema(), indent=2)
+
+
+def clean_value(value, kind: str):
+    """An output field's value as stored: text trimmed, lists without blanks or repeats (case-insensitive);
+    None when empty."""
+    if value is None:
+        return None
+    if kind == "text":
+        return " ".join(value.split())[:1000] or None
+    if kind in ("text list", "integer list"):
+        cleaned, seen = [], set()
+        for item in value:
+            item = " ".join(item.split())[:200] if isinstance(item, str) else item
+            marker = item.casefold() if isinstance(item, str) else item
+            if item not in ("", None) and marker not in seen:
+                seen.add(marker)
+                cleaned.append(item)
+        return cleaned[:50] or None
+    if kind == "integer" and value < 0:
+        return None
+    return value
+
+
+def extracted_values(decision: BaseModel, output_fields: list[dict]) -> dict:
+    return {field["name"]: clean_value(getattr(decision, field["name"], None), field["type"])
+            for field in check_output_fields(output_fields or [])}
 
 
 class ResearchError(RuntimeError):
@@ -351,33 +392,26 @@ def prompt_context(context: dict) -> dict:
     return payload
 
 
-NULLABLE_FIELDS = ("url", "score", "reasons", "reasoning", "reason", "team_size", "languages")
-MAX_LANGUAGES = 10
+NULLABLE_FIELDS = ("url", "score", "reasons", "reasoning", "reason")
 PAGE_LIMIT_NOTE = "the five-page limit was reached"
 
 
-def clean_languages(languages: list[str] | None) -> list[str] | None:
-    """The languages as stated, trimmed, each once (case-insensitively); None when there are none."""
-    cleaned, seen = [], set()
-    for item in languages or []:
-        name = " ".join(str(item).split())[:40]
-        if name and name.casefold() not in seen:
-            seen.add(name.casefold())
-            cleaned.append(name)
-    return cleaned[:MAX_LANGUAGES] or None
-
-
-def parse_decision(content: str) -> "AgentResponse":
+def parse_decision(content: str, output_fields: list[dict] | None = None) -> BaseModel:
     """The agent's answer; fields it left out that may be null count as null (models sometimes drop them)."""
+    model = response_model(output_fields)
     data = json.loads(content or "")
     if isinstance(data, dict):
         for name in NULLABLE_FIELDS:
             data.setdefault(name, None)
-    return AgentResponse.model_validate(data)
+        for name in model.model_fields:
+            if name not in AgentResponse.model_fields:
+                data.setdefault(name, None)
+    return model.model_validate(data)
 
 
 def validate_agent_response(client: OpenAI, model: str, context: dict, must_score: bool, system_prompt: str,
-                            score_note: str = PAGE_LIMIT_NOTE, deadline: float | None = None) -> dict:
+                            score_note: str = PAGE_LIMIT_NOTE, deadline: float | None = None,
+                            output_fields: list[dict] | None = None) -> dict:
     """One agent decision. With must_score the agent has to SCORE now; score_note says why (shown to the agent and
     added to its reasoning)."""
     feedback = None
@@ -386,7 +420,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
         "json_schema": {
             "name": "business_research_action",
             "strict": True,
-            "schema": AgentResponse.model_json_schema(),
+            "schema": response_model(output_fields).model_json_schema(),
         },
     }
     for _ in range(MAX_AGENT_RETRIES):
@@ -414,7 +448,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
             if content is None:
                 raise
         try:
-            decision = parse_decision(content)
+            decision = parse_decision(content, output_fields)
         except (ValueError, ValidationError):
             feedback = ("Return a response matching the required strict action schema, with every field present "
                         "(unused ones as null).")
@@ -447,8 +481,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                     "qualification_score": decision.score,
                     "qualification_reasons": decision.reasons,
                     "agent_reasoning": reasoning,
-                    "team_size": decision.team_size,
-                    "languages": clean_languages(decision.languages),
+                    "extracted": extracted_values(decision, output_fields),
                 }
             feedback = "SCORE requires score, reasons, and reasoning; set url and reason to null."
             continue
@@ -466,8 +499,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                 "qualification_score": None,
                 "qualification_reasons": [],
                 "agent_reasoning": decision.reason,
-                "team_size": None,
-                "languages": None,
+                "extracted": None,
             }
 
         if action == "SCRAPE" and not must_score:
@@ -556,7 +588,9 @@ def research_business(
         elif last["agent_action"] is None:
             decide_only = True
     system_prompt = business["qualification_prompt"].strip()  # the campaign prompt, exactly as stored
-    business = {key: value for key, value in business.items() if key != "qualification_prompt"}  # already in it
+    output_fields = business.get("output_fields") or []
+    business = {key: value for key, value in business.items()
+                if key not in ("qualification_prompt", "output_fields")}  # already in the prompt and the format
 
     while len(pages) < MAX_PAGES_PER_BUSINESS or decide_only:
         if decide_only:  # an interrupted run read this page but the agent had not decided on it yet
@@ -626,13 +660,14 @@ def research_business(
         note = TIME_LIMIT_NOTE if out_of_time_now and len(pages) < MAX_PAGES_PER_BUSINESS else PAGE_LIMIT_NOTE
         try:
             decision = validate_agent_response(client, model, context, must_score, system_prompt, score_note=note,
-                                               deadline=deadline)
+                                               deadline=deadline, output_fields=output_fields)
         except ResearchError:
             if must_score:
                 raise
             # The agent could not pick a readable page: score from the pages read so far instead of failing.
             decision = validate_agent_response(client, model, context, True, system_prompt,
-                                               score_note="no further useful page could be chosen", deadline=deadline)
+                                               score_note="no further useful page could be chosen", deadline=deadline,
+                                               output_fields=output_fields)
         page_record.update(
             summary=decision["summary"],
             relevant_findings=decision["relevant_findings"],
@@ -672,6 +707,7 @@ def start_profile(business_id: int) -> int:
             "agent_reasoning": None,
             "team_size": None,
             "languages": None,
+            "extracted": None,
         },
     )
     return profile.pk
@@ -712,7 +748,8 @@ def load_businesses(limit: int | None, business_ids: list[int] | None, retry_fai
         queryset = queryset.filter(id__in=business_ids)
     if limit is not None:
         queryset = queryset[:limit]
-    return list(queryset.values(*BUSINESS_FIELDS, qualification_prompt=F("discovery_campaign__campaign_prompt__prompt")))
+    return list(queryset.values(*BUSINESS_FIELDS, qualification_prompt=F("discovery_campaign__campaign_prompt__prompt"),
+                                output_fields=F("discovery_campaign__campaign_prompt__output_fields")))
 
 
 @outside_event_loop
@@ -727,9 +764,20 @@ def finalize_profile(profile_id: int, result: dict) -> None:
         qualification_score=result["qualification_score"],
         qualification_reasons=result["qualification_reasons"],
         agent_reasoning=result["agent_reasoning"],
-        team_size=result.get("team_size"),
-        languages=result.get("languages"),
+        extracted=result.get("extracted"),
+        **known_columns(result.get("extracted")),
     )
+
+
+def known_columns(extracted: dict | None) -> dict:
+    """team_size and languages also get their own columns (filters, lists) when the output fields have them."""
+    extracted = extracted or {}
+    team_size = extracted.get("team_size")
+    languages = extracted.get("languages")
+    return {"team_size": team_size if isinstance(team_size, int) and not isinstance(team_size, bool) and team_size > 0
+            else None,
+            "languages": languages if isinstance(languages, list) and all(isinstance(x, str) for x in languages)
+            else None}
 
 
 @outside_event_loop
