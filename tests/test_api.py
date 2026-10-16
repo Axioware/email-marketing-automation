@@ -140,12 +140,25 @@ class ResourceTests(ApiCase):
         self.assertIsNone(prospect.email_verification_provider)  # read-only
 
     @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
+    def test_sending_settings(self):
+        data = self.api.get("/api/settings/").json()
+        self.assertEqual((data["daily_cap"], data["gap_fixed_seconds"], data["gap_random_min_seconds"],
+                          data["gap_random_max_seconds"]), (40, 120, 180, 300))
+        changed = self.api.patch("/api/settings/", {"daily_cap": 25}, format="json")
+        self.assertEqual((changed.status_code, changed.json()["daily_cap"]), (200, 25))
+        bad = self.api.patch("/api/settings/", {"gap_random_min_seconds": 500}, format="json")
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("gap_random_max_seconds", bad.json())
+        self.assertEqual(self.api.get("/api/settings/").json()["gap_random_min_seconds"], 180)
+        campaign = self.api.post("/api/campaigns/", {"name": "C"}, format="json").json()
+        self.assertNotIn("daily_cap", campaign)  # global now
+
     def test_stats(self):
         make_email("sent")
         make_email("opened")
         data = self.api.get("/api/stats/").json()
         self.assertEqual(data["emails"]["sent"], 1)
-        self.assertEqual(data["open_rate"], 50)
+        self.assertNotIn("open_rate", data)  # open tracking is off
         self.assertEqual(data["businesses"], 2)
 
 

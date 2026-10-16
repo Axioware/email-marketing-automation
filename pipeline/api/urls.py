@@ -20,6 +20,7 @@ router.register("runs", views.PipelineRunViewSet)
 urlpatterns = [
     path("", include(router.urls)),
     path("stats/", views.StatsView.as_view(), name="api-stats"),
+    path("settings/", views.SendingSettingsView.as_view(), name="api-settings"),
     path("ghl/email-sent/", hooks.EmailSentView.as_view(), name="ghl-email-sent"),
     path("ghl/stop-sequence/", hooks.StopSequenceView.as_view(), name="ghl-stop-sequence"),
 ]

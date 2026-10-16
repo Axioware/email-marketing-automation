@@ -14,6 +14,7 @@ from pipeline.services import generation, ghl, outreach
 
 EDITABLE = ("in_review", "approved", "scheduled", "rejected")
 STATUS_ORDER = ("in_review", "approved", "scheduled", "sending", "rejected", "sent", "opened", "replied", "failed")
+LEGACY_STATUSES = ("sending", "opened", "failed")  # from SMTP sending and open tracking; no longer set
 MAX_SUBJECT = generation.MAX_SUBJECT_CHARS
 MAX_BODY = generation.MAX_BODY_CHARS
 

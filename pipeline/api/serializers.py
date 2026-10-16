@@ -15,6 +15,7 @@ from pipeline.models import (
     EmailOpenEvent,
     PipelineRun,
     Prospect,
+    SendingSettings,
 )
 
 
@@ -40,8 +41,7 @@ class FollowUpSerializer(serializers.ModelSerializer):
         return value
 
 
-CAMPAIGN_SETTINGS = ["min_score", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds", "daily_cap",
-                     "send_window_start", "send_window_end", "send_timezone"]
+CAMPAIGN_SETTINGS = ["min_score", "send_window_start", "send_window_end", "send_timezone"]
 
 
 class DiscoveryCampaignSerializer(serializers.ModelSerializer):
@@ -62,7 +62,7 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        """The model's rules (gap range, send window, time zone, score range)."""
+        """The model's rules (send window, time zone, score range)."""
         instance = DiscoveryCampaign(**{field: getattr(self.instance, field) for field in CAMPAIGN_SETTINGS}) \
             if self.instance else DiscoveryCampaign()
         for field in CAMPAIGN_SETTINGS:
@@ -257,3 +257,24 @@ class PipelineRunSerializer(serializers.ModelSerializer):
 class PipelineRunListSerializer(PipelineRunSerializer):
     class Meta(PipelineRunSerializer.Meta):
         fields = [field for field in PipelineRunSerializer.Meta.fields if field != "output"]
+
+
+class SendingSettingsSerializer(serializers.ModelSerializer):
+    """How fast emails go out, for all campaigns together."""
+
+    class Meta:
+        model = SendingSettings
+        fields = ["daily_cap", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds", "updated_at"]
+        read_only_fields = ["updated_at"]
+
+    def validate(self, attrs):
+        settings_row = SendingSettings(**{field: getattr(self.instance, field) for field in
+                                          ("daily_cap", "gap_fixed_seconds", "gap_random_min_seconds",
+                                           "gap_random_max_seconds")})
+        for field, value in attrs.items():
+            setattr(settings_row, field, value)
+        try:
+            settings_row.clean()
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(error.message_dict) from error
+        return attrs

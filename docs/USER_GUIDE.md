@@ -27,7 +27,7 @@ The home page shows the whole pipeline at a glance:
 - **Recent pipeline runs** shows the jobs you started and whether they finished.
 - **Yellow warnings** at the top mean something in the settings is missing (for example the AI key). See [Settings](#9-settings).
 
-The left sidebar lists the pages in pipeline order (its **Jump to a page** box only narrows this list of pages, it does not filter records): **Campaigns > Businesses > Website research > Contacts > Prospects > Emails**, then **Pipeline runs**, **Email opens** and **Google Maps listings**.
+The left sidebar lists the pages in pipeline order (its **Jump to a page** box only narrows this list of pages, it does not filter records): **Campaigns > Businesses > Website research > Contacts > Prospects > Emails**, then **Pipeline runs**, **Settings** and **Google Maps listings**.
 
 ## 3. How the pipeline works
 
@@ -72,7 +72,7 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Minimum score** (under Leads, default 50): businesses scoring at least this go straight on to finding decision makers; the rest wait for you to approve or reject them.
    - **Campaign prompt** (under Prompts): what makes a good prospect; the AI scores each business's website against it. Pick one, or click **+** to write a new one. Several campaigns can share one. Without one, the campaign's businesses are not researched.
    - **Initial-email prompts** (under Prompts): tick one or more. With several, prospects are split equally between them (an A/B test) and each person keeps their prompt.
-   - **Sending** (optional): the gap between two sends (default 2 minutes fixed plus a random 3-5 minutes), the **daily cap** (default 40), and a **send window** (e.g. 09:00 to 18:00) with its time zone. See [Sending](#step-8-sending-through-gohighlevel).
+   - **Sending** (optional): a **send window** (e.g. 09:00 to 18:00) with its time zone. The gap between two sends and the **daily cap** are the same for every campaign: sidebar > **Settings** (defaults: 2 minutes fixed plus a random 3-5 minutes, 40 emails a day). See [Sending](#step-8-sending-through-gohighlevel).
    - **Follow-ups** table (bottom): one row per follow-up with its days and its prompt. See [Follow-ups](#follow-ups).
 3. Click **Save**.
 
@@ -203,7 +203,7 @@ To approve or reject many emails at once: on the Emails list tick them, choose *
 GoHighLevel sends the emails from your connected mailbox, at the time this app gives each one.
 
 - **Contacts:** every prospect ready to email (verified, or approved by you) is created in GoHighLevel with the tags `outreach-app` and `campaign-<name>` (the full pipeline does it at the end; **Create GHL contacts** on the dashboard does it any time). Your GHL workflow turns them into **New Lead** opportunities. One email address gets one sequence, even if two prospects share it.
-- **Approve = hand to GoHighLevel.** Each approved email gets a send time: the campaign's previous one plus the gap (default 2 minutes plus a random 3-5 minutes), only inside the send window, at most the daily cap per day. A follow-up never goes before its days after the previous email. The email is written into its contact at once (**Email Subject**, **Email Body**, **Follow-up Count**, **Email Due At**, and **Initial Email Type** for a first email), and GoHighLevel waits until Email Due At and sends it. The email shows **In GoHighLevel** with its due time.
+- **Approve = hand to GoHighLevel.** Each approved email gets a send time: the latest planned email of any campaign plus the gap (Settings; default 2 minutes plus a random 3-5 minutes), only inside its campaign's send window, and at most the daily cap per day for all campaigns together (one mailbox sends them all). A follow-up never goes before its days after the previous email. The email is written into its contact at once (**Email Subject**, **Email Body**, **Follow-up Count**, **Email Due At**, and **Initial Email Type** for a first email), and GoHighLevel waits until Email Due At and sends it. The email shows **In GoHighLevel** with its due time.
 - **If GoHighLevel could not take it**, the email stays **Approved** with the reason shown; click **Hand to GoHighLevel** on it (or the dashboard button) once the problem is fixed. It is never sent twice.
 - **Changed your mind?** Edit, reject or send it back to review before it is sent: it is taken back out of GoHighLevel first. If GoHighLevel cannot be reached, nothing changes and you are told (it could still be sent).
 - **After it is sent**, GoHighLevel tells the app, the email becomes **Sent**, and the next follow-up is written for your review.

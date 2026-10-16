@@ -27,7 +27,7 @@ from django.db import transaction
 from django.db.models import Max, Q
 from django.utils.text import slugify
 
-from pipeline.models import DiscoveryCampaign, Email, FollowUp, Prospect
+from pipeline.models import DiscoveryCampaign, Email, FollowUp, Prospect, SendingSettings
 from pipeline.services import generation, ghl
 
 HOLDS_SLOT = ("approved", "scheduled", "sending", "sent", "opened", "replied")  # with scheduled_at set
@@ -57,19 +57,24 @@ def local_day_bounds(campaign: DiscoveryCampaign, day: date) -> tuple[datetime, 
     return datetime.combine(day, day_time.min, tzinfo=tz), datetime.combine(day + timedelta(days=1), day_time.min, tzinfo=tz)
 
 
-def slot_holders(campaign: DiscoveryCampaign):
-    return Email.objects.filter(business__discovery_campaign=campaign, status__in=HOLDS_SLOT, scheduled_at__isnull=False)
+def slot_holders():
+    """Emails holding a send time, in every campaign: they all go out from one mailbox."""
+    return Email.objects.filter(status__in=HOLDS_SLOT, scheduled_at__isnull=False)
 
 
-def next_slot(campaign: DiscoveryCampaign, earliest: datetime, rng: random.Random | None = None) -> datetime:
+def next_slot(campaign: DiscoveryCampaign, earliest: datetime, rng: random.Random | None = None,
+              sending: SendingSettings | None = None) -> datetime:
     """The send time for a newly approved email of the campaign: at least `earliest`, at least the fixed plus a
-    random gap after the campaign's latest slot, inside the send window, on a day under the daily cap. Call it
-    inside a transaction that locked the campaign row, so two approvals never take the same slot."""
+    random gap after the latest send time of any campaign, inside the campaign's send window, on a day when fewer
+    than the daily cap (all campaigns together, the day in the campaign's time zone) are planned. The gaps and the
+    cap are the global Sending settings. Call it inside a transaction that locked the settings row, so two approvals
+    never take the same slot."""
     rng = rng or random
-    latest = slot_holders(campaign).aggregate(latest=Max("scheduled_at"))["latest"]
+    sending = sending or SendingSettings.current()
+    latest = slot_holders().aggregate(latest=Max("scheduled_at"))["latest"]
     candidate = earliest
     if latest is not None:
-        gap = campaign.gap_fixed_seconds + rng.uniform(campaign.gap_random_min_seconds, campaign.gap_random_max_seconds)
+        gap = sending.gap_fixed_seconds + rng.uniform(sending.gap_random_min_seconds, sending.gap_random_max_seconds)
         candidate = max(candidate, latest + timedelta(seconds=gap))
     tz = ZoneInfo(campaign.send_timezone)
     for _ in range(366):
@@ -80,11 +85,14 @@ def next_slot(campaign: DiscoveryCampaign, earliest: datetime, rng: random.Rando
         if candidate >= finish:
             candidate = local_day_bounds(campaign, day + timedelta(days=1))[0]
             continue
-        if slot_holders(campaign).filter(scheduled_at__gte=begin, scheduled_at__lt=finish).count() >= campaign.daily_cap:
+        day_start = datetime.combine(day, day_time.min, tzinfo=tz)
+        planned = slot_holders().filter(scheduled_at__gte=day_start, scheduled_at__lt=day_start + timedelta(days=1))
+        if planned.count() >= sending.daily_cap:
             candidate = local_day_bounds(campaign, day + timedelta(days=1))[0]
             continue
         return candidate
-    raise OutreachError("No send slot found within a year; check the campaign's daily cap and send window.")
+    raise OutreachError("No send slot found within a year; check the daily cap (Settings) and the campaign's send "
+                        "window.")
 
 
 def earliest_send(email: Email) -> datetime:
@@ -101,9 +109,11 @@ def earliest_send(email: Email) -> datetime:
 
 def schedule(email: Email) -> datetime:
     """Give an approved email its send time (kept while it is approved or handed over). Returns the time."""
+    SendingSettings.current()  # the row exists before it is locked
     with transaction.atomic():
-        campaign = DiscoveryCampaign.objects.select_for_update().get(pk=email.business.discovery_campaign_id)
-        slot = next_slot(campaign, earliest_send(email))
+        sending = SendingSettings.objects.select_for_update().get(pk=1)  # one approval at a time, all campaigns
+        campaign = DiscoveryCampaign.objects.get(pk=email.business.discovery_campaign_id)
+        slot = next_slot(campaign, earliest_send(email), sending=sending)
         if not Email.objects.filter(pk=email.pk, status="approved").update(scheduled_at=slot):
             raise OutreachError("Only approved emails can be scheduled.")
     email.scheduled_at = slot

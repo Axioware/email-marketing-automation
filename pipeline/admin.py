@@ -31,9 +31,9 @@ from pipeline.models import (
     BusinessWebsiteProfile,
     DiscoveryCampaign,
     Email,
-    EmailOpenEvent,
     PipelineRun,
     Prospect,
+    SendingSettings,
 )
 from pipeline.services import generation, qualify
 
@@ -132,8 +132,7 @@ class ReadOnlyInline(admin.TabularInline):
 # ---------------------------------------------------------------- Module 1: campaigns and businesses
 
 
-CAMPAIGN_SETTINGS = ("lead_source", "min_score", "gap_fixed_seconds", "gap_random_min_seconds",
-                     "gap_random_max_seconds", "daily_cap", "send_timezone")  # left out of a form post: the default
+CAMPAIGN_SETTINGS = ("lead_source", "min_score", "send_timezone")  # left out of a form post: the default
 
 
 class DiscoveryCampaignForm(forms.ModelForm):
@@ -143,8 +142,7 @@ class DiscoveryCampaignForm(forms.ModelForm):
     class Meta:
         model = DiscoveryCampaign
         fields = ["name", "target_country", "target_locations", "search_terms", "lead_source", "campaign_prompt",
-                  "initial_email_prompts", "min_score", "gap_fixed_seconds", "gap_random_min_seconds",
-                  "gap_random_max_seconds", "daily_cap", "send_window_start", "send_window_end", "send_timezone"]
+                  "initial_email_prompts", "min_score", "send_window_start", "send_window_end", "send_timezone"]
         widgets = {"initial_email_prompts": forms.CheckboxSelectMultiple}
 
     def __init__(self, *args, **kwargs):
@@ -219,19 +217,17 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
     fieldsets = [
         (None, {"fields": ["name", "target_country", "target_locations", "search_terms"]}),
         ("Leads", {"fields": ["lead_source", "min_score"],
-                   "description": "Built-in browser: this app opens Google Maps in its own Chromium. Scraper "
-                                  "container: the Google Maps scraper Docker service does it (MAPS_SCRAPER_URL, port "
-                                  "8001 by default). Both save the same details. Businesses scoring below the minimum "
-                                  "score wait for you to approve or reject them (Businesses > Needs review)."}),
+                   "description": "Scraper container: the Google Maps scraper on your server finds the businesses "
+                                  "(MAPS_SCRAPER_URL); the built-in browser only works on a machine with Chromium, not "
+                                  "on Vercel. Businesses scoring below the minimum score wait for you to approve or "
+                                  "reject them (Businesses > Needs review)."}),
         ("Prompts", {"fields": ["campaign_prompt", "initial_email_prompts"],
                      "description": "Campaign prompt: qualifies businesses. Initial-email prompts: write the first "
                                     "email; with several, prospects are split equally (A/B test) and each keeps its "
                                     "prompt. Follow-up prompts are chosen per step in the Follow-ups table below."}),
-        ("Sending", {"fields": [("gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds"), "daily_cap",
-                                ("send_window_start", "send_window_end"), "send_timezone"],
-                     "description": "Each approved email gets a send time: the campaign's previous one plus the fixed "
-                                    "gap plus a random gap between the two values (e.g. 120 s + 180-300 s), only inside "
-                                    "the send window, and at most the daily cap per day. GoHighLevel sends it then."}),
+        ("Sending", {"fields": [("send_window_start", "send_window_end"), "send_timezone"],
+                     "description": "Each approved email gets a send time inside this window. The daily cap and the "
+                                    "gaps between emails are the same for all campaigns: Settings in the sidebar."}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
     actions = ["run_pipeline", "fetch_businesses", "fetch_with_browser", "fetch_with_scraper"]
@@ -412,7 +408,7 @@ class ProspectInline(ReadOnlyInline):
 class EmailInline(ReadOnlyInline):
     model = Email
     fk_name = "business"
-    fields = ["recipient", "subject", "status", "sent_at", "open_count"]
+    fields = ["recipient", "subject", "status", "sent_at"]
     readonly_fields = fields
 
 
@@ -520,7 +516,6 @@ class EmailsFilter(ChoiceFilter):
         ("review", "Email in review", Q(emails__status="in_review")),
         ("approved", "Email approved", Q(emails__status="approved")),
         ("sent", "Email sent", Q(emails__status__in=["sent", "opened"])),
-        ("opened", "Email opened", Q(emails__status="opened")),
         ("none", "No email yet", Q(emails__isnull=True)),
     ]
 
@@ -557,10 +552,10 @@ class BusinessAdmin(PipelineAdmin):
     search_fields = ["name", "category", "city", "state", "address", "domain", "phone", "website_url"]
     change_list_template = "admin/pipeline/business/change_list.html"
     readonly_fields = ["created_at", "updated_at", "first_discovered_at", "last_discovered_at", "profile_link",
-                       "opening_hours_display"]
+                       "opening_hours_display", "team_size", "languages"]
     fieldsets = [
         (None, {"fields": ["discovery_campaign", "name", "category", "website_url", "domain", "phone", "profile_link",
-                           "review_status"]}),
+                           "review_status", "team_size", "languages"]}),
         ("Location", {"fields": ["address", "city", "state", "country", "postal_code", "latitude", "longitude"]}),
         ("Google Maps", {"fields": ["google_place_id", "google_maps_url", "google_rating", "google_review_count",
                                     "opening_hours_display", "source", "source_url"], "classes": ["collapse"]}),
@@ -664,6 +659,16 @@ class BusinessAdmin(PipelineAdmin):
         score = f", score {profile.qualification_score}" if profile.qualification_score is not None else ""
         return admin_link(profile, f"{profile.get_status_display()}{score}")
 
+    @admin.display(description="Team size")
+    def team_size(self, obj):
+        profile = self._profile(obj) if obj.pk else None
+        return profile.team_size if profile and profile.team_size is not None else "-"
+
+    @admin.display(description="Languages")
+    def languages(self, obj):
+        profile = self._profile(obj) if obj.pk else None
+        return ", ".join(profile.languages) if profile and profile.languages else "-"
+
     @admin.display(description="Opening hours")
     def opening_hours_display(self, obj):
         return pretty_json(obj.opening_hours)
@@ -726,15 +731,17 @@ class BusinessSourceAdmin(PipelineAdmin):
 
 @admin.register(BusinessWebsiteProfile)
 class BusinessWebsiteProfileAdmin(PipelineAdmin):
-    list_display = ["business", "status_badge", "qualification_score", "pages_scraped", "contact_discovery_status",
-                    "updated_at"]
+    list_display = ["business", "status_badge", "qualification_score", "team_size", "languages_display", "pages_scraped",
+                    "contact_discovery_status", "updated_at"]
     list_filter = ["status", "contact_discovery_status"]
     search_fields = ["business__name", "business__domain"]
     list_select_related = ["business"]
     readonly_fields = ["business", "pages_scraped", "created_at", "updated_at", "contact_discovery_at",
-                       "reasons_display", "findings_display", "emails_display", "urls_display", "links_display"]
+                       "reasons_display", "findings_display", "emails_display", "urls_display", "links_display",
+                       "team_size", "languages_display"]
     fieldsets = [
-        (None, {"fields": ["business", "status", "qualification_score", "reasons_display", "agent_reasoning"]}),
+        (None, {"fields": ["business", "status", "qualification_score", "reasons_display", "agent_reasoning",
+                           "team_size", "languages_display"]}),
         ("What the agent read", {"fields": ["pages_scraped", "urls_display", "findings_display", "emails_display",
                                             "links_display"]}),
         ("Contact discovery (Module 3)", {"fields": ["contact_discovery_status", "contact_discovery_at"]}),
@@ -748,6 +755,10 @@ class BusinessWebsiteProfileAdmin(PipelineAdmin):
     @admin.display(description="Status", ordering="status")
     def status_badge(self, obj):
         return badge(obj.status, obj.get_status_display())
+
+    @admin.display(description="Languages")
+    def languages_display(self, obj):
+        return ", ".join(obj.languages) if obj.languages else "-"
 
     @admin.display(description="Qualification reasons")
     def reasons_display(self, obj):
@@ -1012,14 +1023,14 @@ class ProspectAdmin(PipelineAdmin):
         self.message_user(request, f"{count} prospect(s) can be contacted again.")
 
 
-# ---------------------------------------------------------------- Module 5: emails and opens
+# ---------------------------------------------------------------- Module 5: emails
 
 
 class EmailReviewForm(forms.ModelForm):
     body = forms.CharField(
         widget=forms.Textarea(attrs={"rows": 16, "class": "vLargeTextField"}),
         max_length=review.MAX_BODY,
-        help_text="The Axioware footer and the tracking image are added automatically below the body. "
+        help_text="The Axioware footer is added automatically below the body. "
                   "Saving sends the email back to review.",
     )
 
@@ -1040,12 +1051,19 @@ class EmailReviewForm(forms.ModelForm):
         return subject
 
 
-class OpenEventInline(ReadOnlyInline):
-    model = EmailOpenEvent
-    fields = ["opened_at", "user_agent"]
-    readonly_fields = fields
-    show_change_link = False
-    max_num = 0
+class EmailStatusFilter(admin.SimpleListFilter):
+    """The statuses emails can be in now (old SMTP/open-tracking ones only when some email still has them)."""
+
+    title = "status"
+    parameter_name = "status__exact"  # the same as the status chips above the list
+
+    def lookups(self, request, model_admin):
+        used = set(Email.objects.filter(status__in=review.LEGACY_STATUSES).values_list("status", flat=True).distinct())
+        return [(status, Email.Status(status).label) for status in review.STATUS_ORDER
+                if status not in review.LEGACY_STATUSES or status in used]
+
+    def queryset(self, request, queryset):
+        return queryset.filter(status=self.value()) if self.value() else queryset
 
 
 @admin.register(Email)
@@ -1054,17 +1072,15 @@ class EmailAdmin(PipelineAdmin):
     list_display = ["id", "business", "recipient", "subject_short", "step", "email_prompt", "status_badge",
                     "scheduled_at", "sent_at", "edited"]
     list_display_links = ["id", "subject_short"]
-    list_filter = ["status", "sequence_step", "email_prompt", "generation_provider"]
+    list_filter = [EmailStatusFilter, "sequence_step", "email_prompt", "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
     list_select_related = ["business", "prospect", "email_prompt"]
     actions = ["approve_selected", "hand_over_selected", "reject_selected", "mark_replied_selected"]
-    inlines = [OpenEventInline]
     change_form_template = "admin/pipeline/email/change_form.html"
     change_list_template = "admin/pipeline/email/change_list.html"
     details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by", "email_prompt",
                "generated_at", "reviewed_at", "review_note", "edited_at"]
-    delivery = ["scheduled_at", "released_at", "ghl_error", "sent_at", "sent_from", "message_id", "send_error", "open_count", "first_opened_at", "last_opened_at",
-                "tracking_token"]
+    delivery = ["scheduled_at", "released_at", "ghl_error", "sent_at"]
 
     def has_add_permission(self, request):
         return False  # emails are written by generate_emails
@@ -1147,9 +1163,9 @@ class EmailAdmin(PipelineAdmin):
     def changelist_view(self, request, extra_context=None):
         counts = review.status_counts()
         chips = [{"status": status, "label": Email.Status(status).label, "count": counts[status]}
-                 for status in review.STATUS_ORDER]
-        extra_context = {**(extra_context or {}), "status_chips": chips, "email_total": sum(counts.values()),
-                         "open_rate": review.open_rate(counts), "open_tracking": generation.OPEN_TRACKING}
+                 for status in review.STATUS_ORDER
+                 if status not in review.LEGACY_STATUSES or counts[status]]  # old SMTP/open-tracking states, if any
+        extra_context = {**(extra_context or {}), "status_chips": chips, "email_total": sum(counts.values())}
         return super().changelist_view(request, extra_context=extra_context)
 
     @admin.display(description="Step", ordering="sequence_step")
@@ -1267,24 +1283,6 @@ class EmailAdmin(PipelineAdmin):
         return self._review_action(request, object_id, review.hand_over)
 
 
-@admin.register(EmailOpenEvent)
-class EmailOpenEventAdmin(PipelineAdmin):
-    list_display = ["email", "opened_at", "user_agent_short"]
-    search_fields = ["email__recipient", "user_agent"]
-    list_select_related = ["email"]
-    date_hierarchy = "opened_at"
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
-
-    @admin.display(description="User agent")
-    def user_agent_short(self, obj):
-        return Truncator(obj.user_agent or "").chars(90)
-
-
 # ---------------------------------------------------------------- pipeline runs
 
 
@@ -1308,6 +1306,34 @@ class PipelineRunForm(forms.ModelForm):
             except ValueError as error:
                 raise forms.ValidationError(str(error)) from error
         return cleaned
+
+
+@admin.register(SendingSettings)
+class SendingSettingsAdmin(admin.ModelAdmin):
+    """The Settings page: one row, opened straight from the sidebar."""
+
+    fieldsets = [
+        ("Sending (all campaigns together)", {
+            "fields": ["daily_cap", "gap_fixed_seconds", ("gap_random_min_seconds", "gap_random_max_seconds")],
+            "description": "Each approved email gets a send time: the latest planned send of any campaign plus the "
+                           "fixed gap plus a random gap between the two values (e.g. 120 s + 180-300 s), inside its "
+                           "campaign's send window, and at most the daily cap per day for all campaigns together. "
+                           "GoHighLevel sends it then. Changes apply to emails approved from now on."}),
+    ]
+    readonly_fields = ["updated_at"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        return HttpResponseRedirect(reverse("admin:pipeline_sendingsettings_change", args=[SendingSettings.current().pk]))
+
+    def response_change(self, request, obj):
+        self.message_user(request, "Settings saved.", messages.SUCCESS)
+        return HttpResponseRedirect(reverse("admin:pipeline_sendingsettings_change", args=[obj.pk]))
 
 
 @admin.register(PipelineRun)

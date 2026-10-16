@@ -19,6 +19,7 @@ from rest_framework.test import APIClient
 
 from pipeline import jobs, review
 from pipeline.models import (
+    SendingSettings,
     Business,
     BusinessWebsiteProfile,
     DiscoveryCampaign,
@@ -119,8 +120,7 @@ class OutreachCase(TestCase):
         self.addCleanup(env.stop)
         self.initial = make_email_prompt("Initial A", "INITIAL A")
         self.follow = make_email_prompt("Follow 1", "FOLLOW 1", kind="follow_up")
-        self.campaign = make_campaign(name="Clinics", initial_prompts=[self.initial], gap_fixed_seconds=120,
-                                      gap_random_min_seconds=180, gap_random_max_seconds=300, daily_cap=40)
+        self.campaign = make_campaign(name="Clinics", initial_prompts=[self.initial])  # default Settings: 120 s + 180-300 s, 40 a day
         FollowUp.objects.create(campaign=self.campaign, sequence=1, days_after_previous=3, email_prompt=self.follow)
         self.api = APIClient()
 
@@ -153,8 +153,8 @@ class ScheduleTests(OutreachCase):
                          start + timedelta(hours=5))  # far later than the gap: the earliest time wins
 
     def test_send_window_and_daily_cap(self):
-        DiscoveryCampaign.objects.filter(pk=self.campaign.pk).update(
-            send_window_start=dt_time(9), send_window_end=dt_time(18), daily_cap=2)
+        DiscoveryCampaign.objects.filter(pk=self.campaign.pk).update(send_window_start=dt_time(9), send_window_end=dt_time(18))
+        SendingSettings.objects.update_or_create(pk=1, defaults={"daily_cap": 2})
         self.campaign.refresh_from_db()
         night = datetime(2026, 10, 20, 21, 0, tzinfo=KARACHI)
         slot = outreach.next_slot(self.campaign, night)
@@ -166,6 +166,19 @@ class ScheduleTests(OutreachCase):
             Email.objects.filter(pk=email.pk).update(scheduled_at=datetime(2026, 10, 21, 9, minute, tzinfo=KARACHI))
         full = outreach.next_slot(self.campaign, datetime(2026, 10, 21, 9, 30, tzinfo=KARACHI))
         self.assertEqual(full, datetime(2026, 10, 22, 9, 0, tzinfo=KARACHI))  # cap of 2 reached that day
+
+    def test_cap_and_gaps_count_every_campaign(self):
+        """One mailbox sends for all campaigns: another campaign's emails take the gap and the daily cap too."""
+        SendingSettings.objects.update_or_create(pk=1, defaults={"daily_cap": 1, "gap_fixed_seconds": 600,
+                                                                 "gap_random_min_seconds": 0,
+                                                                 "gap_random_max_seconds": 0})
+        other = make_campaign(name="Other", initial_prompts=[self.initial])
+        theirs = make_email("scheduled", campaign=other)
+        start = datetime(2026, 10, 20, 10, 0, tzinfo=KARACHI)
+        Email.objects.filter(pk=theirs.pk).update(scheduled_at=start)
+        self.assertEqual(outreach.next_slot(self.campaign, start), datetime(2026, 10, 21, 0, 0, tzinfo=KARACHI))
+        SendingSettings.objects.filter(pk=1).update(daily_cap=40)
+        self.assertEqual(outreach.next_slot(self.campaign, start), start + timedelta(seconds=600))
 
     def test_approve_hands_the_email_to_ghl(self):
         email = self.email()

@@ -15,7 +15,6 @@ from pipeline.models import (
     BusinessWebsiteProfile,
     DiscoveryCampaign,
     Email,
-    EmailOpenEvent,
     PipelineRun,
     Prospect,
 )
@@ -59,18 +58,44 @@ class AdminCase(TestCase):
 class AdminPagesTests(AdminCase):
     def test_every_model_has_working_list_and_detail_pages(self):
         email = make_email("sent")
-        EmailOpenEvent.objects.create(email=email, user_agent="Mail")
         BusinessSource.objects.create(business=email.business, source="google_maps", raw_data={"name": "x"})
         run = PipelineRun.objects.create(command="send_emails", arguments=[], status="succeeded", output="done")
         objects = [email.business.discovery_campaign, email.business, email.business.sources.first(),
-                   email.business.website_profile, email.contact, email.prospect, email, email.open_events.first(), run]
+                   email.business.website_profile, email.contact, email.prospect, email, run]
         for obj in objects:
             name = obj._meta.model_name
             changelist = self.client.get(reverse(f"admin:pipeline_{name}_changelist"))
             self.assertEqual(changelist.status_code, 200, name)
             detail = self.client.get(reverse(f"admin:pipeline_{name}_change", args=[obj.pk]))
             self.assertEqual(detail.status_code, 200, name)
-        self.assertEqual(self.client.get(reverse("admin:index")).status_code, 200)
+        index = self.client.get(reverse("admin:index"))
+        self.assertEqual(index.status_code, 200)
+        page = index.content.decode()
+        self.assertNotIn("Email open events", page)  # open tracking is off: nothing to show
+        self.assertIn("Settings", page)
+        detail = self.client.get(reverse("admin:pipeline_email_change", args=[email.pk])).content.decode()
+        for unused in ("Open count", "Sent from", "Message id", "Tracking token"):
+            self.assertNotIn(unused, detail)
+
+    def test_settings_page_is_the_one_settings_row(self):
+        from pipeline.models import SendingSettings
+
+        listing = self.client.get(reverse("admin:pipeline_sendingsettings_changelist"))
+        url = reverse("admin:pipeline_sendingsettings_change", args=[1])
+        self.assertRedirects(listing, url)
+        page = self.client.get(url).content.decode()
+        self.assertIn("all campaigns together", page)
+        self.assertNotIn("Delete", page)
+        saved = self.client.post(url, {"daily_cap": "25", "gap_fixed_seconds": "60", "gap_random_min_seconds": "10",
+                                       "gap_random_max_seconds": "20"}, follow=True)
+        self.assertContains(saved, "Settings saved.")
+        current = SendingSettings.current()
+        self.assertEqual((current.daily_cap, current.gap_fixed_seconds, current.gap_random_max_seconds), (25, 60, 20))
+        bad = self.client.post(url, {"daily_cap": "25", "gap_fixed_seconds": "60", "gap_random_min_seconds": "300",
+                                     "gap_random_max_seconds": "100"})
+        self.assertContains(bad, "Must be at least the minimum random gap")
+        self.assertEqual(SendingSettings.objects.count(), 1)
+        self.assertEqual(self.client.get(reverse("admin:pipeline_sendingsettings_add")).status_code, 403)
 
     def test_admin_requires_staff(self):
         self.client.logout()
@@ -184,14 +209,15 @@ class PipelineActionTests(AdminCase):
 
 
 class EmailReviewTests(AdminCase):
-    def test_list_shows_counts_open_rate_and_filters_by_status(self):
+    def test_list_shows_counts_and_filters_by_status(self):
         self.email("in_review", subject="Review me")
         self.email("approved", subject="Ready to go")
         url = reverse("admin:pipeline_email_changelist")
         page = self.client.get(url, {"status__exact": "in_review"}).content.decode()
         self.assertIn("Review me", page)
         self.assertNotIn("Ready to go", page)
-        self.assertIn("Open rate", page)
+        self.assertNotIn("Open rate", page)  # open tracking is off
+        self.assertNotIn("Opened", page)  # no chip for a status nothing uses
         both = self.client.get(url).content.decode()
         self.assertIn("Review me", both)
         self.assertIn("Ready to go", both)
@@ -339,18 +365,6 @@ class EmailReviewTests(AdminCase):
         self.assertEqual(self.row(eid)["status"], "approved")  # no send view: the admin just redirects
 
     @mock.patch("pipeline.services.generation.OPEN_TRACKING", True)
-    def test_opens_are_shown(self):
-        eid = self.email("approved")
-        Email.objects.filter(pk=eid).update(status="sent", sent_at=timezone.now())  # sent elsewhere
-        from django.db import connection
-
-        with connection.cursor() as cursor:
-            cursor.execute("select record_email_open(tracking_token, 'Apple Mail') from emails where id=%s", [eid])
-        page = self.client.get(self.change_url(eid)).content.decode()
-        self.assertIn("Apple Mail", page)
-        self.assertIn("Opened", page)
-        self.assertIn("100%", self.client.get(reverse("admin:pipeline_email_changelist")).content.decode())
-
     def test_posts_without_the_csrf_token_are_refused(self):
         from django.test import Client
 

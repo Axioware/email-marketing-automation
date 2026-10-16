@@ -74,6 +74,30 @@ class AgentCallTests(unittest.TestCase):
             schema = kwargs["response_format"]["json_schema"]["schema"]
             self.assertIn("SCRAPE: read one more page", schema["properties"]["action"]["description"])
 
+    def test_team_size_and_languages_come_with_the_score(self):
+        content = ('{"action":"SCORE","url":null,"score":80,"reasons":["Small"],"reasoning":"ok","reason":null,'
+                   '"summary":"Clinic","relevant_findings":[],"team_size":6,'
+                   '"languages":["English"," Urdu ","english","Sindhi"]}')
+        client = mock.Mock()
+        client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=content))]
+        decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
+                                                                      must_score=False, system_prompt="SYS")
+        self.assertEqual((decision["team_size"], decision["languages"]), (6, ["English", "Urdu", "Sindhi"]))
+        schema = client.chat.completions.create.call_args.kwargs["response_format"]["json_schema"]["schema"]
+        self.assertIn("team_size", schema["required"])  # strict schemas need every field, null when not stated
+        self.assertIn("languages", schema["required"])
+        unstated = content.replace('"team_size":6', '"team_size":null').replace(
+            '"languages":["English"," Urdu ","english","Sindhi"]', '"languages":[]')
+        client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=unstated))]
+        decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
+                                                                      must_score=False, system_prompt="SYS")
+        self.assertEqual((decision["team_size"], decision["languages"]), (None, None))
+        older = content.replace(',"team_size":6,"languages":["English"," Urdu ","english","Sindhi"]', "")
+        client.chat.completions.create.return_value.choices = [mock.Mock(message=mock.Mock(content=older))]
+        decision = research_business_websites.validate_agent_response(client, "m", {"current_page_url": "https://x.com/"},
+                                                                      must_score=False, system_prompt="SYS")
+        self.assertEqual((decision["team_size"], decision["languages"]), (None, None))  # left out: null
+
     def test_answer_refused_by_groqs_schema_check_is_used_when_only_a_null_field_is_missing(self):
         import httpx
         from openai import BadRequestError

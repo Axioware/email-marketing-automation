@@ -81,8 +81,7 @@ class ModelTests(PromptCase):
         from django.core.exceptions import ValidationError
 
         campaign = make_campaign()
-        for values, field in (({"gap_random_min_seconds": 400, "gap_random_max_seconds": 300}, "gap_random_max_seconds"),
-                              ({"min_score": 101}, "min_score"),
+        for values, field in (({"min_score": 101}, "min_score"),
                               ({"send_window_start": dt_time(18), "send_window_end": dt_time(9)}, "send_window_end"),
                               ({"send_window_start": dt_time(9)}, "send_window_end"),
                               ({"send_timezone": "Mars/Base"}, "send_timezone")):
@@ -194,25 +193,40 @@ class CampaignAdminTests(PromptCase):
         self.assertIn(reverse("admin:pipeline_campaignprompt_add"), page.content.decode())  # the + (create) link
         response = self.client.post(url, {**CAMPAIGN_INLINE, "name": "A/B", "campaign_prompt": campaign_prompt.pk,
                                           "initial_email_prompts": [first.pk, other.pk], "min_score": "65",
-                                          "gap_fixed_seconds": "60", "gap_random_min_seconds": "10",
-                                          "gap_random_max_seconds": "20", "daily_cap": "25",
                                           "send_window_start": "09:00", "send_window_end": "18:00",
                                           "send_timezone": "Asia/Karachi"})
         self.assertEqual(response.status_code, 302, response.content[:300])
         created = DiscoveryCampaign.objects.get(name="A/B")
         self.assertEqual(created.campaign_prompt, campaign_prompt)
         self.assertEqual(set(created.initial_email_prompts.all()), {first, other})
-        self.assertEqual((created.min_score, created.gap_fixed_seconds, created.daily_cap, str(created.send_window_end)),
-                         (65, 60, 25, "18:00:00"))
-        bad = self.client.post(url, {**CAMPAIGN_INLINE, "name": "Bad", "gap_random_min_seconds": "300",
-                                     "gap_random_max_seconds": "100"})
-        self.assertContains(bad, "Must be at least the minimum random gap")
+        self.assertEqual((created.min_score, str(created.send_window_end)), (65, "18:00:00"))
+        bad = self.client.post(url, {**CAMPAIGN_INLINE, "name": "Bad", "send_window_start": "18:00",
+                                     "send_window_end": "09:00"})
+        self.assertContains(bad, "The end must be later than the start")
+        self.assertNotIn("daily_cap", self.client.get(url).content.decode())  # global: the Settings page
         defaults = self.client.post(url, {**CAMPAIGN_INLINE, "name": "Defaults"})
         self.assertEqual(defaults.status_code, 302)
         made = DiscoveryCampaign.objects.get(name="Defaults")
-        self.assertEqual((made.min_score, made.gap_fixed_seconds, made.gap_random_min_seconds,
-                          made.gap_random_max_seconds, made.daily_cap, made.send_timezone),
-                         (50, 120, 180, 300, 40, "Asia/Karachi"))
+        self.assertEqual((made.min_score, made.send_timezone), (50, "Asia/Karachi"))
+
+    def test_sending_settings_validation(self):
+        from django.core.exceptions import ValidationError
+
+        from pipeline.models import SendingSettings
+
+        current = SendingSettings.current()
+        self.assertEqual((current.daily_cap, current.gap_fixed_seconds, current.gap_random_min_seconds,
+                          current.gap_random_max_seconds), (40, 120, 180, 300))
+        for values, field in (({"gap_random_min_seconds": 400, "gap_random_max_seconds": 300}, "gap_random_max_seconds"),
+                              ({"daily_cap": 0}, "daily_cap")):
+            row = SendingSettings.current()
+            for key, value in values.items():
+                setattr(row, key, value)
+            with self.assertRaises(ValidationError, msg=values) as caught:
+                row.clean()
+            self.assertIn(field, caught.exception.message_dict)
+        SendingSettings(daily_cap=10).save()  # saving another one keeps the single row
+        self.assertEqual((SendingSettings.objects.count(), SendingSettings.current().daily_cap), (1, 10))
 
     def test_new_prompts_start_empty(self):
         self.assertNotIn("prompt", self.client.get(reverse("admin:pipeline_campaignprompt_add")).context["adminform"]
@@ -340,8 +354,7 @@ class PromptApiTests(PromptCase):
                                        format="json").status_code, 400)
         campaign = self.api.post("/api/campaigns/", {
             "name": "Spa campaign", "campaign_prompt": created["id"], "initial_email_prompts": [first.json()["id"]],
-            "min_score": 70, "gap_fixed_seconds": 120, "gap_random_min_seconds": 180, "gap_random_max_seconds": 300,
-            "daily_cap": 30, "send_window_start": "09:00", "send_window_end": "18:00"}, format="json")
+            "min_score": 70, "send_window_start": "09:00", "send_window_end": "18:00"}, format="json")
         self.assertEqual(campaign.status_code, 201, campaign.content)
         self.assertEqual((campaign.json()["min_score"], campaign.json()["send_timezone"]), (70, "Asia/Karachi"))
         self.assertEqual(self.api.get(f"/api/campaign-prompts/{created['id']}/").json()["campaigns"],

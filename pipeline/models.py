@@ -118,11 +118,6 @@ class DiscoveryCampaign(models.Model):
     min_score = models.PositiveSmallIntegerField(
         default=50, db_default=50, help_text="Businesses scoring at least this go on to finding decision makers; lower ones wait "
                               "for a person to approve or reject them.")
-    gap_fixed_seconds = models.PositiveIntegerField(default=120, db_default=120, help_text="Fixed gap between two sends, in seconds.")
-    gap_random_min_seconds = models.PositiveIntegerField(default=180, db_default=180, help_text="Plus a random gap of at least this "
-                                                                                "many seconds...")
-    gap_random_max_seconds = models.PositiveIntegerField(default=300, db_default=300, help_text="...and at most this many seconds.")
-    daily_cap = models.PositiveIntegerField(default=40, db_default=40, help_text="Most emails this campaign sends in one day.")
     send_window_start = models.TimeField(null=True, blank=True, help_text="Send only between these times (campaign "
                                                                           "time zone); empty: any time of day.")
     send_window_end = models.TimeField(null=True, blank=True)
@@ -149,9 +144,6 @@ class DiscoveryCampaign(models.Model):
             models.CheckConstraint(condition=models.Q(lead_source__in=["browser", "scraper_api"]),
                                    name="ck_discovery_campaigns_lead_source"),
             models.CheckConstraint(condition=models.Q(min_score__lte=100), name="ck_discovery_campaigns_min_score"),
-            models.CheckConstraint(condition=models.Q(gap_random_min_seconds__lte=models.F("gap_random_max_seconds")),
-                                   name="ck_discovery_campaigns_gap"),
-            models.CheckConstraint(condition=models.Q(daily_cap__gte=1), name="ck_discovery_campaigns_daily_cap"),
             models.CheckConstraint(
                 condition=models.Q(send_window_start__isnull=True, send_window_end__isnull=True)
                 | models.Q(send_window_start__isnull=False, send_window_end__isnull=False,
@@ -164,9 +156,6 @@ class DiscoveryCampaign(models.Model):
 
     def clean(self):
         errors = {}
-        if self.gap_random_min_seconds is not None and self.gap_random_max_seconds is not None \
-                and self.gap_random_min_seconds > self.gap_random_max_seconds:
-            errors["gap_random_max_seconds"] = "Must be at least the minimum random gap."
         if self.min_score is not None and self.min_score > 100:
             errors["min_score"] = "Scores go from 0 to 100."
         if (self.send_window_start is None) != (self.send_window_end is None):
@@ -179,6 +168,48 @@ class DiscoveryCampaign(models.Model):
             errors["send_timezone"] = "Unknown time zone; use a name like Asia/Karachi."
         if errors:
             raise ValidationError(errors)
+
+
+class SendingSettings(models.Model):
+    """How fast emails go out, for all campaigns together (GoHighLevel sends them all from one mailbox). One row,
+    edited on the admin's Settings page (or the API's /api/settings/); read it with SendingSettings.current()."""
+
+    daily_cap = models.PositiveIntegerField(default=40, help_text="Most emails sent in one day, all campaigns together "
+                                                                  "(the day in each campaign's time zone).")
+    gap_fixed_seconds = models.PositiveIntegerField(default=120, help_text="Fixed gap between two sends, in seconds.")
+    gap_random_min_seconds = models.PositiveIntegerField(default=180, help_text="Plus a random gap of at least this many "
+                                                                               "seconds...")
+    gap_random_max_seconds = models.PositiveIntegerField(default=300, help_text="...and at most this many seconds.")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sending_settings"
+        verbose_name = "sending settings"
+        verbose_name_plural = "settings"
+        constraints = [
+            models.CheckConstraint(condition=models.Q(id=1), name="ck_sending_settings_single_row"),
+            models.CheckConstraint(condition=models.Q(daily_cap__gte=1), name="ck_sending_settings_daily_cap"),
+            models.CheckConstraint(condition=models.Q(gap_random_min_seconds__lte=models.F("gap_random_max_seconds")),
+                                   name="ck_sending_settings_gap"),
+        ]
+
+    def __str__(self):
+        return "Sending settings"
+
+    @classmethod
+    def current(cls) -> "SendingSettings":
+        return cls.objects.get_or_create(pk=1)[0]
+
+    def save(self, *args, **kwargs):
+        self.pk = 1  # there is only one
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        if self.gap_random_min_seconds is not None and self.gap_random_max_seconds is not None \
+                and self.gap_random_min_seconds > self.gap_random_max_seconds:
+            raise ValidationError({"gap_random_max_seconds": "Must be at least the minimum random gap."})
+        if self.daily_cap is not None and self.daily_cap < 1:
+            raise ValidationError({"daily_cap": "At least one email a day."})
 
 
 class Business(models.Model):
@@ -273,6 +304,12 @@ class BusinessWebsiteProfile(models.Model):
     qualification_score = models.IntegerField(null=True, blank=True)
     qualification_reasons = models.JSONField(default=list, blank=True)
     agent_reasoning = models.TextField(null=True, blank=True)
+    team_size = models.PositiveIntegerField(null=True, blank=True,
+                                            help_text="Staff the website or listing states (as scored); empty when not "
+                                                      "stated.")
+    languages = models.JSONField(null=True, blank=True,
+                                 help_text='Languages the clinic says it offers, e.g. ["English", "Urdu"]; empty when '
+                                           "not stated.")
     contact_discovery_status = models.CharField(
         max_length=32, choices=DiscoveryStatus.choices, null=True, blank=True, db_index=True,
         help_text="Set by contact discovery (Module 3). Clear it to let discovery run again.",

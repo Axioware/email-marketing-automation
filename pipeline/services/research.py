@@ -92,6 +92,12 @@ class AgentResponse(BaseModel):
                                                    "and why (must_score_reason); null otherwise.")
     reason: str | None = Field(..., description="SCRAPE: why that page is worth reading. EXIT: why the website cannot "
                                                 "be used. Null for SCORE.")
+    team_size: int | None = Field(..., ge=1, description="SCORE only: how many staff the content states (e.g. people "
+                                                         "listed on a team page, or a stated number); null when not "
+                                                         "stated or for SCRAPE/EXIT.")
+    languages: list[str] | None = Field(..., description="SCORE only: languages the clinic says it offers patients, "
+                                                         "e.g. [\"English\", \"Urdu\"]; null when not stated or for "
+                                                         "SCRAPE/EXIT.")
     summary: str = Field(..., min_length=1, description="What the current page says about the business, in a "
                                                         "sentence or two.")
     relevant_findings: list[str] = Field(..., description="Facts from the current page that matter for the score "
@@ -345,8 +351,20 @@ def prompt_context(context: dict) -> dict:
     return payload
 
 
-NULLABLE_FIELDS = ("url", "score", "reasons", "reasoning", "reason")
+NULLABLE_FIELDS = ("url", "score", "reasons", "reasoning", "reason", "team_size", "languages")
+MAX_LANGUAGES = 10
 PAGE_LIMIT_NOTE = "the five-page limit was reached"
+
+
+def clean_languages(languages: list[str] | None) -> list[str] | None:
+    """The languages as stated, trimmed, each once (case-insensitively); None when there are none."""
+    cleaned, seen = [], set()
+    for item in languages or []:
+        name = " ".join(str(item).split())[:40]
+        if name and name.casefold() not in seen:
+            seen.add(name.casefold())
+            cleaned.append(name)
+    return cleaned[:MAX_LANGUAGES] or None
 
 
 def parse_decision(content: str) -> "AgentResponse":
@@ -429,6 +447,8 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                     "qualification_score": decision.score,
                     "qualification_reasons": decision.reasons,
                     "agent_reasoning": reasoning,
+                    "team_size": decision.team_size,
+                    "languages": clean_languages(decision.languages),
                 }
             feedback = "SCORE requires score, reasons, and reasoning; set url and reason to null."
             continue
@@ -446,6 +466,8 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                 "qualification_score": None,
                 "qualification_reasons": [],
                 "agent_reasoning": decision.reason,
+                "team_size": None,
+                "languages": None,
             }
 
         if action == "SCRAPE" and not must_score:
@@ -648,6 +670,8 @@ def start_profile(business_id: int) -> int:
             "qualification_score": None,
             "qualification_reasons": [],
             "agent_reasoning": None,
+            "team_size": None,
+            "languages": None,
         },
     )
     return profile.pk
@@ -703,6 +727,8 @@ def finalize_profile(profile_id: int, result: dict) -> None:
         qualification_score=result["qualification_score"],
         qualification_reasons=result["qualification_reasons"],
         agent_reasoning=result["agent_reasoning"],
+        team_size=result.get("team_size"),
+        languages=result.get("languages"),
     )
 
 

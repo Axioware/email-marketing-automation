@@ -27,6 +27,7 @@ from pipeline.models import (
     EmailOpenEvent,
     PipelineRun,
     Prospect,
+    SendingSettings,
 )
 
 
@@ -288,6 +289,29 @@ class PipelineRunViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.
         return Response([jobs.describe_command(command) for command in jobs.COMMANDS])
 
 
+class SendingSettingsView(APIView):
+    """How fast emails go out, for all campaigns together: the daily cap and the gaps between sends (GET; PATCH or
+    PUT to change them)."""
+
+    @extend_schema(responses=s.SendingSettingsSerializer)
+    def get(self, request):
+        return Response(s.SendingSettingsSerializer(SendingSettings.current()).data)
+
+    @extend_schema(request=s.SendingSettingsSerializer, responses=s.SendingSettingsSerializer)
+    def patch(self, request):
+        return self.save(request, partial=True)
+
+    @extend_schema(request=s.SendingSettingsSerializer, responses=s.SendingSettingsSerializer)
+    def put(self, request):
+        return self.save(request, partial=False)
+
+    def save(self, request, partial):
+        serializer = s.SendingSettingsSerializer(SendingSettings.current(), data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
 class StatsView(APIView):
     """Counts across the whole pipeline."""
 
@@ -305,6 +329,5 @@ class StatsView(APIView):
             "contacts": BusinessContact.objects.count(),
             "prospects": by(Prospect.objects, "outreach_status"),
             "emails": email_counts,
-            "open_rate": review.open_rate(email_counts),
             "runs": by(PipelineRun.objects, "status"),
         })

@@ -118,6 +118,18 @@ class ResearchTests(TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("their campaigns have no campaign prompt", result.stderr)
 
+    def test_team_size_and_languages_are_saved_and_shown(self):
+        business = make_business(make_campaign(), "Clinic", website_url="https://clinic.pk")
+        profile_id = research.start_profile(business.pk)
+        research.finalize_profile(profile_id, {"pages_scraped": 1, "scraped_urls": [], "scraped_pages": [],
+                                               "discovered_links": [], "emails": [], "qualification_score": 70,
+                                               "qualification_reasons": [], "agent_reasoning": "ok", "team_size": 7,
+                                               "languages": ["English", "Urdu"]})
+        profile = BusinessWebsiteProfile.objects.get(pk=profile_id)
+        self.assertEqual((profile.team_size, profile.languages), (7, ["English", "Urdu"]))
+        research.start_profile(business.pk)  # researched again: cleared until the new answer
+        self.assertIsNone(BusinessWebsiteProfile.objects.get(pk=profile_id).team_size)
+
     def test_already_researched_business_explains_redo(self):
         business = make_business(make_campaign(), "Done", website_url="https://done.pk", score=70)
         with mock.patch.object(research, "make_llm_client", return_value=(mock.Mock(), "m", "groq")), \

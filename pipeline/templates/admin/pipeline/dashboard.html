@@ -27,15 +27,10 @@
       {% endif %}
     </div>
 
-    {% if worker %}
-    <p class="pipeline-source-status">Worker: {% if worker.alive %}<span class="pipeline-badge pipeline-succeeded">running</span> on {{ worker.name }}{% else %}<span class="pipeline-badge pipeline-failed">not running</span>{% if worker.last_seen %} (last seen {{ worker.last_seen|timesince }} ago){% endif %}{% endif %}. Pipeline runs started here execute on the worker.</p>
-    {% endif %}
-
     <div class="module">
       <h2>Get leads</h2>
       <p class="pipeline-source-status">
-        Two ways to find businesses on Google Maps: the <b>built-in browser</b> (this app's own Chromium) or the
-        <b>scraper container</b> at <code>{{ leads.scraper_url }}</code>:
+        Businesses are found on Google Maps by the <b>scraper container</b> at <code>{{ leads.scraper_url }}</code>{% if leads.browser %} or this machine's <b>built-in browser</b>{% endif %}:
         {% if leads.scraper_problem %}<span class="pipeline-badge pipeline-failed">{{ leads.scraper_problem }}</span>
         {% else %}<span class="pipeline-badge pipeline-succeeded">running</span>{% endif %}
       </p>
@@ -48,7 +43,7 @@
               <td>{{ row.campaign.get_lead_source_display }}</td>
               <td>{{ row.campaign.business_total }}</td>
               <td class="pipeline-leads-actions">
-                <a class="button" href="{{ row.browser_url }}">Built-in browser</a>
+                {% if leads.browser %}<a class="button" href="{{ row.browser_url }}">Built-in browser</a>{% endif %}
                 <a class="button{% if leads.scraper_problem %} pipeline-disabled{% endif %}" href="{{ row.scraper_url }}"
                    {% if leads.scraper_problem %}title="The scraper container is {{ leads.scraper_problem }}"{% endif %}>Scraper container</a>
               </td>

@@ -17,7 +17,7 @@ WORKER_STALE_AFTER = timedelta(minutes=2)  # no heartbeat for this long: the wor
 
 # Sidebar order: the pipeline's own order, then the supporting tables.
 MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
-               "pipelinerun", "emailopenevent", "businesssource"]
+               "pipelinerun", "sendingsettings", "businesssource"]
 
 
 def changelist(model_name: str, **filters) -> str:
@@ -34,8 +34,8 @@ def run_url(command: str, arguments: str = "") -> str:
 
 
 def lead_sources() -> dict:
-    """The "Get leads" panel: recent campaigns with a fetch button per lead source, and whether the scraper
-    container answers."""
+    """The "Get leads" panel: recent campaigns with a fetch button per lead source (the built-in browser only where
+    Chromium is available, not on Vercel), and whether the scraper container answers."""
     from pipeline.models import DiscoveryCampaign
     from pipeline.services import scraper_api
 
@@ -43,15 +43,9 @@ def lead_sources() -> dict:
         return run_url("fetch_businesses", f"--campaign-id {pk} --limit 20 --source {source}")
 
     campaigns = DiscoveryCampaign.objects.annotate(business_total=Count("businesses")).order_by("-created_at")[:8]
-    from pipeline import jobs
-
-    if jobs.queue_mode() and not settings.ON_VERCEL and scraper_api.is_local():  # the worker's container: its view counts
-        worker = worker_status()
-        problem = (worker["info"].get("scraper") if worker["alive"] else "not known (no worker running)")
-        problem = None if problem == "running" else problem
-    else:
-        problem = scraper_api.status(timeout=1.5)
+    problem = scraper_api.status(timeout=1.5)
     return {
+        "browser": not settings.ON_VERCEL,
         "campaigns": [{"campaign": campaign, "browser_url": fetch(campaign.pk, "browser"),
                        "scraper_url": fetch(campaign.pk, "scraper_api"),
                        "url": reverse("admin:pipeline_discoverycampaign_change", args=[campaign.pk])}
@@ -78,18 +72,14 @@ def worker_status() -> dict:
 def sequence_results() -> list[dict]:
     """Sent emails per step and initial-email prompt (the A/B group), with reply rates."""
     from pipeline.models import Email
-    from pipeline.services.generation import OPEN_TRACKING as tracking
-
     rows = (Email.objects.filter(sent_at__isnull=False)
             .values("sequence_step", "prospect__initial_email_prompt__name")
-            .annotate(sent=Count("id"), opened=Count("id", filter=Q(open_count__gt=0) | Q(status="opened")),
-                      replied=Count("id", filter=Q(status="replied")))
+            .annotate(sent=Count("id"), replied=Count("id", filter=Q(status="replied")))
             .order_by("sequence_step", "prospect__initial_email_prompt__name"))
     return [{
         "step": "First email" if row["sequence_step"] == 1 else f"Follow-up {row['sequence_step'] - 1}",
         "variation": row["prospect__initial_email_prompt__name"] or "-",
         "sent": row["sent"],
-        "open_rate": f"{round(100 * row['opened'] / row['sent'])}%" if tracking else "off",
         "replied": row["replied"],
         "reply_rate": round(100 * row["replied"] / row["sent"]),
     } for row in rows]
@@ -222,7 +212,7 @@ class PipelineAdminSite(admin.AdminSite):
             steps.append((f"{profiles['to_discover']} qualified business(es) still need a decision maker.",
                           "Find decision makers", run_url("find_stakeholders")))
         missing = Business.objects.filter(google_review_count__isnull=True).count()
-        if missing:
+        if missing and not settings.ON_VERCEL:  # refreshing Maps details needs the built-in browser
             steps.append((f"{missing} business(es) have no Google review count or category yet.",
                           "Refresh Google Maps details", run_url("refresh_businesses")))
         if to_research:
@@ -237,8 +227,14 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("The API is disabled: set AUTH_TOKEN in .env.")
         if make_llm_client() is None:
             warnings.append("No LLM key: set GROQ_API_KEY or OPENAI_API_KEY in .env (needed to research and write emails).")
-        if not os.environ.get("VERIFY_HELO") and not jobs.queue_mode():
+        if settings.ON_VERCEL and not (os.environ.get("REACHER_URL") and os.environ.get("REACHER_SECRET")):
+            warnings.append("Email verification is off: set REACHER_URL and REACHER_SECRET (your server's Reacher, "
+                            "once outbound port 25 is open there).")
+        elif not settings.ON_VERCEL and not os.environ.get("VERIFY_HELO"):
             warnings.append("VERIFY_HELO is not set in .env, so email verification cannot run.")
+        if not os.environ.get("SEARXNG_URL"):
+            warnings.append("SEARXNG_URL is not set: finding decision makers only reads the businesses' websites, "
+                            "with no web search.")
         if not ghl.configured():
             warnings.append("GoHighLevel is not set up: add GHL_API_KEY and GHL_LOCATION_ID to .env, or approved emails "
                             "are never sent.")
@@ -253,15 +249,12 @@ class PipelineAdminSite(admin.AdminSite):
         if uses_worker and not worker["alive"]:
             warnings.append("No worker is running: queued runs wait until `python manage.py run_worker` is started on "
                             "the machine with the browsers and Docker.")
-        if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
-            warnings.append("The open-tracking URL is unknown: set EMAIL_TRACKING_BASE_URL in .env.")
         leads = lead_sources()
         if leads["scraper_needed"] and leads["scraper_problem"]:
             warnings.append(f"A campaign gets its leads from the scraper container, but it is {leads['scraper_problem']} "
                             f"at {leads['scraper_url']}: start it, or set MAPS_SCRAPER_URL in .env.")
 
         return {
-            "worker": worker if uses_worker else None,
             "leads": leads,
             "results": sequence_results(),
             "funnel": funnel,
