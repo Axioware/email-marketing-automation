@@ -6,6 +6,7 @@ from pipeline.models import (
     Business,
     CampaignPrompt,
     EmailPrompt,
+    EmailSequence,
     FollowUp,
     BusinessContact,
     BusinessSource,
@@ -33,12 +34,26 @@ def string_list(value, field):
 class FollowUpSerializer(serializers.ModelSerializer):
     class Meta:
         model = FollowUp
-        fields = ["id", "campaign", "sequence", "days_after_previous", "email_prompt", "created_at", "updated_at"]
+        fields = ["id", "email_sequence", "sequence", "days_after_previous", "email_prompt", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
 
     def validate_email_prompt(self, value):
         if value is not None and value.kind != "follow_up":
-            raise serializers.ValidationError("Choose a follow-up prompt (kind follow_up).")
+            raise serializers.ValidationError("Choose a follow-up template (kind follow_up).")
+        return value
+
+
+class EmailSequenceSerializer(serializers.ModelSerializer):
+    follow_ups = FollowUpSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = EmailSequence
+        fields = ["id", "name", "initial_template", "follow_ups", "campaigns", "created_at", "updated_at"]
+        read_only_fields = ["campaigns", "created_at", "updated_at"]
+
+    def validate_initial_template(self, value):
+        if value is not None and value.kind != "initial":
+            raise serializers.ValidationError("Choose an initial-email template (kind initial).")
         return value
 
 
@@ -47,20 +62,13 @@ CAMPAIGN_SETTINGS = ["min_score", "send_window_start", "send_window_end", "send_
 
 class DiscoveryCampaignSerializer(serializers.ModelSerializer):
     business_count = serializers.IntegerField(read_only=True, source="businesses.count")
-    follow_ups = FollowUpSerializer(many=True, read_only=True)
 
     class Meta:
         model = DiscoveryCampaign
         fields = ["id", "name", "target_country", "target_locations", "search_terms", "status", "lead_source",
-                  "campaign_prompt", "initial_email_prompts", *CAMPAIGN_SETTINGS, "follow_ups", "business_count",
+                  "campaign_prompt", "email_sequences", *CAMPAIGN_SETTINGS, "business_count",
                   "created_at", "updated_at", "started_at", "completed_at"]
         read_only_fields = ["status", "created_at", "updated_at", "started_at", "completed_at"]
-
-    def validate_initial_email_prompts(self, value):
-        wrong = [prompt.name for prompt in value if prompt.kind != "initial"]
-        if wrong:
-            raise serializers.ValidationError(f"Not initial-email prompts: {', '.join(wrong)}.")
-        return value
 
     def validate(self, attrs):
         """The model's rules (send window, time zone, score range)."""
@@ -179,7 +187,7 @@ class ProspectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Prospect
         fields = "__all__"
-        read_only_fields = ["initial_email_prompt", "ghl_contact_id", "sequence_stopped_at", "sequence_stop_reason",
+        read_only_fields = ["email_sequence", "ghl_contact_id", "sequence_stopped_at", "sequence_stop_reason",
                             "email_verification_provider", "email_verified_at", "verdict", "verification_note",
                             "verification_details", "last_contacted_at", "created_at", "updated_at"]
 

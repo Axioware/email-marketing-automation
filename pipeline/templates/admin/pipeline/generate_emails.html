@@ -35,9 +35,9 @@
   <div class="module pipeline-help">
     <h2>Initial-email templates</h2>
     <table>
-      <thead><tr><th>Template</th><th>Used by campaigns</th></tr></thead>
+      <thead><tr><th>Template</th><th>Initial email of sequences</th></tr></thead>
       <tbody>{% for prompt in prompts %}
-        <tr><td><a href="{% url 'admin:pipeline_emailprompt_change' prompt.pk %}">{{ prompt.name }}</a></td><td>{{ prompt.initial_for_campaigns.all|join:", "|default:"-" }}</td></tr>
+        <tr><td><a href="{% url 'admin:pipeline_emailprompt_change' prompt.pk %}">{{ prompt.name }}</a></td><td>{{ prompt.initial_for_sequences.all|join:", "|default:"-" }}</td></tr>
       {% endfor %}</tbody>
     </table>
   </div>

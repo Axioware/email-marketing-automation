@@ -25,6 +25,7 @@ from pipeline.models import (
     Business,
     CampaignPrompt,
     EmailPrompt,
+    EmailSequence,
     FollowUp,
     BusinessContact,
     BusinessSource,
@@ -160,8 +161,8 @@ class DiscoveryCampaignForm(forms.ModelForm):
     class Meta:
         model = DiscoveryCampaign
         fields = ["name", "target_country", "target_locations", "search_terms", "lead_source", "campaign_prompt",
-                  "initial_email_prompts", "min_score", "send_window_start", "send_window_end", "send_timezone"]
-        widgets = {"initial_email_prompts": forms.CheckboxSelectMultiple}
+                  "email_sequences", "min_score", "send_window_start", "send_window_end", "send_timezone"]
+        widgets = {"email_sequences": forms.CheckboxSelectMultiple}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -208,6 +209,16 @@ class FollowUpInline(admin.TabularInline):
                            "initial email is sent and goes out no earlier than its days later)")
 
 
+def sequence_problems(sequence) -> list[str]:
+    """What an email sequence is missing to write its emails."""
+    problems = []
+    if sequence.initial_template_id is None:
+        problems.append(f"Sequence {sequence} has no initial-email template: its prospects get no email.")
+    problems += [f"Follow-up {step.sequence} of sequence {sequence} has no template; the sequence ends before it."
+                 for step in sequence.follow_ups.filter(email_prompt__isnull=True)]
+    return problems
+
+
 def prompt_problems(campaign) -> list[str]:
     """What a campaign is missing to qualify its businesses and write its emails and follow-ups."""
     if campaign is None or not campaign.pk:
@@ -216,11 +227,12 @@ def prompt_problems(campaign) -> list[str]:
     if campaign.campaign_prompt_id is None:
         problems.append("This campaign has no campaign prompt: its businesses will not be researched. Choose one "
                         "under Research and emails.")
-    if not campaign.initial_email_prompts.exists():
-        problems.append("This campaign has no initial-email template: no emails will be written. Choose at least one "
-                        "under Research and emails (several are split equally as an A/B test).")
-    problems += [f"Follow-up {step.sequence} has no template; the sequence ends before it. Choose one in the "
-                 "Follow-ups table." for step in campaign.follow_ups.filter(email_prompt__isnull=True)]
+    sequences = list(campaign.email_sequences.all())
+    if not sequences:
+        problems.append("This campaign has no email sequence: no emails will be written. Choose at least one under "
+                        "Research and emails (several are split equally as an A/B test).")
+    for sequence in sequences:
+        problems += sequence_problems(sequence)
     return problems
 
 
@@ -239,18 +251,17 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
                                   "(MAPS_SCRAPER_URL); the built-in browser only works on a machine with Chromium, not "
                                   "on Vercel. Businesses scoring below the minimum score wait for you to approve or "
                                   "reject them (Businesses > Needs review)."}),
-        ("Research and emails", {"fields": ["campaign_prompt", "initial_email_prompts"],
-                                 "description": "Campaign prompt: qualifies businesses (research). Initial-email "
-                                                "templates: the first email; with several, prospects are split equally "
-                                                "(A/B test) and each keeps its template. Follow-up templates are chosen "
-                                                "per step in the Follow-ups table below."}),
+        ("Research and emails", {"fields": ["campaign_prompt", "email_sequences"],
+                                 "description": "Campaign prompt: qualifies businesses (research). Email sequences: "
+                                                "the whole email flow (initial email, then its follow-ups); with "
+                                                "several, prospects are split equally (A/B test) and each keeps its "
+                                                "sequence to the end. Create and edit them under Email sequences."}),
         ("Sending", {"fields": [("send_window_start", "send_window_end"), "send_timezone"],
                      "description": "Each approved email gets a send time inside this window. The daily cap and the "
                                     "gaps between emails are the same for all campaigns: Settings in the sidebar."}),
         ("Progress", {"fields": ["status", "businesses_link", "started_at", "completed_at", "created_at", "updated_at"]}),
     ]
     actions = ["run_pipeline", "fetch_businesses", "fetch_with_browser", "fetch_with_scraper"]
-    inlines = [FollowUpInline]
     change_form_template = "admin/pipeline/discoverycampaign/change_form.html"
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
@@ -403,10 +414,10 @@ class EmailPromptForm(forms.ModelForm):
         kind = self.cleaned_data["kind"]
         instance = self.instance
         if instance.pk and kind != instance.kind:
-            if kind == "follow_up" and instance.initial_for_campaigns.exists():
-                raise forms.ValidationError("Campaigns use it for their initial email; remove it there first.")
+            if kind == "follow_up" and instance.initial_for_sequences.exists():
+                raise forms.ValidationError("Sequences use it for their initial email; remove it there first.")
             if kind == "initial" and instance.follow_up_steps.exists():
-                raise forms.ValidationError("Campaigns use it for a follow-up step; remove it there first.")
+                raise forms.ValidationError("Sequences use it for a follow-up step; remove it there first.")
         return kind
 
     def clean(self):
@@ -457,8 +468,8 @@ class EmailPromptAdmin(PipelineAdmin):
                                      "Hi {{first_name|there}}, ... {{business_short_name}}. {{name|fallback}} uses "
                                      "the fallback when the prospect has no value; without a fallback, a prospect "
                                      "with no value gets no email (the run says why). The footer is added "
-                                     "automatically. Campaigns choose initial-email templates (several = A/B test) "
-                                     "and one follow-up template per step."}),
+                                     "automatically. Email sequences use them: an initial-email template, then one "
+                                     "follow-up template per step."}),
         ("Preview", {"fields": ["preview"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
@@ -478,14 +489,76 @@ class EmailPromptAdmin(PipelineAdmin):
     def used_by(self, obj):
         if not obj.pk:
             return "-"
-        uses = [(admin_link(c), "initial email") for c in obj.initial_for_campaigns.all()]
-        uses += [(admin_link(step.campaign), f"follow-up {step.sequence}")
-                 for step in obj.follow_up_steps.select_related("campaign")]
+        uses = [(admin_link(sequence), "initial email") for sequence in obj.initial_for_sequences.all()]
+        uses += [(admin_link(step.email_sequence), f"follow-up {step.sequence}")
+                 for step in obj.follow_up_steps.select_related("email_sequence")]
         return format_html_join(", ", "{} ({})", uses) if uses else "Not used yet"
 
     @admin.display(description="Emails written", ordering="email_total")
     def email_count(self, obj):
         return changelist_link(Email, obj.email_total, email_prompt__id__exact=obj.pk)
+
+
+@admin.register(EmailSequence)
+class EmailSequenceAdmin(PipelineAdmin):
+    list_display = ["name", "initial_template", "steps", "used_by", "prospect_count", "updated_at"]
+    search_fields = ["name"]
+    list_select_related = ["initial_template"]
+    readonly_fields = ["flow", "used_by", "results", "created_at", "updated_at"]
+    fieldsets = [
+        (None, {"fields": ["name", "initial_template", "used_by"],
+                "description": "One whole email flow: the initial email, then the follow-ups below, each with its "
+                               "template and days. Campaigns choose one or more sequences; with several, prospects "
+                               "are split equally between them (A/B test) and each keeps its sequence to the end."}),
+        ("Flow", {"fields": ["flow", "results"]}),
+        ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
+    ]
+    inlines = [FollowUpInline]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(prospect_total=Count("prospects", distinct=True))
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        sequence = EmailSequence.objects.filter(pk=object_id).first()
+        if request.method == "GET" and sequence is not None:
+            for problem in sequence_problems(sequence):
+                self.message_user(request, problem, messages.WARNING)
+        return super().change_view(request, object_id, form_url, extra_context)
+
+    @admin.display(description="Follow-ups")
+    def steps(self, obj):
+        return obj.follow_ups.count()
+
+    @admin.display(description="Steps")
+    def flow(self, obj):
+        if not obj.pk:
+            return "Shown after saving."
+        parts = [("Initial email", obj.initial_template.name if obj.initial_template else "no template")]
+        parts += [(f"Follow-up {step.sequence} (+{step.days_after_previous} days)",
+                   step.email_prompt.name if step.email_prompt else "no template")
+                  for step in obj.follow_ups.select_related("email_prompt")]
+        return format_html_join(" &rarr; ", "<b>{}</b>: {}", parts)
+
+    @admin.display(description="Used by campaigns")
+    def used_by(self, obj):
+        if not obj.pk:
+            return "-"
+        campaigns = list(obj.campaigns.all())
+        return format_html_join(", ", "{}", ((admin_link(c),) for c in campaigns)) if campaigns else "Not used yet"
+
+    @admin.display(description="Prospects", ordering="prospect_total")
+    def prospect_count(self, obj):
+        return changelist_link(Prospect, obj.prospect_total, email_sequence__id__exact=obj.pk)
+
+    @admin.display(description="Results")
+    def results(self, obj):
+        from pipeline.sites import sequence_results
+
+        rows = [row for row in sequence_results() if row["variation"] == obj.name]
+        if not rows:
+            return "Nothing sent yet."
+        return format_html_join(", ", "{}: {} sent, {} replied ({}%)",
+                                ((r["step"], r["sent"], r["replied"], r["reply_rate"]) for r in rows))
 
 
 class BusinessSourceInline(ReadOnlyInline):
@@ -970,9 +1043,9 @@ GENERATE_SCOPES = {"business": ("--business-id", Business, "business(es)"),
 class GenerateEmailsForm(forms.Form):
     email_prompt = forms.ModelChoiceField(
         EmailPrompt.objects.filter(kind="initial"), required=False, label="Template",
-        empty_label="Each campaign's initial-email templates (A/B split)",
-        help_text="Leave empty to use each campaign's initial-email templates. Use + to write a new template, the "
-                  "pencil to edit one.",
+        empty_label="The initial-email template of each prospect's sequence (A/B split)",
+        help_text="Leave empty to use each prospect's email sequence (new prospects are split equally between their "
+                  "campaign's sequences). Use + to write a new template, the pencil to edit one.",
     )
     regenerate = forms.BooleanField(required=False, label="Fill in again the emails that are in review or rejected",
                                     help_text="Approved and sent emails are never changed.")
@@ -984,22 +1057,22 @@ class GenerateEmailsForm(forms.Form):
 @admin.register(Prospect)
 class ProspectAdmin(PipelineAdmin):
     list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge",
-                    "initial_email_prompt", "do_not_contact", "in_ghl", "qualification_score", "email_verified_at",
+                    "email_sequence", "do_not_contact", "in_ghl", "qualification_score", "email_verified_at",
                     "last_contacted_at"]
-    list_filter = ["email_status", "verdict", "outreach_status", "initial_email_prompt", "approved_by_person",
+    list_filter = ["email_status", "verdict", "outreach_status", "email_sequence", "approved_by_person",
                    "do_not_contact", "email_verification_provider"]
     search_fields = ["email", "business__name", "contact__name"]
-    list_select_related = ["business", "contact", "initial_email_prompt"]
+    list_select_related = ["business", "contact", "email_sequence"]
     autocomplete_fields = ["business", "contact"]
     readonly_fields = ["email_verified_at", "email_verification_provider", "last_contacted_at", "created_at",
                        "updated_at", "emails_link", "verification_details_display", "ghl_contact_id",
-                       "sequence_stopped_at", "sequence_stop_reason", "initial_email_prompt"]
+                       "sequence_stopped_at", "sequence_stop_reason", "email_sequence"]
     fieldsets = [
         (None, {"fields": ["business", "contact", "email", "do_not_contact"]}),
         ("Verification (Module 4)", {"fields": ["email_status", "verdict", "verification_note",
                                                 "verification_details_display", "email_verification_provider",
                                                 "email_verified_at", "qualification_score"]}),
-        ("Outreach", {"fields": ["outreach_status", "approved_by_person", "initial_email_prompt", "outreach_priority",
+        ("Outreach", {"fields": ["outreach_status", "approved_by_person", "email_sequence", "outreach_priority",
                                  "outreach_facts", "research_summary", "last_contacted_at", "emails_link"]}),
         ("GoHighLevel", {"fields": ["ghl_contact_id", "sequence_stopped_at", "sequence_stop_reason"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),

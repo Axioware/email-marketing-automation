@@ -118,11 +118,12 @@ class OutreachCase(TestCase):
         self.initial = make_email_prompt("Initial A", "INITIAL A")
         self.follow = make_email_prompt("Follow 1", "FOLLOW 1", kind="follow_up")
         self.campaign = make_campaign(name="Clinics", initial_prompts=[self.initial])  # default Settings: 120 s + 180-300 s, 40 a day
-        FollowUp.objects.create(campaign=self.campaign, sequence=1, days_after_previous=3, email_prompt=self.follow)
+        self.sequence = self.campaign.email_sequences.get()  # "Initial A": the initial email, then Follow 1
+        FollowUp.objects.create(email_sequence=self.sequence, sequence=1, days_after_previous=3, email_prompt=self.follow)
         self.api = APIClient()
 
     def email(self, status="in_review", **fields):
-        email = make_email(status, campaign=self.campaign, **fields)
+        email = make_email(status, campaign=self.campaign, email_sequence=self.sequence, **fields)
         Email.objects.filter(pk=email.pk).update(email_prompt=self.initial)
         email.refresh_from_db()
         return email

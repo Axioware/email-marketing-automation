@@ -18,6 +18,7 @@ from pipeline.models import (
     Business,
     CampaignPrompt,
     EmailPrompt,
+    EmailSequence,
     FollowUp,
     BusinessContact,
     BusinessSource,
@@ -74,12 +75,20 @@ class CampaignPromptViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "prompt"]
 
 
+class EmailSequenceViewSet(viewsets.ModelViewSet):
+    """Email sequences: an initial-email template and its follow-ups. Campaigns choose one or more (A/B split)."""
+
+    queryset = EmailSequence.objects.prefetch_related("follow_ups", "campaigns")
+    serializer_class = s.EmailSequenceSerializer
+    search_fields = ["name"]
+
+
 class FollowUpViewSet(viewsets.ModelViewSet):
-    """A campaign's follow-up schedule: follow-up 1, 2, ... and the days after the previous email."""
+    """A sequence's follow-ups: follow-up 1, 2, ..., each with its template and the days after the previous email."""
 
     queryset = FollowUp.objects.all()
     serializer_class = s.FollowUpSerializer
-    filterset_fields = ["campaign"]
+    filterset_fields = ["email_sequence"]
 
 
 def replied_response(mark, *args, **kwargs):
@@ -140,7 +149,7 @@ class BusinessContactViewSet(viewsets.ModelViewSet):
 class ProspectViewSet(viewsets.ModelViewSet):
     queryset = Prospect.objects.all()
     serializer_class = s.ProspectSerializer
-    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "initial_email_prompt",
+    filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "email_sequence",
                         "approved_by_person", "do_not_contact"]
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)

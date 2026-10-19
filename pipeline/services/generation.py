@@ -1,9 +1,9 @@
 """Write one outreach email per prospect from its campaign's templates and store it in `emails` for review.
 
 For every prospect that is ready for outreach (deliverable email or approved by a person, `outreach_status =
-'ready'`, not `do_not_contact`) one of the campaign's initial-email templates (several: split equally as an A/B
-test; none: the prospect is skipped) is filled in with the prospect's details (pipeline/services/templates.py). No AI
-writes any email. A template that needs a value the prospect does not have (and gives no fallback) holds that email
+'ready'`, not `do_not_contact`) the initial-email template of its email sequence is filled in with the prospect's details (pipeline/services/templates.py). The prospect gets one of its campaign's sequences (several: split equally as an
+A/B test; none: the prospect is skipped) and keeps it, so its follow-ups come from the same sequence. No AI writes any
+email. A template that needs a value the prospect does not have (and gives no fallback) holds that email
 back, with the reason. Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below):
 the email carries no image.
 
@@ -24,7 +24,7 @@ from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
 from django.db.models.functions import Lower
 
 from pipeline.management.base import out_of_time, time_limit_note
-from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, FollowUp, Prospect
+from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, EmailSequence, FollowUp, Prospect
 from pipeline.services import templates
 
 MAX_WEBSITE_FINDINGS = 12
@@ -186,55 +186,59 @@ def resolve_template(row: dict, chosen: EmailPrompt | None = None, cache: dict |
                      sequence: int = 0) -> EmailPrompt | None:
     """The template for one prospect and step (sequence 0 = the initial email, n = follow-up n).
 
-    A chosen template wins. Otherwise the initial email uses the prospect's initial-email template (its A/B group,
-    see assign_initial_prompt) and follow-up n the template of the campaign's follow-up step n. None when there is
-    none: that email is skipped.
+    A chosen template wins. Otherwise both come from the prospect's email sequence (its A/B group, see
+    assign_sequence): its initial-email template, or the template of its follow-up step n. None when there is none:
+    that email is skipped.
     """
     if chosen is not None:
         return chosen
     cache = {} if cache is None else cache
-    if sequence == 0:
-        template_id = row.get("initial_email_prompt_id")
-        key = ("template", template_id)
-        if key not in cache:
-            cache[key] = EmailPrompt.objects.filter(pk=template_id).first() if template_id else None
-    else:
-        key = ("follow_up", row.get("campaign_id"), sequence)
-        if key not in cache:
+    sequence_id = row.get("email_sequence_id")
+    key = ("step", sequence_id, sequence)
+    if key not in cache:
+        if not sequence_id:
+            cache[key] = None
+        elif sequence == 0:
+            found = EmailSequence.objects.select_related("initial_template").filter(pk=sequence_id).first()
+            cache[key] = found.initial_template if found else None
+        else:
             step = FollowUp.objects.select_related("email_prompt").filter(
-                campaign_id=row.get("campaign_id"), sequence=sequence).first()
+                email_sequence_id=sequence_id, sequence=sequence).first()
             cache[key] = step.email_prompt if step else None
     return cache[key]
 
 
 def missing_prompt_reason(row: dict, sequence: int = 0) -> str:
+    found = EmailSequence.objects.filter(pk=row.get("email_sequence_id")).first() \
+        if row.get("email_sequence_id") else None
+    if found is None:
+        return "its campaign has no email sequence (choose one on the campaign)"
     if sequence == 0:
-        return "its campaign has no initial-email template (choose one on the campaign)"
-    if not FollowUp.objects.filter(campaign_id=row.get("campaign_id"), sequence=sequence).exists():
-        return f"its campaign has no follow-up {sequence}"
-    return f"follow-up {sequence} of its campaign has no template (choose one on the campaign)"
+        return f"its sequence {found} has no initial-email template"
+    if not found.follow_ups.filter(sequence=sequence).exists():
+        return f"its sequence {found} has no follow-up {sequence}"
+    return f"follow-up {sequence} of its sequence {found} has no template"
 
 
-def assign_initial_prompt(row: dict, save: bool = True) -> int | None:
-    """The prospect's initial-email template (its A/B group): kept if it has one, else the campaign's initial-email
-    template with the fewest prospects of the campaign so far (equal split). Stored on the prospect unless `save` is
-    False. None when the campaign has no initial-email template."""
-    if row.get("initial_email_prompt_id"):
-        return row["initial_email_prompt_id"]
-    available = sorted(DiscoveryCampaign.initial_email_prompts.through.objects
-                       .filter(discoverycampaign_id=row.get("campaign_id")).values_list("emailprompt_id", flat=True))
+def assign_sequence(row: dict, save: bool = True) -> int | None:
+    """The prospect's email sequence (its A/B group): kept if it has one, else the campaign's sequence with the fewest
+    prospects of the campaign so far (equal split). Stored on the prospect unless `save` is False. None when the
+    campaign has no sequence."""
+    if row.get("email_sequence_id"):
+        return row["email_sequence_id"]
+    available = sorted(DiscoveryCampaign.email_sequences.through.objects
+                       .filter(discoverycampaign_id=row.get("campaign_id")).values_list("emailsequence_id", flat=True))
     if not available:
         return None
     counts = dict(Prospect.objects.filter(business__discovery_campaign_id=row.get("campaign_id"),
-                                          initial_email_prompt_id__in=available)
-                  .values_list("initial_email_prompt_id").annotate(n=Count("id"))
-                  .values_list("initial_email_prompt_id", "n"))
-    template_id = min(available, key=lambda value: (counts.get(value, 0), value))
+                                          email_sequence_id__in=available)
+                  .values_list("email_sequence_id").annotate(n=Count("id"))
+                  .values_list("email_sequence_id", "n"))
+    sequence_id = min(available, key=lambda value: (counts.get(value, 0), value))
     if save:
-        Prospect.objects.filter(pk=row["prospect_id"], initial_email_prompt__isnull=True).update(
-            initial_email_prompt_id=template_id)
-    row["initial_email_prompt_id"] = template_id
-    return template_id
+        Prospect.objects.filter(pk=row["prospect_id"], email_sequence__isnull=True).update(email_sequence_id=sequence_id)
+    row["email_sequence_id"] = sequence_id
+    return sequence_id
 
 
 def fill_template(template: EmailPrompt, row: dict) -> Draft:
@@ -250,7 +254,7 @@ READY_PROSPECT = (Q(email_status="deliverable") | Q(approved_by_person=True)) & 
     outreach_status="ready", do_not_contact=False, sequence_stopped_at__isnull=True)
 
 PROSPECT_COLUMNS = ("business_id", "contact_id", "qualification_score", "outreach_facts", "research_summary",
-                    "initial_email_prompt_id")
+                    "email_sequence_id")
 PROSPECT_FIELDS = {
     "campaign_id": F("business__discovery_campaign_id"),
     "prospect_id": F("id"),
@@ -381,7 +385,7 @@ def add_arguments(parser) -> None:
                         help="Fill again the emails that are in review or rejected (approved and sent emails are never "
                              "touched).")
     parser.add_argument("--email-prompt-id", "--template-id", type=int, dest="email_prompt_id",
-                        help="Use this template for every email (default: each campaign's initial-email templates).")
+                        help="Use this template for every email (default: the initial-email template of each prospect's sequence).")
     parser.add_argument("--dry-run", action="store_true", help="Fill and print without writing to the database.")
 
 
@@ -413,11 +417,15 @@ def run(options: dict) -> int:
                 time_limit_note(len(queue) - position, "email(s)")
                 break
             label = f"Prospect {row['prospect_id']} <{row['recipient']}>"
-            if chosen is None and assign_initial_prompt(row, save=not options["dry_run"]) is None:
+            if chosen is None and assign_sequence(row, save=not options["dry_run"]) is None:
                 skipped += 1
                 print(f"  {label} skipped: {missing_prompt_reason(row)}.")
                 continue
             template = resolve_template(row, chosen, cache)
+            if template is None:
+                skipped += 1
+                print(f"  {label} skipped: {missing_prompt_reason(row)}.")
+                continue
             try:
                 draft = fill_template(template, row)
             except templates.TemplateIncomplete as error:

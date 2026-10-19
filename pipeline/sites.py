@@ -16,7 +16,7 @@ GUIDE_PATH = Path(settings.BASE_DIR) / "docs" / "USER_GUIDE.md"
 WORKER_STALE_AFTER = timedelta(minutes=2)  # no heartbeat for this long: the worker is shown as not running
 
 # Sidebar order: the pipeline's own order, then the supporting tables.
-MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
+MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "emailsequence", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
                "pipelinerun", "sendingsettings", "businesssource"]
 
 
@@ -70,15 +70,15 @@ def worker_status() -> dict:
 
 
 def sequence_results() -> list[dict]:
-    """Sent emails per step and initial-email template (the A/B group), with reply rates."""
+    """Sent emails per step and email sequence (the A/B group), with reply rates."""
     from pipeline.models import Email
     rows = (Email.objects.filter(sent_at__isnull=False)
-            .values("sequence_step", "prospect__initial_email_prompt__name")
+            .values("sequence_step", "prospect__email_sequence__name")
             .annotate(sent=Count("id"), replied=Count("id", filter=Q(status="replied")))
-            .order_by("sequence_step", "prospect__initial_email_prompt__name"))
+            .order_by("prospect__email_sequence__name", "sequence_step"))
     return [{
         "step": "First email" if row["sequence_step"] == 1 else f"Follow-up {row['sequence_step'] - 1}",
-        "variation": row["prospect__initial_email_prompt__name"] or "-",
+        "variation": row["prospect__email_sequence__name"] or "-",
         "sent": row["sent"],
         "replied": row["replied"],
         "reply_rate": round(100 * row["replied"] / row["sent"]),

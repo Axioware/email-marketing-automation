@@ -102,7 +102,7 @@ def earliest_send(email: Email) -> datetime:
     previous = Email.objects.filter(prospect_id=email.prospect_id, sequence_step=email.sequence_step - 1).first()
     if previous is None or previous.sent_at is None:
         raise OutreachError("The previous email of this follow-up has not been sent yet.")
-    step = FollowUp.objects.filter(campaign_id=email.business.discovery_campaign_id,
+    step = FollowUp.objects.filter(email_sequence_id=email.prospect.email_sequence_id,
                                    sequence=email.sequence_step - 1).first()
     return max(now(), previous.sent_at + timedelta(days=step.days_after_previous if step else 0))
 
@@ -138,7 +138,11 @@ def due_value(email: Email) -> str | None:
 
 
 def initial_type(email: Email) -> str | None:
-    return email.email_prompt.name if email.sequence_step == generation.SEQUENCE_STEP and email.email_prompt else None
+    """Initial Email Type: the prospect's sequence (its A/B group), written with the first email."""
+    if email.sequence_step != generation.SEQUENCE_STEP:
+        return None
+    sequence = email.prospect.email_sequence
+    return sequence.name if sequence else (email.email_prompt.name if email.email_prompt else None)
 
 
 def email_fields(email: Email) -> dict:
@@ -270,8 +274,8 @@ def prospect_for_contact(contact_id: str) -> Prospect:
 def sequence_state(prospect: Prospect, sent_step: int) -> dict:
     """The contact's fields after email `sent_step` went out: the next follow-up's number, or all empty (done)."""
     has_next = (prospect.sequence_stopped_at is None and not prospect.do_not_contact
-                and FollowUp.objects.filter(campaign_id=prospect.business.discovery_campaign_id, sequence=sent_step,
-                                            email_prompt__isnull=False).exists())  # a step without a prompt ends it
+                and FollowUp.objects.filter(email_sequence_id=prospect.email_sequence_id, sequence=sent_step,
+                                            email_prompt__isnull=False).exists())  # a step without a template ends it
     return {"subject": None, "body": None, "due": None, "count": sent_step if has_next else None}
 
 

@@ -402,7 +402,7 @@ class DashboardTests(AdminCase):
         apps = self.client.get(reverse("admin:index")).context["app_list"]
         self.assertEqual(apps[0]["app_label"], "pipeline")
         names = [m["object_name"] for m in apps[0]["models"]]
-        self.assertEqual(names[:8], ["DiscoveryCampaign", "CampaignPrompt", "EmailPrompt", "Business",
+        self.assertEqual(names[:9], ["DiscoveryCampaign", "CampaignPrompt", "EmailPrompt", "EmailSequence", "Business",
                                      "BusinessWebsiteProfile", "BusinessContact", "Prospect", "Email"])
 
     def test_guide(self):

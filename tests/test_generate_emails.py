@@ -139,7 +139,7 @@ class FooterImageTests(unittest.TestCase):
 class GenerateCase:
     def setUp(self):
         campaign = make_campaign()
-        self.template = campaign.initial_email_prompts.get()
+        self.template = campaign.email_sequences.get().initial_template
         self.b, self.c = [None], [None]
         for i in range(1, 5):
             business = make_business(campaign, f"Business {i}", city="Lahore")

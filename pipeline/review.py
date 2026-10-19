@@ -200,7 +200,7 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
     if not rows:
         raise ReviewError("The prospect is no longer ready for outreach (check its status).")
     row = rows[0]
-    if email_prompt is None and email.email_prompt is None and generation.assign_initial_prompt(row) is None:
+    if email_prompt is None and email.email_prompt is None and generation.assign_sequence(row) is None:
         raise ReviewError(f"Cannot fill it in: {generation.missing_prompt_reason(row)}.")
     template = generation.resolve_template(row, email_prompt or email.email_prompt)
     if template is None:

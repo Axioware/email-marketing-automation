@@ -57,14 +57,41 @@ def make_email_prompt(name=None, text=EMAIL_TEXT, kind="initial", subject=None, 
                                       subject=subject, body=body)
 
 
-def make_campaign(campaign_prompt=_unset, initial_prompts=_unset, **fields) -> DiscoveryCampaign:
-    """A campaign with its own campaign prompt and one initial-email prompt (pass campaign_prompt=None or
-    initial_prompts=[] for none)."""
+def make_sequence(initial=None, name=None, follow_ups=()):
+    """An email sequence: `initial` template, then (days, template) follow-ups."""
+    from pipeline.models import EmailSequence, FollowUp
+
+    sequence = EmailSequence.objects.create(name=name or (initial.name if initial else "Sequence"),
+                                            initial_template=initial)
+    for number, (days, template) in enumerate(follow_ups, start=1):
+        FollowUp.objects.create(email_sequence=sequence, sequence=number, days_after_previous=days,
+                                email_prompt=template)
+    return sequence
+
+
+def make_campaign(campaign_prompt=_unset, initial_prompts=_unset, sequences=None, **fields) -> DiscoveryCampaign:
+    """A campaign with its own campaign prompt and one email sequence per initial-email template (named after it;
+    default: one new template). Pass campaign_prompt=None or initial_prompts=[] for none, or `sequences`."""
+    from pipeline.models import EmailSequence
+
     if campaign_prompt is _unset:
         campaign_prompt = make_prompts()
     campaign = DiscoveryCampaign.objects.create(**{"name": "test", "campaign_prompt": campaign_prompt, **fields})
-    campaign.initial_email_prompts.set([make_email_prompt()] if initial_prompts is _unset else initial_prompts)
+    if sequences is None:
+        templates = [make_email_prompt()] if initial_prompts is _unset else initial_prompts
+        sequences = [EmailSequence.objects.get_or_create(name=t.name, defaults={"initial_template": t})[0]
+                     for t in templates]
+    campaign.email_sequences.set(sequences)
     return campaign
+
+
+def add_follow_up(campaign, sequence, days, template=None):
+    """Follow-up `sequence` (number) in every email sequence of the campaign."""
+    from pipeline.models import FollowUp
+
+    for email_sequence in campaign.email_sequences.all():
+        FollowUp.objects.create(email_sequence=email_sequence, sequence=sequence, days_after_previous=days,
+                                email_prompt=template)
 
 
 def make_business(campaign=None, name="Business", score=None, **fields) -> Business:
@@ -113,6 +140,5 @@ def review_env(llm=None) -> dict:
     return {"EMAIL_TRACKING_BASE_URL": BASE, "SENDER_NAME": "Sender"}
 
 
-# Management-form fields of the follow-ups inline on the campaign form (empty inline).
-CAMPAIGN_INLINE = {"follow_ups-TOTAL_FORMS": "0", "follow_ups-INITIAL_FORMS": "0", "follow_ups-MIN_NUM_FORMS": "0",
-                   "follow_ups-MAX_NUM_FORMS": "1000"}
+# Extra fields the campaign form needs (none since follow-ups moved to email sequences).
+CAMPAIGN_INLINE = {}

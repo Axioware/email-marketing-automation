@@ -71,9 +71,8 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Lead source** (under Leads): how businesses are found on Google Maps: **Built-in browser** (default) or **Scraper container**. You can still pick the other one for a single fetch.
    - **Minimum score** (under Leads, default 50): businesses scoring at least this go straight on to finding decision makers; the rest wait for you to approve or reject them.
    - **Campaign prompt** (under Prompts): what makes a good prospect; the AI scores each business's website against it. Pick one, or click **+** to write a new one. Several campaigns can share one. Without one, the campaign's businesses are not researched.
-   - **Initial-email templates**: tick one or more. With several, prospects are split equally between them (an A/B test) and each person keeps their template.
+   - **Email sequences**: tick one or more. A sequence is a whole email flow (first email, then its follow-ups). With several, prospects are split equally between them (an A/B test) and each person stays in their sequence to the end. See [Email sequences](#email-sequences-and-follow-ups).
    - **Sending** (optional): a **send window** (e.g. 09:00 to 18:00) with its time zone. The gap between two sends and the **daily cap** are the same for every campaign: sidebar > **Settings** (defaults: 2 minutes fixed plus a random 3-5 minutes, 40 emails a day). See [Sending](#step-8-sending-through-gohighlevel).
-   - **Follow-ups** table (bottom): one row per follow-up with its days and its prompt. See [Follow-ups](#follow-ups).
 3. Click **Save**.
 
 Every search term is searched in every location, so 2 terms and 3 locations means 6 searches. The campaign's **Status** (Pending, Running, Completed, Failed) is set automatically when businesses are fetched; you cannot edit it.
@@ -152,7 +151,7 @@ On the Prospects list, use the **By email status** and **By verdict** filters on
 
 1. Sidebar > **Prospects** (or **Businesses**), tick the rows, choose **Write emails from templates (Module 5)** and click **Go**. To write emails for every ready prospect, click **Write emails** on the dashboard instead.
 2. The **Write emails** page opens:
-   - **Template**: leave it on "Each campaign's initial-email templates (A/B split)", or pick one template for all of them. Click **+** to write a new template or the pencil to edit the selected one, without leaving the page.
+   - **Template**: leave it on "The initial-email template of each prospect's sequence (A/B split)", or pick one template for all of them. Click **+** to write a new template or the pencil to edit the selected one, without leaving the page.
    - **Fill in again emails still in review or rejected**: tick to replace those drafts. Approved and sent emails are never changed.
    - **Limit** and **Dry run** work like everywhere else.
 3. Click **Write emails**.
@@ -164,7 +163,7 @@ Each prospect gets its campaign's template with the variables filled in (no AI i
 Both are edited in the admin; nothing is built into the code. Campaigns choose them, and several campaigns can share one.
 
 - **Campaign prompts** (sidebar) **qualify businesses**. They describe what you sell, what a good and a poor prospect look like, and what each score range means. In step 3 the AI reads each business's website and scores it 0-100 against its campaign's campaign prompt. The AI receives **exactly what you write** there. The shape of its answer is the **Answer format (JSON schema)** on the prompt's page; extra fields you add there (e.g. `team_size`) are stored per business and become email variables.
-- **Email templates** (sidebar) **are the emails**. Each has a **Kind** (**Initial email** or **Follow-up**), a **Subject** and a **Body**. Write the email as you want it sent, with variables where the prospect's details go. A campaign picks one or more initial-email templates (several = A/B test, split equally) and one follow-up template per follow-up step. A template's page shows a preview for a real prospect and which campaigns use it.
+- **Email templates** (sidebar) **are the emails**. Each has a **Kind** (**Initial email** or **Follow-up**), a **Subject** and a **Body**. Write the email as you want it sent, with variables where the prospect's details go. **Email sequences** put them in order (see [Email sequences](#email-sequences-and-follow-ups)). A template's page shows a preview for a real prospect and which sequences use it.
 
 **Variables.** Open **Email templates** > **Email variables** for the full list with example values. The common ones:
 
@@ -181,7 +180,7 @@ Both are edited in the admin; nothing is built into the code. Campaigns choose t
 - After `|` comes the **fallback**, used when the prospect has no value. A variable **without** a fallback and without a value holds the email back, so nobody gets "Hi ,". Use a fallback on anything that may be missing (names, research fields).
 - A template with a misspelled variable, or `{{previous_subject}}` in an initial email, cannot be saved: the page says what is wrong.
 - The footer (company details and unsubscribe line) is added automatically; do not write it.
-- The campaign page warns when it has no campaign prompt, no initial-email template, or a follow-up step without a template.
+- The campaign page warns when it has no campaign prompt, no email sequence, a sequence without an initial-email template, or a follow-up step without a template.
 
 ### Step 7: Review emails
 
@@ -217,7 +216,7 @@ To approve or reject many emails at once: on the Emails list tick them, choose *
 GoHighLevel sends the emails from your connected mailbox, at the time this app gives each one.
 
 - **Contacts:** every prospect ready to email (verified, or approved by you) is created in GoHighLevel with the tags `outreach-app` and `campaign-<name>` (the full pipeline does it at the end; **Create GHL contacts** on the dashboard does it any time). Your GHL workflow turns them into **New Lead** opportunities. One email address gets one sequence, even if two prospects share it.
-- **Approve = hand to GoHighLevel.** Each approved email gets a send time: the latest planned email of any campaign plus the gap (Settings; default 2 minutes plus a random 3-5 minutes), only inside its campaign's send window, and at most the daily cap per day for all campaigns together (one mailbox sends them all). A follow-up never goes before its days after the previous email. The email is written into its contact at once (**Email Subject**, **Email Body**, **Follow-up Count**, **Email Due At**, and **Initial Email Type** for a first email), and GoHighLevel waits until Email Due At and sends it. The email shows **In GoHighLevel** with its due time.
+- **Approve = hand to GoHighLevel.** Each approved email gets a send time: the latest planned email of any campaign plus the gap (Settings; default 2 minutes plus a random 3-5 minutes), only inside its campaign's send window, and at most the daily cap per day for all campaigns together (one mailbox sends them all). A follow-up never goes before its days after the previous email. The email is written into its contact at once (**Email Subject**, **Email Body**, **Follow-up Count**, **Email Due At**, and **Initial Email Type** = the person's sequence, for a first email), and GoHighLevel waits until Email Due At and sends it. The email shows **In GoHighLevel** with its due time.
 - **If GoHighLevel could not take it**, the email stays **Approved** with the reason shown; click **Hand to GoHighLevel** on it (or the dashboard button) once the problem is fixed. It is never sent twice.
 - **Changed your mind?** Edit, reject or send it back to review before it is sent: it is taken back out of GoHighLevel first. If GoHighLevel cannot be reached, nothing changes and you are told (it could still be sent).
 - **After it is sent**, GoHighLevel tells the app, the email becomes **Sent**, and the next follow-up is written for your review.
@@ -225,21 +224,28 @@ GoHighLevel sends the emails from your connected mailbox, at the time this app g
 
 Statuses: In review → Approved → **In GoHighLevel** → **Sent** (→ Replied). The dashboard warns if GoHighLevel is not set up, if approved emails are not in GoHighLevel yet, or if an email is over a day past its send time and was never reported sent (check the GHL workflow).
 
-### Follow-ups
+### Email sequences and follow-ups
 
-A campaign can have follow-up emails for people who did not reply.
+An **email sequence** is one whole flow: the first email, then follow-ups for people who did not reply. For example:
 
-**1. Set the steps.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** (1, 2, ...), **Days after previous** (e.g. 3, then 7) and **Template** (a follow-up template). The first email is step 0.
+- **Sequence A:** Initial email > Follow-up 1 (3 days later)
+- **Sequence B:** Initial email > Follow-up 1 (2 days later) > Follow-up 2 (5 days later) > Follow-up 3 (9 days later)
 
-**2. Written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next follow-up's template is filled in for review (if it was held back for a missing value, fix it and use **Write follow-ups** on the dashboard). You have the days in between to review it.
+Each step uses its own template, so B can open with another first email, follow up sooner, and send more follow-ups than A.
 
-**3. Review and approve** like first emails. Approving schedules it for no earlier than the previous email's send time plus its days.
+**1. Build a sequence.** Sidebar > **Email sequences** > **Add**. Give it a **Name** (it is what GoHighLevel and the results table show), pick its **Initial-email template**, and add one row per follow-up in the **Follow-ups** table: **Sequence** (1, 2, ...), **Days after previous** and **Template** (a follow-up template). Save. The page shows the flow, e.g. *Initial email: First touch → Follow-up 1 (+3 days): Gentle nudge*, and which campaigns use it.
 
-**4. The end.** After the last follow-up is sent, the contact's **Follow-up Count** is emptied, which tells GoHighLevel the sequence is over (Quota Exhausted). A follow-up step without a template also ends the sequence there.
+**2. Choose sequences on the campaign.** Open the campaign and tick one or more under **Email sequences**. With one, everybody gets it. With several, it is an A/B test: new prospects are split equally between them, and each person keeps their sequence to the end (first email and every follow-up). A sequence can be used by several campaigns. Changing a campaign's sequences later does not move people who already started one.
+
+**3. Follow-ups are written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next step of *that person's* sequence is filled in for review (if it was held back for a missing value, fix it and use **Write follow-ups** on the dashboard). You have the days in between to review it.
+
+**4. Review and approve** like first emails. Approving schedules it for no earlier than the previous email's send time plus that step's days.
+
+**5. The end.** After a sequence's last follow-up is sent, the contact's **Follow-up Count** is emptied, which tells GoHighLevel the sequence is over (Quota Exhausted). A follow-up step without a template also ends the sequence there. Sequences can have different lengths: in the example, A ends after one follow-up and B after three.
 
 No follow-up is written once the person replied, their sequence was stopped, or they are do-not-contact.
 
-**Results:** the dashboard's **Results by step and initial-email template (A/B)** table shows, for the first email and each follow-up, per initial-email template: emails sent, replies and reply rate.
+**Results:** the dashboard's **Results by email sequence (A/B) and step** table shows, per sequence and step: emails sent, replies and reply rate. Each sequence's page shows its own numbers. GoHighLevel's **Initial Email Type** field holds the person's sequence name, so you can report on it there too.
 
 ## 5. Pipeline runs
 

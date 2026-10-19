@@ -12,8 +12,8 @@ from rest_framework.test import APIClient
 from pipeline.models import CampaignPrompt, DiscoveryCampaign, Email, EmailPrompt, PipelineRun
 from pipeline.migrations import _prompt_texts as prompt_texts
 from pipeline.services import research
-from tests.support import (CAMPAIGN_INLINE, make_business, make_campaign, make_email, make_email_prompt, review_env,
-                           run_command)
+from tests.support import (CAMPAIGN_INLINE, make_business, make_campaign, make_email, make_email_prompt, make_sequence,
+                           review_env, run_command)
 
 KEY = "prompt-test-key"
 
@@ -27,14 +27,15 @@ class PromptCase(TestCase):
         self.client.force_login(self.user)
 
     def prompt_set(self, name="Dental", campaign=None):
-        """A campaign prompt, an initial-email template and a second initial template the campaign does not use."""
+        """A campaign prompt, an initial-email template (in the campaign's only sequence) and a second initial
+        template the campaign does not use."""
         campaign_prompt = CampaignPrompt.objects.create(name=name, prompt=f"CAMPAIGN RULES {name}")
         first = make_email_prompt(f"First touch {name}", f"FIRST TOUCH {name}")
         other = make_email_prompt(f"Other {name}", f"OTHER {name}")
         if campaign is not None:
             campaign.campaign_prompt = campaign_prompt
             campaign.save()
-            campaign.initial_email_prompts.set([first])
+            campaign.email_sequences.set([make_sequence(first)])
         return campaign_prompt, first, other
 
     def generate(self, *args):
@@ -59,9 +60,10 @@ class ModelTests(PromptCase):
     def test_prompts_are_shared_between_campaigns(self):
         campaign_prompt, first, _ = self.prompt_set(campaign=make_campaign(name="A"))
         second = DiscoveryCampaign.objects.create(name="B", campaign_prompt=campaign_prompt)
-        second.initial_email_prompts.set([first])
+        sequence = first.initial_for_sequences.get()
+        second.email_sequences.set([sequence])  # sequences are shared too
         self.assertEqual(set(campaign_prompt.campaigns.all()), {second, DiscoveryCampaign.objects.get(name="A")})
-        self.assertEqual(first.initial_for_campaigns.count(), 2)
+        self.assertEqual(sequence.campaigns.count(), 2)
         with self.assertRaises(IntegrityError), transaction.atomic():
             EmailPrompt.objects.create(name=first.name, body="x")  # names are unique
 
@@ -76,7 +78,7 @@ class ModelTests(PromptCase):
         campaign.refresh_from_db()
         self.assertIsNone(email.email_prompt)
         self.assertIsNone(campaign.campaign_prompt)
-        self.assertFalse(campaign.initial_email_prompts.exists())
+        self.assertIsNone(campaign.email_sequences.get().initial_template)  # the sequence stays, without it
 
     def test_campaign_settings_validation(self):
         from django.core.exceptions import ValidationError
@@ -111,7 +113,7 @@ class GenerationTests(PromptCase):
         self.assertEqual(email.email_prompt, first)
         self.assertIn("FIRST TOUCH Dental about", email.body_text)
         prospect.refresh_from_db()
-        self.assertEqual(prospect.initial_email_prompt, first)
+        self.assertEqual(prospect.email_sequence.initial_template, first)
 
     def test_chosen_email_prompt_wins(self):
         campaign = make_campaign()
@@ -127,15 +129,15 @@ class GenerationTests(PromptCase):
         prospect = self.ready_prospect(make_campaign(initial_prompts=[]))
         result = self.generate()
         self.assertEqual(result.returncode, 1)
-        self.assertIn(f"Prospect {prospect.pk} <{prospect.email}> skipped: its campaign has no initial-email template",
+        self.assertIn(f"Prospect {prospect.pk} <{prospect.email}> skipped: its campaign has no email sequence",
                       result.stdout)
         self.assertIn("1 skipped (no template)", result.stdout)
         self.assertFalse(Email.objects.filter(prospect=prospect).exists())
         prospect.refresh_from_db()
-        self.assertIsNone(prospect.initial_email_prompt)  # no A/B group until it can get an email
+        self.assertIsNone(prospect.email_sequence)  # no A/B group until it can get an email
         email = make_email(campaign=prospect.business.discovery_campaign)  # regenerating says why too
         response = self.client.post(reverse("admin:pipeline_email_regenerate", args=[email.pk]), follow=True)
-        self.assertContains(response, "Cannot fill it in: its campaign has no initial-email template")
+        self.assertContains(response, "Cannot fill it in: its campaign has no email sequence")
 
     def test_campaign_prompt_is_not_needed_to_write_emails(self):
         prospect = self.ready_prospect(make_campaign(campaign_prompt=None))
@@ -184,23 +186,21 @@ class CampaignAdminTests(PromptCase):
 
     def test_choose_prompts_and_settings_on_the_campaign(self):
         campaign_prompt, first, other = self.prompt_set("Shared", campaign=make_campaign(name="Other"))
-        follow = make_email_prompt("A follow-up", kind="follow_up")
+        sequence_a, sequence_b = first.initial_for_sequences.get(), make_sequence(other)
         url = reverse("admin:pipeline_discoverycampaign_add")
         page = self.client.get(url)
         form = page.context["adminform"].form
         self.assertIn(campaign_prompt, list(form.fields["campaign_prompt"].queryset))  # shared prompts are offered
-        self.assertEqual(set(form.fields["initial_email_prompts"].queryset), {first, other} | set(
-            EmailPrompt.objects.filter(kind="initial")))
-        self.assertNotIn(follow, list(form.fields["initial_email_prompts"].queryset))
+        self.assertTrue({sequence_a, sequence_b} <= set(form.fields["email_sequences"].queryset))
         self.assertIn(reverse("admin:pipeline_campaignprompt_add"), page.content.decode())  # the + (create) link
         response = self.client.post(url, {**CAMPAIGN_INLINE, "name": "A/B", "campaign_prompt": campaign_prompt.pk,
-                                          "initial_email_prompts": [first.pk, other.pk], "min_score": "65",
+                                          "email_sequences": [sequence_a.pk, sequence_b.pk], "min_score": "65",
                                           "send_window_start": "09:00", "send_window_end": "18:00",
                                           "send_timezone": "Asia/Karachi"})
         self.assertEqual(response.status_code, 302, response.content[:300])
         created = DiscoveryCampaign.objects.get(name="A/B")
         self.assertEqual(created.campaign_prompt, campaign_prompt)
-        self.assertEqual(set(created.initial_email_prompts.all()), {first, other})
+        self.assertEqual(set(created.email_sequences.all()), {sequence_a, sequence_b})
         self.assertEqual((created.min_score, str(created.send_window_end)), (65, "18:00:00"))
         bad = self.client.post(url, {**CAMPAIGN_INLINE, "name": "Bad", "send_window_start": "18:00",
                                      "send_window_end": "09:00"})
@@ -244,11 +244,11 @@ class CampaignAdminTests(PromptCase):
         bare = make_campaign(name="Bare", campaign_prompt=None, initial_prompts=[])
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[bare.pk]))
         self.assertContains(page, "This campaign has no campaign prompt: its businesses will not be researched")
-        self.assertContains(page, "This campaign has no initial-email template")
+        self.assertContains(page, "This campaign has no email sequence")
         fine = make_campaign(name="Fine")
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[fine.pk]))
         self.assertNotContains(page, "has no campaign prompt")
-        self.assertNotContains(page, "no initial-email template")
+        self.assertNotContains(page, "no email sequence")
 
     def test_prompt_pages(self):
         campaign_prompt, first, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
@@ -469,8 +469,12 @@ class PromptApiTests(PromptCase):
         variables = self.api.get("/api/email-variables/").json()
         self.assertIn("first_name", str(variables))
         self.assertIn("team_size", str(variables))  # research output fields are variables too
+        sequence = self.api.post("/api/email-sequences/", {"name": "Spa flow", "initial_template": first.json()["id"]},
+                                 format="json").json()
+        self.api.post("/api/follow-ups/", {"email_sequence": sequence["id"], "sequence": 1, "days_after_previous": 3,
+                                           "email_prompt": follow.json()["id"]}, format="json")
         campaign = self.api.post("/api/campaigns/", {
-            "name": "Spa campaign", "campaign_prompt": created["id"], "initial_email_prompts": [first.json()["id"]],
+            "name": "Spa campaign", "campaign_prompt": created["id"], "email_sequences": [sequence["id"]],
             "min_score": 70, "send_window_start": "09:00", "send_window_end": "18:00"}, format="json")
         self.assertEqual(campaign.status_code, 201, campaign.content)
         self.assertEqual((campaign.json()["min_score"], campaign.json()["send_timezone"]), (70, "Asia/Karachi"))
@@ -478,9 +482,9 @@ class PromptApiTests(PromptCase):
                          [campaign.json()["id"]])
         shared = self.api.post("/api/campaigns/", {"name": "Another", "campaign_prompt": created["id"]}, format="json")
         self.assertEqual(shared.status_code, 201)  # a campaign prompt can be shared
-        wrong = self.api.post("/api/campaigns/", {"name": "Wrong", "initial_email_prompts": [follow.json()["id"]]},
+        wrong = self.api.post("/api/email-sequences/", {"name": "Wrong", "initial_template": follow.json()["id"]},
                               format="json")
-        self.assertEqual(wrong.status_code, 400)  # a follow-up prompt cannot write the initial email
+        self.assertEqual(wrong.status_code, 400)  # a follow-up template cannot write the initial email
         bad_window = self.api.patch(f"/api/campaigns/{campaign.json()['id']}/", {"send_window_end": "08:00"},
                                     format="json")
         self.assertEqual(bad_window.status_code, 400)

@@ -144,10 +144,33 @@ LEAD_SOURCES = [("browser", "Built-in browser"), ("scraper_api", "Scraper contai
 DEFAULT_SEND_TIMEZONE = "Asia/Karachi"
 
 
-class FollowUp(models.Model):
-    """One follow-up in a campaign's sequence: sent `days_after_previous` days after the previous email."""
+class EmailSequence(models.Model):
+    """A whole email flow: the initial email's template, then its follow-ups (FollowUp rows), each with its template
+    and days. A campaign chooses one or more; with several, prospects are split equally between them (A/B test) and
+    each prospect keeps its sequence to the end. Sequences can be shared by campaigns."""
 
-    campaign = models.ForeignKey("DiscoveryCampaign", on_delete=models.CASCADE, related_name="follow_ups")
+    name = models.CharField(max_length=200, unique=True)
+    initial_template = models.ForeignKey(
+        EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="initial_for_sequences",
+        limit_choices_to={"kind": "initial"}, verbose_name="initial-email template",
+        help_text="The template of the first email.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "email_sequences"
+        ordering = ["name"]
+        verbose_name = "email sequence"
+
+    def __str__(self):
+        return self.name
+
+
+class FollowUp(models.Model):
+    """One follow-up in an email sequence: sent `days_after_previous` days after the previous email."""
+
+    email_sequence = models.ForeignKey(EmailSequence, on_delete=models.CASCADE, related_name="follow_ups",
+                                       verbose_name="sequence")
     sequence = models.PositiveIntegerField(help_text="1 = the first follow-up (the first email is 0).")
     days_after_previous = models.PositiveIntegerField(default=3, help_text="Days after the previous email was sent.")
     email_prompt = models.ForeignKey(EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True,
@@ -158,10 +181,10 @@ class FollowUp(models.Model):
 
     class Meta:
         db_table = "follow_ups"
-        ordering = ["campaign_id", "sequence"]
+        ordering = ["email_sequence_id", "sequence"]
         verbose_name = "follow-up"
         constraints = [
-            models.UniqueConstraint(fields=["campaign", "sequence"], name="uq_follow_ups_campaign_sequence"),
+            models.UniqueConstraint(fields=["email_sequence", "sequence"], name="uq_follow_ups_email_sequence"),
             models.CheckConstraint(condition=models.Q(sequence__gte=1), name="ck_follow_ups_sequence"),
             models.CheckConstraint(condition=models.Q(days_after_previous__gte=1), name="ck_follow_ups_days"),
         ]
@@ -189,11 +212,10 @@ class DiscoveryCampaign(models.Model):
         CampaignPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="campaigns",
         help_text="Qualifies this campaign's businesses (website research). Without one, they are not researched.",
     )
-    initial_email_prompts = models.ManyToManyField(
-        EmailPrompt, blank=True, related_name="initial_for_campaigns", limit_choices_to={"kind": "initial"},
-        verbose_name="initial-email templates",
-        help_text="Templates for the first email. With several, prospects are split equally between them (A/B test) "
-                  "and each keeps its template.")
+    email_sequences = models.ManyToManyField(
+        EmailSequence, blank=True, related_name="campaigns", verbose_name="email sequences",
+        help_text="The email flows (initial email and follow-ups). With several, prospects are split equally between "
+                  "them (A/B test) and each keeps its sequence to the end.")
     min_score = models.PositiveSmallIntegerField(
         default=50, db_default=50, help_text="Businesses scoring at least this go on to finding decision makers; lower ones wait "
                               "for a person to approve or reject them.")
@@ -505,10 +527,11 @@ class Prospect(models.Model):
     qualification_score = models.IntegerField(null=True, blank=True)
     outreach_status = models.CharField(max_length=32, choices=OutreachStatus.choices, default=OutreachStatus.PENDING, db_index=True)
     outreach_priority = models.CharField(max_length=16, null=True, blank=True)
-    initial_email_prompt = models.ForeignKey(
-        EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
-        verbose_name="initial-email template",
-        help_text="The initial-email template this prospect got (A/B group), set when its first email is written.")
+    email_sequence = models.ForeignKey(
+        EmailSequence, on_delete=models.SET_NULL, null=True, blank=True, related_name="prospects",
+        verbose_name="email sequence",
+        help_text="The sequence this prospect gets (A/B group), set when its first email is written; its follow-ups "
+                  "come from it.")
     approved_by_person = models.BooleanField(
         default=False, db_default=False, help_text="A person approved emailing this address although verification did not confirm it.")
     ghl_contact_id = models.CharField(max_length=64, null=True, blank=True, db_index=True,

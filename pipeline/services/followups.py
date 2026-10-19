@@ -1,7 +1,7 @@
 """Follow-ups: further emails to a prospect after the previous one was sent.
 
-A campaign's `follow_ups` rows define the sequence: follow-up 1, 2, ..., each with its template and the days to wait
-after the previous email. A follow-up is filled in from its template (In review) as soon as the previous email is
+The prospect's email sequence (its A/B group) defines its follow-ups: follow-up 1, 2, ..., each with its template and the
+days to wait after the previous email. A follow-up is filled in from its template (In review) as soon as the previous email is
 sent ({{previous_subject}} is that email's subject), so a person has those days to review it; approving it schedules it no earlier than "previous email sent + days" (outreach.py).
 Nothing is written once the prospect replied, was stopped (sequence_stopped_at) or is do-not-contact; each prospect
 has its own sequence.
@@ -23,14 +23,13 @@ def now() -> datetime:
 
 
 def find_due(options: dict) -> list[dict]:
-    """The follow-ups to write now: the prospect's latest email was sent, its campaign has a next follow-up step, and
+    """The follow-ups to write now: the prospect's latest email was sent, its sequence has a next follow-up step, and
     that follow-up does not exist yet. Each item: prospect_id, step (emails.sequence_step to write), sequence
     (follow-up number), previous (the latest sent Email) and follow_up (the FollowUp step)."""
     prospects = (
         Prospect.objects.filter(do_not_contact=False, sequence_stopped_at__isnull=True,
                                 emails__status__in=SENT_STATUSES)
         .exclude(emails__status="replied")
-        .select_related("business")
         .order_by("id")
         .distinct()
     )
@@ -43,16 +42,18 @@ def find_due(options: dict) -> list[dict]:
     schedules: dict[int, dict[int, FollowUp]] = {}
     due = []
     for prospect in prospects:
-        campaign_id = prospect.business.discovery_campaign_id
-        if campaign_id not in schedules:
-            schedules[campaign_id] = {f.sequence: f for f in FollowUp.objects.filter(campaign_id=campaign_id)}
+        sequence_id = prospect.email_sequence_id
+        if sequence_id is None:
+            continue  # no sequence: no follow-ups
+        if sequence_id not in schedules:
+            schedules[sequence_id] = {f.sequence: f for f in FollowUp.objects.filter(email_sequence_id=sequence_id)}
         latest = prospect.emails.order_by("-sequence_step").first()
         if latest is None or latest.status not in SENT_STATUSES or latest.sent_at is None:
             continue  # the latest email is not sent yet, failed or replied, or the next one exists already
         sequence = latest.sequence_step  # step s is follow-up s - 1, so the next follow-up is number s
-        follow_up = schedules[campaign_id].get(sequence)
+        follow_up = schedules[sequence_id].get(sequence)
         if follow_up is None:
-            continue  # the campaign's sequence is finished for this prospect
+            continue  # its sequence is finished
         if follow_up.email_prompt_id is None and not options.get("any_prompt"):
             continue  # nothing can write it (the sequence ends there; see outreach.sequence_state)
         due.append({"prospect_id": prospect.pk, "step": latest.sequence_step + 1, "sequence": sequence,
