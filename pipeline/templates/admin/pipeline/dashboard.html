@@ -57,9 +57,9 @@
 
     {% if results %}
     <div class="module">
-      <h2>Results by step and initial-email prompt (A/B)</h2>
+      <h2>Results by step and initial-email template (A/B)</h2>
       <table>
-        <thead><tr><th>Step</th><th>Initial-email prompt</th><th>Sent</th><th>Replies</th><th>Reply rate</th></tr></thead>
+        <thead><tr><th>Step</th><th>Initial-email template</th><th>Sent</th><th>Replies</th><th>Reply rate</th></tr></thead>
         <tbody>{% for row in results %}
           <tr><td>{{ row.step }}</td><td>{{ row.variation }}</td><td>{{ row.sent }}</td><td>{{ row.replied }}</td><td>{{ row.reply_rate }}%</td></tr>
         {% endfor %}</tbody>

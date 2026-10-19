@@ -276,21 +276,21 @@ def sequence_state(prospect: Prospect, sent_step: int) -> dict:
 
 
 def write_next_followup(prospect: Prospect) -> str:
-    """Write the prospect's next follow-up for review right away (the webhook does this; nothing runs on a timer).
-    Returns what happened; a failure leaves it for Write follow-ups (dashboard) or the generate_followups command."""
+    """Fill in the prospect's next follow-up from its template, for review, right away (the webhook does this;
+    nothing runs on a timer). Returns what happened; a follow-up held back (a variable with no value) or a failure is
+    left for Write follow-ups (dashboard) or the generate_followups command."""
     from pipeline.services import followups
 
     due = followups.find_due({"prospect_id": [prospect.pk]})
     if not due:
         return "no follow-up to write"
-    llm = generation.make_llm_client()
-    if llm is None:
-        return "follow-up not written: no LLM key"
     try:
-        outcome, detail = followups.write_followup(due[0], llm)
+        outcome, detail = followups.write_followup(due[0])
     except Exception as error:  # noqa: BLE001 - the email was sent either way; report and let a person retry
         return f"follow-up not written ({type(error).__name__}); use Write follow-ups"
-    return f"follow-up {due[0]['sequence']} written for review" if outcome == "saved" else f"follow-up {outcome}: {detail}"
+    if outcome == "saved":
+        return f"follow-up {due[0]['sequence']} written for review"
+    return f"follow-up {due[0]['sequence']} {'held back' if outcome == 'held' else outcome}: {detail}"
 
 
 def record_sent(contact_id: str, followup_count=None, client: ghl.Client | None = None,

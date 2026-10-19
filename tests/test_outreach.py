@@ -31,7 +31,6 @@ from pipeline.models import (
 )
 from pipeline.services import ghl, outreach, stakeholders
 from tests.support import make_business, make_campaign, make_contact, make_email, make_email_prompt, review_env
-from tests.test_generate_emails import FakeLLM
 
 KARACHI = ZoneInfo("Asia/Karachi")
 FIELD_IDS = {"contact.email_subject": "fSubject", "contact.email_body": "fBody", "contact.email_due_at": "fDue",
@@ -112,9 +111,7 @@ class OutreachCase(TestCase):
     def setUp(self):
         self.ghl = FakeGhl()
         self.addCleanup(self.ghl.close)
-        self.llm = FakeLLM()
-        self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, {**review_env(self.llm), "GHL_API_KEY": "pit-test", "GHL_LOCATION_ID": "loc1",
+        env = mock.patch.dict(os.environ, {**review_env(), "GHL_API_KEY": "pit-test", "GHL_LOCATION_ID": "loc1",
                                            "GHL_BASE_URL": self.ghl.url, "GHL_WEBHOOK_SECRET": SECRET})
         env.start()
         self.addCleanup(env.stop)
@@ -332,12 +329,16 @@ class WebhookTests(OutreachCase):
         self.assertEqual(Email.objects.filter(prospect_id=email.prospect_id).count(), 2)  # no second follow-up
         self.assertEqual(Email.objects.get(pk=email.pk).sent_at, email.sent_at)
 
-    def test_a_follow_up_the_ai_could_not_write_is_left_for_later(self):
+    def test_a_follow_up_with_a_missing_variable_is_held_back(self):
+        from pipeline.models import EmailPrompt
+
         email = self.handed_over()
-        self.llm.mode = "bad"
+        EmailPrompt.objects.filter(kind="follow_up").update(body="Hi, about your {{team_size}} people.")
         response = self.hook("email-sent", {"contact_id": self.contact_id(email), "followup_count": "0"})
         self.assertEqual(response.status_code, 200)  # the email was sent either way
-        self.assertIn("follow-up not written", response.json()["follow_up"])
+        self.assertIn("held back", response.json()["follow_up"])
+        self.assertIn("{{team_size}}", response.json()["follow_up"])
+        self.assertFalse(Email.objects.filter(prospect_id=email.prospect_id, sequence_step=2).exists())
         self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
 
     def test_an_email_whose_hand_over_timed_out_is_still_recorded(self):

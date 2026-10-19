@@ -109,8 +109,9 @@ class CampaignPrompt(models.Model):
 
 
 class EmailPrompt(models.Model):
-    """Instructions that write one kind of email: an initial email (a campaign can pick several, split equally as an
-    A/B test) or a follow-up (a campaign picks one per follow-up step). Reusable across campaigns."""
+    """An email template: a subject and a body with {{variables}}, filled in per prospect (pipeline/services/
+    templates.py). Initial-email templates can be A/B tested (a campaign picks several, split equally); follow-up
+    templates are picked per follow-up step. Reusable across campaigns. (The table keeps its old name.)"""
 
     class Kind(models.TextChoices):
         INITIAL = "initial", "Initial email"
@@ -119,16 +120,19 @@ class EmailPrompt(models.Model):
     name = models.CharField(max_length=255, unique=True)
     kind = models.CharField(max_length=16, choices=Kind.choices, default=Kind.INITIAL, db_default=Kind.INITIAL,
                             help_text="Initial emails can be A/B tested on a campaign; follow-ups are picked per step.")
-    prompt = models.TextField(help_text="Everything the model needs to write this email: who we are and what we "
-                                        "offer, the rules, structure, call to action, length and style. The model "
-                                        "receives exactly this text, with the prospect's details as input (follow-ups "
-                                        "also get follow_up and previous_emails).")
+    subject = models.CharField(max_length=200, default="", db_default="",
+                               help_text="E.g. Quick question for {{business_short_name}}. Variables: see Email "
+                                         "variables; {{name|fallback}} uses the fallback when there is no value.")
+    body = models.TextField(default="", db_default="",
+                            help_text="Plain text with {{variables}}; blank lines separate paragraphs. The footer is "
+                                      "added automatically.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "email_prompts"
         ordering = ["kind", "name"]
+        verbose_name = "email template"
         constraints = [models.CheckConstraint(condition=models.Q(kind__in=["initial", "follow_up"]),
                                               name="ck_email_prompts_kind")]
 
@@ -148,7 +152,7 @@ class FollowUp(models.Model):
     days_after_previous = models.PositiveIntegerField(default=3, help_text="Days after the previous email was sent.")
     email_prompt = models.ForeignKey(EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True,
                                      related_name="follow_up_steps", limit_choices_to={"kind": "follow_up"},
-                                     help_text="The prompt that writes this follow-up.")
+                                     verbose_name="template", help_text="The follow-up template for this step.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -187,8 +191,9 @@ class DiscoveryCampaign(models.Model):
     )
     initial_email_prompts = models.ManyToManyField(
         EmailPrompt, blank=True, related_name="initial_for_campaigns", limit_choices_to={"kind": "initial"},
-        help_text="Prompts that write the initial email. With several, prospects are split equally between them "
-                  "(A/B test) and each keeps its prompt.")
+        verbose_name="initial-email templates",
+        help_text="Templates for the first email. With several, prospects are split equally between them (A/B test) "
+                  "and each keeps its template.")
     min_score = models.PositiveSmallIntegerField(
         default=50, db_default=50, help_text="Businesses scoring at least this go on to finding decision makers; lower ones wait "
                               "for a person to approve or reject them.")
@@ -502,7 +507,8 @@ class Prospect(models.Model):
     outreach_priority = models.CharField(max_length=16, null=True, blank=True)
     initial_email_prompt = models.ForeignKey(
         EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
-        help_text="The initial-email prompt this prospect got (A/B group), set when its first email is written.")
+        verbose_name="initial-email template",
+        help_text="The initial-email template this prospect got (A/B group), set when its first email is written.")
     approved_by_person = models.BooleanField(
         default=False, db_default=False, help_text="A person approved emailing this address although verification did not confirm it.")
     ghl_contact_id = models.CharField(max_length=64, null=True, blank=True, db_index=True,
@@ -559,7 +565,7 @@ class Email(models.Model):
     generation_provider = models.CharField(max_length=32, null=True, blank=True)
     generation_model = models.CharField(max_length=128, null=True, blank=True)
     email_prompt = models.ForeignKey(EmailPrompt, on_delete=models.SET_NULL, null=True, blank=True, related_name="emails",
-                                     help_text="The email prompt this email was written with.")
+                                     verbose_name="template", help_text="The template this email was filled from.")
     generated_at = models.DateTimeField(null=True, blank=True)
     reviewed_at = models.DateTimeField(null=True, blank=True)
     review_note = models.TextField(null=True, blank=True)

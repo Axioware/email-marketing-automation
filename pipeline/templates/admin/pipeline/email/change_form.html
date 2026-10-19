@@ -46,11 +46,11 @@
       {% endif %}
       {% if email.status == "in_review" or email.status == "rejected" %}
         <form method="post" action="{{ regenerate_url }}">{% csrf_token %}
-          <select name="email_prompt" aria-label="Email prompt">
-            <option value="">{% if email.email_prompt %}Same prompt ({{ email.email_prompt.name }}){% else %}The campaign's prompt{% endif %}</option>
+          <select name="email_prompt" aria-label="Template">
+            <option value="">{% if email.email_prompt %}Same template ({{ email.email_prompt.name }}){% else %}The campaign's template{% endif %}</option>
             {% for prompt in email_prompts %}<option value="{{ prompt.pk }}">{{ prompt }}</option>{% endfor %}
           </select>
-          <input type="submit" value="Regenerate with AI"></form>
+          <input type="submit" value="Fill in again from template"></form>
       {% endif %}
     </div>
 

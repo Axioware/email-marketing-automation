@@ -1,0 +1,31 @@
+{% extends "admin/base_site.html" %}
+{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">Home</a> › <a href="{% url 'admin:pipeline_emailprompt_changelist' %}">Email templates</a> › Email variables</div>{% endblock %}
+{% block content %}
+<div id="content-main" class="pipeline-guide">
+  <p>Use these in an email template's subject or body. They are filled in for each prospect when its email is written.</p>
+  <ul>
+    <li><code>{{ plain }}</code>: the value, e.g. <i>Ayesha</i>.</li>
+    <li><code>{{ with_fallback }}</code>: the value, or <i>there</i> when the prospect has none.</li>
+    <li>A variable with no value and no fallback holds that prospect's email back; the run says which variable.</li>
+    <li>Lists (e.g. languages) are joined with commas; yes/no fields show <i>yes</i> or <i>no</i>.</li>
+  </ul>
+  {% if example %}<p class="help">Examples are this prospect's values: {{ example }}.</p>{% endif %}
+  <table>
+    <thead><tr><th>Variable</th><th>What it is</th><th>Example</th></tr></thead>
+    <tbody>
+    {% regroup rows by group as groups %}
+    {% for group in groups %}
+      <tr><th colspan="3">{{ group.grouper }}</th></tr>
+      {% for row in group.list %}
+        <tr>
+          <td><code>{{ row.token }}</code></td>
+          <td>{{ row.description }}</td>
+          <td>{% if row.example %}{{ row.example }}{% else %}<span class="help">no value</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    {% endfor %}
+    </tbody>
+  </table>
+  <p><a href="{% url 'admin:pipeline_emailprompt_changelist' %}">Email templates</a></p>
+</div>
+{% endblock %}

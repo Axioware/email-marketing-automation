@@ -1,4 +1,4 @@
-"""Campaign prompts and email prompts: storage rules, how emails pick them, the admin pages and the API."""
+"""Campaign prompts and email templates: storage rules, how emails pick them, the admin pages and the API."""
 import os
 from unittest import mock
 
@@ -12,27 +12,25 @@ from rest_framework.test import APIClient
 from pipeline.models import CampaignPrompt, DiscoveryCampaign, Email, EmailPrompt, PipelineRun
 from pipeline.migrations import _prompt_texts as prompt_texts
 from pipeline.services import research
-from tests.support import CAMPAIGN_INLINE, make_business, make_campaign, make_email, review_env, run_command
-from tests.test_generate_emails import FakeLLM
+from tests.support import (CAMPAIGN_INLINE, make_business, make_campaign, make_email, make_email_prompt, review_env,
+                           run_command)
 
 KEY = "prompt-test-key"
 
 
 class PromptCase(TestCase):
     def setUp(self):
-        self.llm = FakeLLM()
-        self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.llm))
+        env = mock.patch.dict(os.environ, review_env())
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_superuser("admin", "a@example.org", "pw")
         self.client.force_login(self.user)
 
     def prompt_set(self, name="Dental", campaign=None):
-        """A campaign prompt, an initial-email prompt and a second initial prompt the campaign does not use."""
+        """A campaign prompt, an initial-email template and a second initial template the campaign does not use."""
         campaign_prompt = CampaignPrompt.objects.create(name=name, prompt=f"CAMPAIGN RULES {name}")
-        first = EmailPrompt.objects.create(name=f"First touch {name}", prompt=f"FIRST TOUCH {name}")
-        other = EmailPrompt.objects.create(name=f"Other {name}", prompt=f"OTHER {name}")
+        first = make_email_prompt(f"First touch {name}", f"FIRST TOUCH {name}")
+        other = make_email_prompt(f"Other {name}", f"OTHER {name}")
         if campaign is not None:
             campaign.campaign_prompt = campaign_prompt
             campaign.save()
@@ -45,15 +43,18 @@ class PromptCase(TestCase):
 
 class ModelTests(PromptCase):
     def test_seeded_axioware_prompts(self):
-        """The migrations leave the qualification criteria in the campaign prompt and the whole email text (what the
-        model received before 0008) in the initial-email prompt."""
+        """The migrations leave the qualification criteria in the campaign prompt, and turn the seeded email prompt
+        into a starter template (0022) that uses only real variables."""
+        from pipeline.services import templates
+
         seeded = CampaignPrompt.objects.get(name="Axioware - dental clinics")
         self.assertEqual(seeded.prompt, prompt_texts.QUALIFICATION_PROMPT)
         self.assertFalse(hasattr(research, "AGENT_INSTRUCTIONS"))  # nothing is added in front of it
         first_touch = EmailPrompt.objects.get(name="First-touch email")
         self.assertEqual(first_touch.kind, "initial")
-        self.assertEqual(first_touch.prompt,
-                         f"{prompt_texts.OLD_CAMPAIGN_PROMPT.strip()}\n\n{prompt_texts.OLD_EMAIL_PROMPT.strip()}")
+        self.assertEqual(first_touch.subject, "Quick question for {{business_short_name}}")
+        self.assertIn("Hi {{first_name|there}},", first_touch.body)
+        self.assertEqual(templates.problems(first_touch.subject + first_touch.body, follow_up=False), [])
 
     def test_prompts_are_shared_between_campaigns(self):
         campaign_prompt, first, _ = self.prompt_set(campaign=make_campaign(name="A"))
@@ -62,7 +63,7 @@ class ModelTests(PromptCase):
         self.assertEqual(set(campaign_prompt.campaigns.all()), {second, DiscoveryCampaign.objects.get(name="A")})
         self.assertEqual(first.initial_for_campaigns.count(), 2)
         with self.assertRaises(IntegrityError), transaction.atomic():
-            EmailPrompt.objects.create(name=first.name, prompt="x")  # names are unique
+            EmailPrompt.objects.create(name=first.name, body="x")  # names are unique
 
     def test_deleting_a_prompt_keeps_campaigns_and_emails(self):
         email = make_email()
@@ -106,8 +107,9 @@ class GenerationTests(PromptCase):
         prospect = self.ready_prospect(campaign)
         result = self.generate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.llm.system_prompts[-1], "FIRST TOUCH Dental")  # the email prompt alone
-        self.assertEqual(Email.objects.get(prospect=prospect).email_prompt, first)
+        email = Email.objects.get(prospect=prospect)
+        self.assertEqual(email.email_prompt, first)
+        self.assertIn("FIRST TOUCH Dental about", email.body_text)
         prospect.refresh_from_db()
         self.assertEqual(prospect.initial_email_prompt, first)
 
@@ -116,24 +118,24 @@ class GenerationTests(PromptCase):
         _, _, other = self.prompt_set(campaign=campaign)
         prospect = self.ready_prospect(campaign)
         result = self.generate("--email-prompt-id", other.pk)
-        self.assertIn("Using email prompt: Other Dental", result.stdout)
-        self.assertEqual(self.llm.system_prompts[-1], "OTHER Dental")
-        self.assertEqual(Email.objects.get(prospect=prospect).email_prompt, other)
+        self.assertIn("Using template: Other Dental", result.stdout)
+        email = Email.objects.get(prospect=prospect)
+        self.assertEqual(email.email_prompt, other)
+        self.assertIn("OTHER Dental about", email.body_text)
 
     def test_campaign_without_initial_prompts_is_skipped(self):
         prospect = self.ready_prospect(make_campaign(initial_prompts=[]))
         result = self.generate()
         self.assertEqual(result.returncode, 1)
-        self.assertIn(f"Prospect {prospect.pk} <{prospect.email}> skipped: its campaign has no initial-email prompt",
+        self.assertIn(f"Prospect {prospect.pk} <{prospect.email}> skipped: its campaign has no initial-email template",
                       result.stdout)
-        self.assertIn("1 skipped (no email prompt)", result.stdout)
-        self.assertEqual(self.llm.system_prompts, [])
+        self.assertIn("1 skipped (no template)", result.stdout)
         self.assertFalse(Email.objects.filter(prospect=prospect).exists())
         prospect.refresh_from_db()
         self.assertIsNone(prospect.initial_email_prompt)  # no A/B group until it can get an email
         email = make_email(campaign=prospect.business.discovery_campaign)  # regenerating says why too
         response = self.client.post(reverse("admin:pipeline_email_regenerate", args=[email.pk]), follow=True)
-        self.assertContains(response, "Cannot regenerate: its campaign has no initial-email prompt")
+        self.assertContains(response, "Cannot fill it in: its campaign has no initial-email template")
 
     def test_campaign_prompt_is_not_needed_to_write_emails(self):
         prospect = self.ready_prospect(make_campaign(campaign_prompt=None))
@@ -144,15 +146,15 @@ class GenerationTests(PromptCase):
         first_campaign, second_campaign = make_campaign(name="One"), make_campaign(name="Two")
         self.prompt_set("One", first_campaign)
         self.prompt_set("Two", second_campaign)
-        self.ready_prospect(first_campaign)
-        self.ready_prospect(second_campaign)
+        one, two = self.ready_prospect(first_campaign), self.ready_prospect(second_campaign)
         self.generate()
-        self.assertEqual(sorted(self.llm.system_prompts), ["FIRST TOUCH One", "FIRST TOUCH Two"])
+        self.assertIn("FIRST TOUCH One", Email.objects.get(prospect=one).body_text)
+        self.assertIn("FIRST TOUCH Two", Email.objects.get(prospect=two).body_text)
 
     def test_unknown_email_prompt_is_refused(self):
         result = self.generate("--email-prompt-id", 999999)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Email prompt 999999 does not exist", result.stderr)
+        self.assertIn("Template 999999 does not exist", result.stderr)
 
     def test_regenerate_keeps_the_prompt_or_uses_the_chosen_one(self):
         email = make_email()
@@ -160,13 +162,13 @@ class GenerationTests(PromptCase):
         Email.objects.filter(pk=email.pk).update(email_prompt=other)
         url = reverse("admin:pipeline_email_regenerate", args=[email.pk])
         self.client.post(url)
-        self.assertEqual(self.llm.system_prompts[-1], "OTHER Dental")
+        self.assertIn("OTHER Dental", Email.objects.get(pk=email.pk).body_text)
         self.client.post(url, {"email_prompt": first.pk})
-        self.assertEqual(self.llm.system_prompts[-1], "FIRST TOUCH Dental")
+        self.assertIn("FIRST TOUCH Dental", Email.objects.get(pk=email.pk).body_text)
         self.assertEqual(Email.objects.get(pk=email.pk).email_prompt, first)
         page = self.client.get(reverse("admin:pipeline_email_change", args=[email.pk])).content.decode()
         self.assertIn('name="email_prompt"', page)
-        self.assertIn("Same prompt (First touch Dental)", page)
+        self.assertIn("Same template (First touch Dental)", page)
 
 
 class CampaignAdminTests(PromptCase):
@@ -182,7 +184,7 @@ class CampaignAdminTests(PromptCase):
 
     def test_choose_prompts_and_settings_on_the_campaign(self):
         campaign_prompt, first, other = self.prompt_set("Shared", campaign=make_campaign(name="Other"))
-        follow = EmailPrompt.objects.create(name="A follow-up", kind="follow_up", prompt="F")
+        follow = make_email_prompt("A follow-up", kind="follow_up")
         url = reverse("admin:pipeline_discoverycampaign_add")
         page = self.client.get(url)
         form = page.context["adminform"].form
@@ -242,11 +244,11 @@ class CampaignAdminTests(PromptCase):
         bare = make_campaign(name="Bare", campaign_prompt=None, initial_prompts=[])
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[bare.pk]))
         self.assertContains(page, "This campaign has no campaign prompt: its businesses will not be researched")
-        self.assertContains(page, "This campaign has no initial-email prompt")
+        self.assertContains(page, "This campaign has no initial-email template")
         fine = make_campaign(name="Fine")
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[fine.pk]))
         self.assertNotContains(page, "has no campaign prompt")
-        self.assertNotContains(page, "no initial-email prompt")
+        self.assertNotContains(page, "no initial-email template")
 
     def test_prompt_pages(self):
         campaign_prompt, first, _ = self.prompt_set(campaign=make_campaign(name="Mine"))
@@ -262,8 +264,9 @@ class CampaignAdminTests(PromptCase):
         self.assertIn("&quot;team_size&quot;", detail)  # the default output fields are in it
         self.assertIn("Mine", detail)  # used by campaigns
         detail = self.client.get(reverse("admin:pipeline_emailprompt_change", args=[first.pk])).content.decode()
-        self.assertNotIn("CAMPAIGN RULES Dental", detail)  # the email prompt is used on its own
-        self.assertIn("initial email", detail)
+        self.assertNotIn("CAMPAIGN RULES Dental", detail)
+        self.assertIn("FIRST TOUCH Dental about", detail)  # the template, and its preview
+        self.assertIn(reverse("admin:email_variables"), detail)
 
 
 class AnswerSchemaTests(PromptCase):
@@ -442,16 +445,30 @@ class PromptApiTests(PromptCase):
         created = response.json()
         self.assertEqual((created["prompt"], created["campaigns"]), ("Day spas score high.", []))
         self.assertNotIn("full_prompt", created)
-        first = self.api.post("/api/email-prompts/", {"name": "First", "kind": "initial", "prompt": "Write to spas."},
+        first = self.api.post("/api/email-templates/", {"name": "First", "kind": "initial",
+                                                         "subject": "Hi {{business_short_name}}",
+                                                         "body": "Hi {{first_name|there}}, about {{team_size|your team}}."},
                               format="json")
         self.assertEqual(first.status_code, 201, first.content)
-        follow = self.api.post("/api/email-prompts/", {"name": "Follow-up", "kind": "follow_up",
-                                                        "prompt": "Short follow-up."}, format="json")
+        self.assertEqual(self.api.get(f"/api/email-prompts/{first.json()['id']}/").json()["subject"],
+                         "Hi {{business_short_name}}")  # the old address still works
+        follow = self.api.post("/api/email-templates/", {"name": "Follow-up", "kind": "follow_up",
+                                                          "subject": "Re: {{previous_subject}}", "body": "Short."},
+                               format="json")
         self.assertEqual(follow.status_code, 201, follow.content)
-        duplicate = self.api.post("/api/email-prompts/", {"name": "First", "prompt": "x"}, format="json")
+        duplicate = self.api.post("/api/email-templates/", {"name": "First", "body": "x"}, format="json")
         self.assertEqual(duplicate.status_code, 400)  # names are unique
-        self.assertEqual(self.api.post("/api/email-prompts/", {"name": "Odd", "kind": "other", "prompt": "x"},
+        self.assertEqual(self.api.post("/api/email-templates/", {"name": "Odd", "kind": "other", "body": "x"},
                                        format="json").status_code, 400)
+        unknown = self.api.post("/api/email-templates/", {"name": "Typo", "body": "Hi {{frist_name}}"}, format="json")
+        self.assertEqual(unknown.status_code, 400)
+        self.assertIn("frist_name", str(unknown.json()))
+        previous = self.api.post("/api/email-templates/", {"name": "Prev", "subject": "Re: {{previous_subject}}",
+                                                            "body": "x"}, format="json")
+        self.assertEqual(previous.status_code, 400)  # only follow-ups have a previous email
+        variables = self.api.get("/api/email-variables/").json()
+        self.assertIn("first_name", str(variables))
+        self.assertIn("team_size", str(variables))  # research output fields are variables too
         campaign = self.api.post("/api/campaigns/", {
             "name": "Spa campaign", "campaign_prompt": created["id"], "initial_email_prompts": [first.json()["id"]],
             "min_score": 70, "send_window_start": "09:00", "send_window_end": "18:00"}, format="json")
@@ -479,7 +496,7 @@ class PromptApiTests(PromptCase):
         with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
             run = self.api.post("/api/runs/", {"command": "generate_emails", "options": {"email_prompt_id": follow.pk}},
                                 format="json")
-        self.assertEqual(run.json()["arguments"], ["--email-prompt-id", str(follow.pk)])
+        self.assertEqual(run.json()["arguments"], ["--template-id", str(follow.pk)])
 
 
 class BusinessQuickFilterTests(PromptCase):

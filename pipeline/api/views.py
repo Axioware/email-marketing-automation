@@ -289,6 +289,17 @@ class PipelineRunViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.
         return Response([jobs.describe_command(command) for command in jobs.COMMANDS])
 
 
+class EmailVariablesView(APIView):
+    """Every variable an email template can use: {{name}}, or {{name|fallback}} for a value when there is none."""
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        from pipeline.services import templates
+
+        return Response([{"name": name, "description": description}
+                         for name, description in templates.known_variables().items()])
+
+
 class SendingSettingsView(APIView):
     """How fast emails go out, for all campaigns together: the daily cap and the gaps between sends (GET; PATCH or
     PUT to change them)."""

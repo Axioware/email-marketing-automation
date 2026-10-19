@@ -9,7 +9,6 @@ from rest_framework.test import APIClient
 
 from pipeline.models import BusinessContact, DiscoveryCampaign, Email, PipelineRun, Prospect
 from tests.support import BASE, make_business, make_campaign, make_contact, make_email, review_env
-from tests.test_generate_emails import FakeLLM
 
 
 KEY = "test-api-key-0123456789"
@@ -18,9 +17,7 @@ KEY = "test-api-key-0123456789"
 @override_settings(AUTH_TOKEN=KEY)
 class ApiCase(TestCase):
     def setUp(self):
-        self.llm = FakeLLM()
-        self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.llm))
+        env = mock.patch.dict(os.environ, review_env())
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_user("staff", "staff@example.org", "pw", is_staff=True)
@@ -209,7 +206,7 @@ class EmailApiTests(ApiCase):
         email = make_email("rejected")
         response = self.api.post(f"/api/emails/{email.pk}/regenerate/")
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertIn("Idea for Clinic", response.json()["email"]["subject"])
+        self.assertIn("TEST TEMPLATE for Clinic", response.json()["email"]["subject"])
         self.assertEqual(response.json()["email"]["tracking_token"], email.tracking_token)
 
     def test_there_is_no_send_endpoint(self):

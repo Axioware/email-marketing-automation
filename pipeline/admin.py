@@ -117,7 +117,7 @@ def ids_arguments(flag: str, ids) -> list[str]:
 
 
 def generate_url(scope: str | None = None, ids=(), regenerate: bool = False) -> str:
-    """The "Generate emails" page (choose an email prompt), optionally for selected businesses or prospects."""
+    """The "Write emails" page (choose a template), optionally for selected businesses or prospects."""
     query = {}
     if scope:
         query.update(scope=scope, ids=",".join(str(pk) for pk in sorted(set(ids))))
@@ -215,11 +215,11 @@ def prompt_problems(campaign) -> list[str]:
     problems = []
     if campaign.campaign_prompt_id is None:
         problems.append("This campaign has no campaign prompt: its businesses will not be researched. Choose one "
-                        "under Prompts.")
+                        "under Research and emails.")
     if not campaign.initial_email_prompts.exists():
-        problems.append("This campaign has no initial-email prompt: no emails will be written. Choose at least one "
-                        "under Prompts (several are split equally as an A/B test).")
-    problems += [f"Follow-up {step.sequence} has no email prompt; the sequence ends before it. Choose one in the "
+        problems.append("This campaign has no initial-email template: no emails will be written. Choose at least one "
+                        "under Research and emails (several are split equally as an A/B test).")
+    problems += [f"Follow-up {step.sequence} has no template; the sequence ends before it. Choose one in the "
                  "Follow-ups table." for step in campaign.follow_ups.filter(email_prompt__isnull=True)]
     return problems
 
@@ -239,10 +239,11 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
                                   "(MAPS_SCRAPER_URL); the built-in browser only works on a machine with Chromium, not "
                                   "on Vercel. Businesses scoring below the minimum score wait for you to approve or "
                                   "reject them (Businesses > Needs review)."}),
-        ("Prompts", {"fields": ["campaign_prompt", "initial_email_prompts"],
-                     "description": "Campaign prompt: qualifies businesses. Initial-email prompts: write the first "
-                                    "email; with several, prospects are split equally (A/B test) and each keeps its "
-                                    "prompt. Follow-up prompts are chosen per step in the Follow-ups table below."}),
+        ("Research and emails", {"fields": ["campaign_prompt", "initial_email_prompts"],
+                                 "description": "Campaign prompt: qualifies businesses (research). Initial-email "
+                                                "templates: the first email; with several, prospects are split equally "
+                                                "(A/B test) and each keeps its template. Follow-up templates are chosen "
+                                                "per step in the Follow-ups table below."}),
         ("Sending", {"fields": [("send_window_start", "send_window_end"), "send_timezone"],
                      "description": "Each approved email gets a send time inside this window. The daily cap and the "
                                     "gaps between emails are the same for all campaigns: Settings in the sidebar."}),
@@ -394,8 +395,9 @@ class CampaignPromptAdmin(PipelineAdmin):
 class EmailPromptForm(forms.ModelForm):
     class Meta:
         model = EmailPrompt
-        fields = ["name", "kind", "prompt"]
-        widgets = {"prompt": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"})}
+        fields = ["name", "kind", "subject", "body"]
+        widgets = {"subject": forms.TextInput(attrs={"class": "vLargeTextField"}),
+                   "body": forms.Textarea(attrs={"rows": 18, "class": "vLargeTextField"})}
 
     def clean_kind(self):
         kind = self.cleaned_data["kind"]
@@ -407,24 +409,70 @@ class EmailPromptForm(forms.ModelForm):
                 raise forms.ValidationError("Campaigns use it for a follow-up step; remove it there first.")
         return kind
 
+    def clean(self):
+        from pipeline.services import templates
+
+        cleaned = super().clean()
+        known = templates.known_variables()
+        follow_up = cleaned.get("kind") == "follow_up"
+        for field in ("subject", "body"):
+            if not (cleaned.get(field) or "").strip():
+                self.add_error(field, "Required.")
+                continue
+            for problem in templates.problems(cleaned[field], known, follow_up):
+                self.add_error(field, problem)
+        return cleaned
+
+
+def template_preview(template: EmailPrompt):
+    """The template filled in with a real prospect (the most recent ready one), or what is missing."""
+    from pipeline.services import templates
+
+    prospect = (generation.ready_prospects().order_by("-id").first()
+                or Prospect.objects.order_by("-id").first())
+    if prospect is None or not template.pk:
+        return "Shown once there is a prospect."
+    row = generation.prospect_rows(Prospect.objects.filter(pk=prospect.pk))[0]
+    if template.kind == "follow_up":
+        row["previous_subject"] = "Quick question for your clinic"  # an example of the previous email's subject
+    try:
+        subject, body = templates.render(template.subject, template.body, row)
+    except templates.TemplateIncomplete as error:
+        return format_html("For {} ({}): held back, {}.", row["business_name"], row["recipient"], str(error))
+    return format_html('<p class="help">For {} ({})</p><p><b>{}</b></p><pre class="pipeline-pre">{}</pre>',
+                       row["business_name"], row["recipient"], subject, body)
+
 
 @admin.register(EmailPrompt)
 class EmailPromptAdmin(PipelineAdmin):
     form = EmailPromptForm
-    list_display = ["name", "kind", "used_by", "email_count", "updated_at"]
+    list_display = ["name", "kind", "subject", "used_by", "email_count", "updated_at"]
     list_filter = ["kind"]
-    search_fields = ["name", "prompt"]
-    readonly_fields = ["used_by", "created_at", "updated_at"]
+    search_fields = ["name", "subject", "body"]
+    readonly_fields = ["used_by", "variables_link", "preview", "created_at", "updated_at"]
     fieldsets = [
-        (None, {"fields": ["name", "kind", "used_by", "prompt"],
-                "description": "Writes one kind of email: the model receives exactly this text, with the prospect's "
-                               "details (and, for follow-ups, follow_up and previous_emails) as input. Campaigns choose "
-                               "initial-email prompts (several = A/B test) and one follow-up prompt per step."}),
+        (None, {"fields": ["name", "kind", "used_by"]}),
+        ("Template", {"fields": ["variables_link", "subject", "body"],
+                      "description": "Write the email with {{variables}} that are filled in for each prospect, e.g. "
+                                     "Hi {{first_name|there}}, ... {{business_short_name}}. {{name|fallback}} uses "
+                                     "the fallback when the prospect has no value; without a fallback, a prospect "
+                                     "with no value gets no email (the run says why). The footer is added "
+                                     "automatically. Campaigns choose initial-email templates (several = A/B test) "
+                                     "and one follow-up template per step."}),
+        ("Preview", {"fields": ["preview"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).annotate(email_total=Count("emails"))
+
+    @admin.display(description="Variables")
+    def variables_link(self, obj):
+        return format_html('<a href="{}" target="_blank">All variables, with examples</a>', reverse("admin:email_variables"))
+
+    @admin.display(description="With a real prospect")
+    def preview(self, obj):
+        return template_preview(obj)
 
     @admin.display(description="Used by")
     def used_by(self, obj):
@@ -751,7 +799,7 @@ class BusinessAdmin(PipelineAdmin):
     def verify_emails(self, request, queryset):
         return run_step("verify_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
 
-    @admin.action(description="Generate outreach emails (Module 5)")
+    @admin.action(description="Write emails from templates (Module 5)")
     def generate_emails(self, request, queryset):
         return HttpResponseRedirect(generate_url("business", queryset.values_list("pk", flat=True)))
 
@@ -921,16 +969,16 @@ GENERATE_SCOPES = {"business": ("--business-id", Business, "business(es)"),
 
 class GenerateEmailsForm(forms.Form):
     email_prompt = forms.ModelChoiceField(
-        EmailPrompt.objects.filter(kind="initial"), required=False,
-        empty_label="Each campaign's initial-email prompts (A/B split)",
-        help_text="Leave empty to use each campaign's initial-email prompts. Use + to write a new prompt, the pencil "
-                  "to edit one.",
+        EmailPrompt.objects.filter(kind="initial"), required=False, label="Template",
+        empty_label="Each campaign's initial-email templates (A/B split)",
+        help_text="Leave empty to use each campaign's initial-email templates. Use + to write a new template, the "
+                  "pencil to edit one.",
     )
-    regenerate = forms.BooleanField(required=False, label="Rewrite emails that are in review or rejected",
+    regenerate = forms.BooleanField(required=False, label="Fill in again the emails that are in review or rejected",
                                     help_text="Approved and sent emails are never changed.")
     limit = forms.IntegerField(required=False, min_value=1, help_text="At most this many prospects (optional).")
     dry_run = forms.BooleanField(required=False, label="Dry run",
-                                 help_text="Show the emails in the run output without saving them.")
+                                 help_text="Show the filled-in emails in the run output without saving them.")
 
 
 @admin.register(Prospect)
@@ -999,15 +1047,15 @@ class ProspectAdmin(PipelineAdmin):
     def emails_link(self, obj):
         return changelist_link(Email, f"{obj.emails.count()} email(s)", prospect__id__exact=obj.pk) if obj.pk else "-"
 
-    @admin.action(description="Generate outreach emails (Module 5)")
+    @admin.action(description="Write emails from templates (Module 5)")
     def generate_emails(self, request, queryset):
         return HttpResponseRedirect(generate_url("prospect", queryset.values_list("pk", flat=True)))
 
-    @admin.action(description="Regenerate emails still in review or rejected (Module 5)")
+    @admin.action(description="Fill in again emails still in review or rejected (Module 5)")
     def regenerate_emails(self, request, queryset):
         return HttpResponseRedirect(generate_url("prospect", queryset.values_list("pk", flat=True), regenerate=True))
 
-    # ------------------------------------------------------------ "Generate emails" page
+    # ------------------------------------------------------------ "Write emails" page
 
     def get_urls(self):
         return [path("generate/", self.admin_site.admin_view(self.generate_view), name="pipeline_prospect_generate")] \
@@ -1044,7 +1092,7 @@ class ProspectAdmin(PipelineAdmin):
             target = "every ready prospect that has no email yet"
         context = {
             **self.admin_site.each_context(request),
-            "title": "Generate emails",
+            "title": "Write emails",
             "form": form,
             "media": self.media + form.media,
             "target": target,

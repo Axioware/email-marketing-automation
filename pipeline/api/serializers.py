@@ -88,10 +88,28 @@ class DiscoveryCampaignSerializer(serializers.ModelSerializer):
 
 
 class EmailPromptSerializer(serializers.ModelSerializer):
+    """An email template: subject and body with {{variables}} (GET /api/email-variables/ lists them)."""
+
     class Meta:
         model = EmailPrompt
-        fields = ["id", "name", "kind", "prompt", "created_at", "updated_at"]
+        fields = ["id", "name", "kind", "subject", "body", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, attrs):
+        from pipeline.services import templates
+
+        known = templates.known_variables()
+        kind = attrs.get("kind", getattr(self.instance, "kind", "initial"))
+        errors = {}
+        for field in ("subject", "body"):
+            value = attrs.get(field, getattr(self.instance, field, ""))
+            if not (value or "").strip():
+                errors[field] = ["Required."]
+            elif templates.problems(value, known, kind == "follow_up"):
+                errors[field] = templates.problems(value, known, kind == "follow_up")
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
 
 
 class CampaignPromptSerializer(serializers.ModelSerializer):

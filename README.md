@@ -121,10 +121,10 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 5. Verify emails | Businesses or Contacts > action **Verify emails** | `python manage.py verify_emails` |
 | 3b. Review low scores | Businesses > filter **Needs your review** > **Approve** / **Reject** | - |
 | 5b. Review unverified addresses | Prospects > filter Needs review > **Approve** / **Reject** | - |
-| 6. Write emails | Prospects or Businesses > action **Generate outreach emails** | `python manage.py generate_emails [--email-prompt-id N]` |
-| 7. Review | Emails: edit, Approve (= schedule), Reject, Regenerate | - |
+| 6. Write emails | Prospects or Businesses > action **Write emails from templates** | `python manage.py generate_emails [--email-prompt-id N]` |
+| 7. Review | Emails: edit, Approve (= schedule), Reject, Fill in again | - |
 | 8. Send | Approving hands the email to GoHighLevel, which waits until Email Due At and sends it | `python manage.py ghl_sync` (contacts; re-hands emails whose hand-over failed) |
-| 9. Follow-ups | Campaign > **Follow-ups** table (days + prompt per step); written for review once the previous email is sent | `python manage.py generate_followups` |
+| 9. Follow-ups | Campaign > **Follow-ups** table (days + template per step); written for review once the previous email is sent | `python manage.py generate_followups` |
 
 Every command has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
 
@@ -153,8 +153,9 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 |---|---|
 | `/api/campaigns/` | list, create, edit, delete: `lead_source`, `campaign_prompt`, `initial_email_prompts` (ids; several = A/B), `min_score`, `send_window_start`/`send_window_end`, `send_timezone`; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20, "source": "scraper_api"}` |
 | `/api/settings/` | the global sending settings: `daily_cap`, `gap_fixed_seconds`, `gap_random_min_seconds`, `gap_random_max_seconds` (`GET`, `PATCH`, `PUT`) |
-| `/api/follow-ups/` | a campaign's follow-up steps (sequence, days after previous, `email_prompt`); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops that prospect's sequence |
-| `/api/campaign-prompts/`, `/api/email-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored; shared by campaigns); email prompts write emails (`kind`: `initial` or `follow_up`) |
+| `/api/follow-ups/` | a campaign's follow-up steps (sequence, days after previous, `email_prompt` = its template); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops that prospect's sequence |
+| `/api/campaign-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored; shared by campaigns) |
+| `/api/email-templates/` (also `/api/email-prompts/`), `/api/email-variables/` | email templates (`name`, `kind`: `initial` or `follow_up`, `subject`, `body` with `{{variables}}`; unknown variables are refused with `400`) and the variables they can use |
 | `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/`, `/api/ghl/resume-sequence/` | GoHighLevel webhooks (Custom Data `secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
 | `POST /api/emails/{id}/hand-over/` | hand an approved email whose hand-over failed to GoHighLevel again |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
@@ -300,19 +301,27 @@ python manage.py verify_emails --limit 5 --dry-run --report out.csv
 
 Options: `--business-id`, `--contact-id` (both repeatable), `--limit` (contacts), `--primary-only`, `--min-score`, `--recheck`, `--max-candidates`, `--probe-all`, `--delay`, `--reacher-timeout`, `--mail-from`, `--helo`, `--no-auto-start`, `--report out.csv`, `--dry-run`.
 
-## Generate outreach emails and track opens (Module 5)
+## Write outreach emails from templates and track opens (Module 5)
 
-### Generate emails
+### Write emails
 
-`python manage.py generate_emails` (admin: select prospects or businesses, action **Generate outreach emails**) writes one email per prospect that is ready for outreach (`email_status = 'deliverable'` or approved by a person, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent.** The model sees only what earlier modules stored (business, contact name and title, qualification reasons, `outreach_facts`, `research_summary`). It uses Groq when `GROQ_API_KEY`/`GROK_API_KEY` is set, otherwise OpenAI (`pipeline/services/llm.py`).
+`python manage.py generate_emails` (admin: select prospects or businesses, action **Write emails from templates**) fills one email per prospect that is ready for outreach (`email_status = 'deliverable'` or approved by a person, `outreach_status = 'ready'`, not `do_not_contact`) and stores it in `emails` with status `in_review`. **Nothing is sent, and no AI is involved:** each email is an **email template** (table `email_prompts`, admin **Email templates**) with its variables filled in for that prospect. No AI key is needed for this step (only research uses one).
 
-The model's instructions are one **email prompt** (table `email_prompts`, edited in the admin), used as is. A campaign chooses its **initial-email prompts** (several are an A/B test: prospects are split equally and each keeps its prompt, `prospects.initial_email_prompt`) and one **follow-up prompt per follow-up step**; `--email-prompt-id` overrides. Prompts are reusable across campaigns. There is no built-in prompt: a prospect whose campaign has no initial-email prompt is skipped and reported. The seeded **First-touch email** writes first-touch cold emails for Axioware: one specific observation about the business, one problem it likely has (missed calls, after-hours calls, no-shows, reception workload), Axioware's fitting offer (Ava, the AI dental receptionist, for clinics; voice agents or chatbots otherwise), and one low-pressure call to action (the live demo at axioware.tech/dental-agent or a 15-minute call). It must use only facts from the input and the Axioware facts in the prompt: no invented statistics, testimonials or prices, no claims about the contact's role, no mention of how they were found. The sign-off uses `SENDER_NAME`. Alongside the business and contact, the model gets `website_findings`: facts Module 2 noted on the business's own website (services, hours, booking, reviews), with phone numbers, email addresses and notes about the research itself removed.
+A template has a **Kind** (initial email or follow-up), a **Subject** and a **Body** (plain text, blank lines between paragraphs; the footer is added automatically). Variables:
+
+- `{{first_name}}` is replaced by the prospect's value.
+- `{{first_name|there}}` uses `there` when the prospect has no value.
+- A variable with no value and no fallback **holds that email back** (the run lists it as "held back" and names the variable), so no email goes out with a gap. Give it a fallback, or fill in the missing data, and run again.
+- The variables: `first_name`, `last_name`, `full_name`, `job_title`, `business_name`, `business_short_name` (without the branch Google Maps adds), `category`, `city`, `country`, `website`, `google_rating`, `google_review_count`, `campaign_name`, `sender_name` (`SENDER_NAME`), `sender_company`, `previous_subject` (follow-ups only), and every output field of the campaign prompts (what research extracted, e.g. `team_size`, `languages`; lists are joined with commas, yes/no fields show yes or no). The admin's **Email variables** page (button on the Email templates list, link on each template) lists them all with a real prospect's values; `GET /api/email-variables/` returns the same.
+- Saving a template with an unknown variable, `{{previous_subject}}` in an initial template, or broken braces is refused with the reason. A template's page shows a preview filled in for the latest ready prospect.
+
+A campaign chooses its **initial-email templates** (several are an A/B test: prospects are split equally and each keeps its template, `prospects.initial_email_prompt`; the dashboard shows reply rates per template) and one **follow-up template per follow-up step**; `--email-prompt-id` (or `--template-id`) overrides. Templates are reusable across campaigns. A prospect whose campaign has no initial-email template is skipped and reported. Migration 0022 replaced the old AI prompts' text with starter templates (an initial one and a follow-up one): edit them in the admin.
 
 ```sh
 python manage.py generate_emails --limit 1 --dry-run
 ```
 
-Options: `--prospect-id`, `--business-id` (both repeatable), `--email-prompt-id` (default: each campaign's initial-email prompts), `--limit`, `--regenerate` (rewrites emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run`.
+Options: `--prospect-id`, `--business-id` (both repeatable), `--email-prompt-id` (default: each campaign's initial-email templates), `--limit`, `--regenerate` (fills again emails in review or rejected, keeping their tracking token; approved and sent emails are never modified), `--dry-run` (prints the filled emails without saving).
 
 ### Open tracking (switched off)
 
@@ -349,10 +358,10 @@ Opens are rate limited in the database: at most 10 recorded opens per email per 
 
 ### Review in the admin
 
-Every generated email starts in `in_review`. Review them in the admin under **Emails**:
+Every new email starts in `in_review`. Review them in the admin under **Emails**:
 
 - **List**: counts per status and the open rate at the top (click one to filter), search by business, recipient or subject, and the actions **Approve selected**, **Reject selected** and **Mark replied**.
-- **Email page**: edit the subject and body (the footer is added automatically), see a preview, and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (schedules it, then jumps to the next email in review), **Reject** with an optional note, **Back to review**, and **Regenerate with AI**. A scheduled email shows its send time; editing, rejecting or sending it back to review frees its slot.
+- **Email page**: edit the subject and body (the footer is added automatically), see a preview, and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (schedules it, then jumps to the next email in review), **Reject** with an optional note, **Back to review**, and **Fill in again from template** (optionally with another template). A scheduled email shows its send time; editing, rejecting or sending it back to review frees its slot.
 - Editing an approved email sends it back to review. Emails with `PLACEHOLDER` text cannot be approved. Sent emails are read-only and show their opens.
 
 Statuses: `in_review` -> `approved` -> `scheduled` (send time given) -> `sending` (written into the GoHighLevel contact) -> `sent` (GoHighLevel reported it) -> `replied`; plus `rejected`. `failed` and `opened` are kept for older data and open tracking.
@@ -362,9 +371,9 @@ Statuses: `in_review` -> `approved` -> `scheduled` (send time given) -> `sending
 GoHighLevel waits until each email's due time and sends it from your connected mailbox; this app decides what and when. Nothing in the app runs on a timer.
 
 1. **Contacts.** Every ready prospect (deliverable, or approved by a person) becomes a GHL contact tagged `outreach-app` and `campaign-<name>`: the full pipeline does it as its last step, `ghl_sync` (or the dashboard button) does it any time, and approving an email does it for that prospect. One email address gets one sequence, even if several prospects share it. A GHL workflow turns new tagged contacts into **New Lead** opportunities.
-2. **Approval = hand-over.** Approving an email gives it a send time (stored in `emails.scheduled_at`): the latest planned send of any campaign + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day for all campaigns together (these four are global: the admin's **Settings** page, or `GET`/`PATCH /api/settings/`); a follow-up never before "previous email sent + its days". The email is written into the contact at once: **Email Subject**, **Email Body** (HTML incl. footer), **Follow-up Count** (0 = initial, n = follow-up n), **Email Due At** (the send time, ISO; GHL's date field keeps the date) and, for an initial email, **Initial Email Type** (the prompt's name). Status: **In GoHighLevel**. The GHL workflow waits until Email Due At and sends.
+2. **Approval = hand-over.** Approving an email gives it a send time (stored in `emails.scheduled_at`): the latest planned send of any campaign + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day for all campaigns together (these four are global: the admin's **Settings** page, or `GET`/`PATCH /api/settings/`); a follow-up never before "previous email sent + its days". The email is written into the contact at once: **Email Subject**, **Email Body** (HTML incl. footer), **Follow-up Count** (0 = initial, n = follow-up n), **Email Due At** (the send time, ISO; GHL's date field keeps the date) and, for an initial email, **Initial Email Type** (the template's name). Status: **In GoHighLevel**. The GHL workflow waits until Email Due At and sends.
 3. **Failures.** A write GHL refuses leaves the email **Approved** with the error shown (dashboard: "not in GoHighLevel yet"; **Hand to GoHighLevel** on the email, the Emails action, `ghl_sync`, or `POST /api/emails/{id}/hand-over/`). Writes are never retried automatically (only a 429 rate limit is), and handing over again first reads the contact: if GHL already has the email (a write that timed out after GHL saved it), it is not written again, so it is never sent twice.
-4. **Sent.** The workflow calls `POST /api/ghl/email-sent/`. The app marks the email sent, empties Subject, Body and Due At and sets **Follow-up Count** to the next follow-up's number, or empties it when the sequence is over (the workflow then moves the lead to **Quota Exhausted**), and then writes the next follow-up for review (if the AI fails, **Write follow-ups** on the dashboard retries). Approving the follow-up hands it over the same way. GHL may retry the webhook; a repeat changes nothing.
+4. **Sent.** The workflow calls `POST /api/ghl/email-sent/`. The app marks the email sent, empties Subject, Body and Due At and sets **Follow-up Count** to the next follow-up's number, or empties it when the sequence is over (the workflow then moves the lead to **Quota Exhausted**), and then fills the next follow-up's template for review (if a variable has no value it is held back; fix it and use **Write follow-ups** on the dashboard). Approving the follow-up hands it over the same way. GHL may retry the webhook; a repeat changes nothing.
 5. **Changes after hand-over.** Editing, rejecting or sending a handed-over email back to review first empties its Subject, Body and Due At in GHL; if GHL cannot be reached nothing changes here and you are told, because GHL could still send it.
 6. **Stop.** On a reply, a bounce, an unsubscribe or a manual stage move the workflow calls `POST /api/ghl/stop-sequence/`: the prospect's sequence ends, emails not sent yet are cancelled and its fields emptied. Each prospect has its own sequence; colleagues at the same business are not affected.
 

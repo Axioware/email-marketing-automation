@@ -40,7 +40,7 @@ The left sidebar lists the pages in pipeline order (its **Jump to a page** box o
 | 5. Verify emails | Each guessed address is checked and saved with its result; only real ones are ready to email | Businesses > **Verify contact emails** |
 | 3b. Review low scores | Businesses below the campaign's minimum score (or not researchable) wait for you | Businesses > **Needs your review** |
 | 5b. Review unverified addresses | Addresses verification could not confirm wait for you | Prospects > Needs review |
-| 6. Write emails | The AI writes one email per prospect; each becomes a GoHighLevel contact | Prospects > **Generate outreach emails** |
+| 6. Write emails | Your email template is filled in for each prospect; each becomes a GoHighLevel contact | Prospects > **Write emails from templates** |
 | 7. Review | You read, edit, approve or reject each email; approving schedules it | Emails |
 | 8. Send | GoHighLevel sends each email at its time | Automatic |
 | 9. Follow-ups | Written for review after each email is sent, sent the same way | Emails |
@@ -55,7 +55,7 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
 
 - Each step only does what is still needed, so running the pipeline again continues where it left off.
 - If a few items fail (one website is down, for example), the pipeline carries on with the next step.
-- If a step cannot run at all (no LLM key, Docker/Reacher not running, Google CAPTCHA), the pipeline stops and tells you why. Everything done so far is kept; fix the problem and run it again.
+- If a step cannot run at all (no AI key for research, Docker/Reacher not running, Google CAPTCHA), the pipeline stops and tells you why. Everything done so far is kept; fix the problem and run it again.
 - Options: `--source scraper_api` (or `browser`) fetches through that source instead of the campaign's own, `--fetch-limit 0` skips fetching new businesses, `--skip verify` skips a step (fetch, research, stakeholders, verify, generate), `--min-score 60`, `--email-prompt-id N`, `--headed`.
 
 ## 4. Step by step
@@ -71,7 +71,7 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Lead source** (under Leads): how businesses are found on Google Maps: **Built-in browser** (default) or **Scraper container**. You can still pick the other one for a single fetch.
    - **Minimum score** (under Leads, default 50): businesses scoring at least this go straight on to finding decision makers; the rest wait for you to approve or reject them.
    - **Campaign prompt** (under Prompts): what makes a good prospect; the AI scores each business's website against it. Pick one, or click **+** to write a new one. Several campaigns can share one. Without one, the campaign's businesses are not researched.
-   - **Initial-email prompts** (under Prompts): tick one or more. With several, prospects are split equally between them (an A/B test) and each person keeps their prompt.
+   - **Initial-email templates**: tick one or more. With several, prospects are split equally between them (an A/B test) and each person keeps their template.
    - **Sending** (optional): a **send window** (e.g. 09:00 to 18:00) with its time zone. The gap between two sends and the **daily cap** are the same for every campaign: sidebar > **Settings** (defaults: 2 minutes fixed plus a random 3-5 minutes, 40 emails a day). See [Sending](#step-8-sending-through-gohighlevel).
    - **Follow-ups** table (bottom): one row per follow-up with its days and its prompt. See [Follow-ups](#follow-ups).
 3. Click **Save**.
@@ -148,26 +148,40 @@ On the Prospects list, use the **By email status** and **By verdict** filters on
 
 > **Sure a risky or unknown address is real?** On **Prospects**, filter **Needs review**, tick it and choose **Approve**: it gets emails and becomes a GoHighLevel contact like a verified one. **Reject** means it is never emailed. Undeliverable addresses cannot be approved.
 
-### Step 6: Generate emails
+### Step 6: Write emails
 
-1. Sidebar > **Prospects** (or **Businesses**), tick the rows, choose **Generate outreach emails (Module 5)** and click **Go**. To write emails for every ready prospect, click **Generate emails** on the dashboard instead.
-2. The **Generate emails** page opens:
-   - **Email prompt**: leave it on "Each campaign's initial-email prompts (A/B split)", or pick one prompt for all of them. Click **+** to write a new email prompt or the pencil to edit the selected one, without leaving the page.
-   - **Rewrite emails that are in review or rejected**: tick to replace those drafts. Approved and sent emails are never changed.
+1. Sidebar > **Prospects** (or **Businesses**), tick the rows, choose **Write emails from templates (Module 5)** and click **Go**. To write emails for every ready prospect, click **Write emails** on the dashboard instead.
+2. The **Write emails** page opens:
+   - **Template**: leave it on "Each campaign's initial-email templates (A/B split)", or pick one template for all of them. Click **+** to write a new template or the pencil to edit the selected one, without leaving the page.
+   - **Fill in again emails still in review or rejected**: tick to replace those drafts. Approved and sent emails are never changed.
    - **Limit** and **Dry run** work like everywhere else.
-3. Click **Start generating**.
+3. Click **Write emails**.
 
-The AI writes one short email per prospect, based only on what was found about the business. Every new email starts as **In review**, and records which email prompt wrote it. Nothing is sent until you approve it.
+Each prospect gets its campaign's template with the variables filled in (no AI is used). Every new email starts as **In review** and records which template it came from. Nothing is sent until you approve it. A prospect whose template needs a value it does not have (see fallbacks below) is **held back**: the run says which variable, and no email is saved for it.
 
-### Prompts
+### Prompts and templates
 
-Both kinds of prompt are edited in the admin; nothing is built into the code. Campaigns choose their prompts, and several campaigns can share a prompt.
+Both are edited in the admin; nothing is built into the code. Campaigns choose them, and several campaigns can share one.
 
-- **Campaign prompts** (sidebar) **qualify businesses**. They describe what you sell, what a good and a poor prospect look like, and what each score range means. In step 3 the AI reads each business's website and scores it 0-100 against its campaign's campaign prompt. The AI receives **exactly what you write** there. Only the shape of its answer (read another page, give the score with reasons, or stop) is set by the app; expand **Answer format (set by the app)** on the prompt's page to see it. An output format you write in the prompt is overridden by it.
-- **Email prompts** (sidebar) **write emails**. Each has a **Kind**: **Initial email** or **Follow-up**. Each is complete on its own: who we are and what we offer, the rules, structure, call to action, length and style. The AI receives exactly that text, plus the facts about the prospect (follow-ups also get the emails already sent). A campaign picks one or more initial-email prompts (several = A/B test, split equally) and one follow-up prompt per follow-up step. An email prompt's page shows which campaigns use it.
+- **Campaign prompts** (sidebar) **qualify businesses**. They describe what you sell, what a good and a poor prospect look like, and what each score range means. In step 3 the AI reads each business's website and scores it 0-100 against its campaign's campaign prompt. The AI receives **exactly what you write** there. The shape of its answer is the **Answer format (JSON schema)** on the prompt's page; extra fields you add there (e.g. `team_size`) are stored per business and become email variables.
+- **Email templates** (sidebar) **are the emails**. Each has a **Kind** (**Initial email** or **Follow-up**), a **Subject** and a **Body**. Write the email as you want it sent, with variables where the prospect's details go. A campaign picks one or more initial-email templates (several = A/B test, split equally) and one follow-up template per follow-up step. A template's page shows a preview for a real prospect and which campaigns use it.
 
-- New prompts start empty. The campaign page warns when it has no campaign prompt, no initial-email prompt, or a follow-up step without a prompt.
-- Every email prompt should ask for a subject and a body: the app reads the AI's answer as those two fields.
+**Variables.** Open **Email templates** > **Email variables** for the full list with example values. The common ones:
+
+| Write | You get |
+|---|---|
+| `{{first_name}}` | the contact's first name, e.g. Ayesha |
+| `{{first_name|there}}` | the first name, or "there" when we have none |
+| `{{business_short_name}}` | the business without its branch, e.g. Alvi Dental Hospital |
+| `{{city}}`, `{{google_rating}}`, `{{job_title}}` | the business's city, its Google rating, the contact's title |
+| `{{team_size}}`, `{{languages}}` | what research found (any field in a campaign prompt's answer format) |
+| `{{sender_name}}` | your name for the sign-off |
+| `{{previous_subject}}` | follow-ups only: the subject of the email before it (e.g. `Re: {{previous_subject}}`) |
+
+- After `|` comes the **fallback**, used when the prospect has no value. A variable **without** a fallback and without a value holds the email back, so nobody gets "Hi ,". Use a fallback on anything that may be missing (names, research fields).
+- A template with a misspelled variable, or `{{previous_subject}}` in an initial email, cannot be saved: the page says what is wrong.
+- The footer (company details and unsubscribe line) is added automatically; do not write it.
+- The campaign page warns when it has no campaign prompt, no initial-email template, or a follow-up step without a template.
 
 ### Step 7: Review emails
 
@@ -185,7 +199,7 @@ What you can do:
 |---|---|
 | **Approve** | Approves and **schedules** it (the page then shows its send time), and jumps to the next email in review |
 | **Reject** | Puts it aside; add a reason so you remember why |
-| **Regenerate with AI** | Writes a new version (it stays in review). The menu next to it lets you pick a different email prompt; by default it uses the same one |
+| **Fill in again from template** | Fills the template in again, e.g. after you edited the template or the prospect's data (it stays in review). The menu next to it lets you pick a different template; by default it uses the same one |
 | **Back to review** | Undoes Approve or Reject; a scheduled email loses its send time |
 | **Save** | Saves your edits to the subject or body |
 
@@ -215,17 +229,17 @@ Statuses: In review → Approved → **In GoHighLevel** → **Sent** (→ Replie
 
 A campaign can have follow-up emails for people who did not reply.
 
-**1. Set the steps.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** (1, 2, ...), **Days after previous** (e.g. 3, then 7) and **Email prompt** (a follow-up prompt). The first email is step 0.
+**1. Set the steps.** Open the campaign. In the **Follow-ups** table at the bottom add one row per follow-up: **Sequence** (1, 2, ...), **Days after previous** (e.g. 3, then 7) and **Template** (a follow-up template). The first email is step 0.
 
-**2. Written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next follow-up is written for review (if the AI fails then, use **Write follow-ups** on the dashboard). You have the days in between to review it. The AI sees the emails already sent.
+**2. Written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next follow-up's template is filled in for review (if it was held back for a missing value, fix it and use **Write follow-ups** on the dashboard). You have the days in between to review it.
 
 **3. Review and approve** like first emails. Approving schedules it for no earlier than the previous email's send time plus its days.
 
-**4. The end.** After the last follow-up is sent, the contact's **Follow-up Count** is emptied, which tells GoHighLevel the sequence is over (Quota Exhausted). A follow-up step without a prompt also ends the sequence there.
+**4. The end.** After the last follow-up is sent, the contact's **Follow-up Count** is emptied, which tells GoHighLevel the sequence is over (Quota Exhausted). A follow-up step without a template also ends the sequence there.
 
 No follow-up is written once the person replied, their sequence was stopped, or they are do-not-contact.
 
-**Results:** the dashboard's **Results by step and initial-email prompt (A/B)** table shows, for the first email and each follow-up, per initial-email prompt: emails sent, replies and reply rate.
+**Results:** the dashboard's **Results by step and initial-email template (A/B)** table shows, for the first email and each follow-up, per initial-email template: emails sent, replies and reply rate.
 
 ## 5. Pipeline runs
 
@@ -254,7 +268,7 @@ Useful arguments:
 | `--min-score 60` | Find decision makers, Verify | Only businesses scoring 60 or more |
 | `--recheck` | Verify | Check addresses that were already checked |
 | `--primary-only` | Verify | Only the main contact of each business |
-| `--regenerate` | Generate emails | Rewrite emails that are in review or rejected |
+| `--regenerate` | Write emails | Fill in again emails that are in review or rejected |
 | `--campaign-id N` | Write due follow-ups | Only that campaign's follow-ups |
 
 ## 6. Managing prospects
@@ -323,7 +337,8 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
 | Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
 | Find decision makers: "Search failed: SearXNG ... is not reachable" | Check `SEARXNG_URL` and that the SearXNG container runs on the server; the business is retried next run |
-| Generate: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to rewrite those in review |
+| Write emails: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to fill those in review again |
+| Write emails: "held back ... no value for {{x}}" | The template needs a value this prospect does not have: give the variable a fallback (`{{x|...}}`) or fill in the data, then run again |
 | "Only emails in review can be approved" | The email was already approved, rejected or sent, perhaps by someone else |
 | A run stays "Running" after the computer restarted | Open **Pipeline runs**; it is marked Failed automatically. Run it again |
 | API answers 401 "Send the API key in the 'Auth' header" | Add `-H "Auth: <AUTH_TOKEN>"` with the exact value from `.env` |

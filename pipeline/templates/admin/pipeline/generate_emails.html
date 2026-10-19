@@ -2,10 +2,10 @@
 {% load static %}
 {% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'admin/css/forms.css' %}">{% endblock %}
 {% block extrahead %}{{ block.super }}{{ media }}{% endblock %}
-{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">Home</a> › <a href="{% url 'admin:pipeline_prospect_changelist' %}">Prospects</a> › Generate emails</div>{% endblock %}
+{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">Home</a> › <a href="{% url 'admin:pipeline_prospect_changelist' %}">Prospects</a> › Write emails</div>{% endblock %}
 {% block content %}
 <div id="content-main">
-  <p>Writes one email per ready prospect (deliverable, not do-not-contact) for <b>{{ target }}</b>. Every email starts <b>In review</b>; nothing is sent.</p>
+  <p>Fills in one email per ready prospect (deliverable, not do-not-contact) from its campaign's templates, for <b>{{ target }}</b>. Every email starts <b>In review</b>; nothing is sent.</p>
   <form method="post" novalidate>{% csrf_token %}
     <input type="hidden" name="scope" value="{{ scope }}">
     <input type="hidden" name="ids" value="{{ ids }}">
@@ -27,15 +27,15 @@
       {% endfor %}
     </fieldset>
     <div class="submit-row">
-      <input type="submit" class="default" value="Start generating">
+      <input type="submit" class="default" value="Write emails">
       <a href="{% url 'admin:pipeline_prospect_changelist' %}" class="closelink">Cancel</a>
     </div>
   </form>
   {% if prompts %}
   <div class="module pipeline-help">
-    <h2>Initial-email prompts</h2>
+    <h2>Initial-email templates</h2>
     <table>
-      <thead><tr><th>Prompt</th><th>Used by campaigns</th></tr></thead>
+      <thead><tr><th>Template</th><th>Used by campaigns</th></tr></thead>
       <tbody>{% for prompt in prompts %}
         <tr><td><a href="{% url 'admin:pipeline_emailprompt_change' prompt.pk %}">{{ prompt.name }}</a></td><td>{{ prompt.initial_for_campaigns.all|join:", "|default:"-" }}</td></tr>
       {% endfor %}</tbody>

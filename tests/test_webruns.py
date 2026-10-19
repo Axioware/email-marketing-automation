@@ -129,8 +129,7 @@ class RefusalTests(TestCase):
         from pipeline.services import generation
 
         rows = [{"prospect_id": 1}, {"prospect_id": 2}]
-        with mock.patch.object(generation, "make_llm_client", return_value=(mock.Mock(), "m", "groq")), \
-                mock.patch.object(generation, "load_prospects", return_value=rows), \
+        with mock.patch.object(generation, "load_prospects", return_value=rows), \
                 mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
             call_command("generate_emails", deadline=time.monotonic())
         self.assertIn("Time limit reached: 2 email(s) not done yet", out.getvalue())

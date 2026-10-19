@@ -20,14 +20,11 @@ from pipeline.models import (
 )
 from pipeline.services import generation as g
 from tests.support import BASE, CAMPAIGN_INLINE, make_business, make_campaign, make_contact, make_email, review_env
-from tests.test_generate_emails import FakeLLM
 
 
 class AdminCase(TestCase):
     def setUp(self):
-        self.llm = FakeLLM()
-        self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.llm))
+        env = mock.patch.dict(os.environ, review_env())
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_superuser("admin", "admin@example.org", "pw")
@@ -338,20 +335,22 @@ class EmailReviewTests(AdminCase):
         self.client.post(url, {"action": "reject_selected", "_selected_action": [b, c]})
         self.assertEqual([self.row(i)["status"] for i in (b, c)], ["rejected", "rejected"])
 
-    def test_regenerate_rewrites_with_the_llm(self):
+    def test_regenerate_fills_the_template_again(self):
         eid = self.email("rejected")
         token = self.row(eid)["tracking_token"]
-        self.assertContains(self.post_action(eid, "regenerate"), "Regenerated with openai")
+        self.assertContains(self.post_action(eid, "regenerate"), "Filled in again from")
         row = self.row(eid)
         self.assertEqual(row["status"], "in_review")
-        self.assertIn("Idea for Clinic", row["subject"])
+        self.assertIn("TEST TEMPLATE for Clinic", row["subject"])
         self.assertEqual(row["tracking_token"], token)
         self.assertNotIn("<img", row["body_html"])
 
     def test_regenerate_failure_is_shown_and_changes_nothing(self):
+        from pipeline.models import EmailPrompt
+
         eid = self.email()
-        self.llm.mode = "bad"
-        self.assertContains(self.post_action(eid, "regenerate"), "Regeneration failed")
+        EmailPrompt.objects.update(body="Hi, about your {{team_size}} people.")  # research found no team size
+        self.assertContains(self.post_action(eid, "regenerate"), "no value for {{team_size}}")
         self.assertEqual(self.row(eid)["subject"], "Hello there")
 
     def test_approved_email_has_no_send_button(self):

@@ -1,4 +1,4 @@
-"""Reviewing generated emails: edit, approve, reject, reopen, regenerate. Used by the admin and the API.
+"""Reviewing emails filled from templates: edit, approve, reject, reopen, fill in again. Used by the admin and the API.
 
 Every change is a conditional update on the email's current status, so two reviewers can never move an email through
 an invalid transition. Editing always sends an email back to review. Approving schedules the email; GoHighLevel sends
@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from django.db.models import Count, Q
 
 from pipeline.models import Business, Email, EmailPrompt
-from pipeline.services import generation, ghl, outreach
+from pipeline.services import generation, ghl, outreach, templates
 
 EDITABLE = ("in_review", "approved", "scheduled", "rejected")
 STATUS_ORDER = ("in_review", "approved", "scheduled", "sending", "rejected", "sent", "opened", "replied", "failed")
@@ -184,42 +184,36 @@ def reopen(email: Email) -> str:
 
 
 def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
-    """Rewrite the email with the LLM (same tracking token); it goes back to review. Uses the given email prompt,
-    else the one the email was written with, else its campaign's default."""
+    """Fill the email again from its template (same tracking token); it goes back to review. Uses the given template,
+    else the one the email was filled from, else its campaign's."""
     if email.status not in generation.REGENERATABLE_STATUSES:
-        raise ReviewError("Only emails in review or rejected can be regenerated.")
-    if email.sequence_step > generation.SEQUENCE_STEP:  # a follow-up: rewritten from the thread so far
+        raise ReviewError("Only emails in review or rejected can be filled in again.")
+    if email.sequence_step > generation.SEQUENCE_STEP:  # a follow-up
         from pipeline.services import followups
 
         try:
-            provider, model = followups.regenerate(email, email_prompt)
+            name = followups.regenerate(email, email_prompt)
         except ValueError as error:
             raise ReviewError(str(error)) from error
-        except Exception as error:  # noqa: BLE001 - show any model/API failure to the reviewer
-            raise ReviewError(f"Regeneration failed ({type(error).__name__}): {error}"[:300]) from error
-        return f"Regenerated with {provider} ({model})."
-    llm = generation.make_llm_client()
-    if llm is None:
-        raise ReviewError("Set an LLM key (GROQ_API_KEY or OPENAI_API_KEY).")
-    client, model, provider = llm
+        return f"Filled in again from {name}."
     rows = generation.load_prospects({"prospect_id": [email.prospect_id], "regenerate": True})
     if not rows:
         raise ReviewError("The prospect is no longer ready for outreach (check its status).")
     row = rows[0]
     if email_prompt is None and email.email_prompt is None and generation.assign_initial_prompt(row) is None:
-        raise ReviewError(f"Cannot regenerate: {generation.missing_prompt_reason(row)}.")
-    resolved = generation.resolve_prompt(row, email_prompt or email.email_prompt)
-    if resolved is None:
-        raise ReviewError(f"Cannot regenerate: {generation.missing_prompt_reason(row)}.")
-    system_prompt, email_prompt_id = resolved
+        raise ReviewError(f"Cannot fill it in: {generation.missing_prompt_reason(row)}.")
+    template = generation.resolve_template(row, email_prompt or email.email_prompt)
+    if template is None:
+        raise ReviewError(f"Cannot fill it in: {generation.missing_prompt_reason(row)}.")
     try:
-        draft = generation.generate_draft(client, model, generation.prospect_context(row), system_prompt)
-    except Exception as error:  # noqa: BLE001 - show any model/API failure to the reviewer
-        raise ReviewError(f"Regeneration failed ({type(error).__name__}): {error}"[:300]) from error
+        draft = generation.fill_template(template, row)
+    except templates.TemplateIncomplete as error:
+        raise ReviewError(f"Not filled in ({template}): {error}.") from error
     body_html = generation.render_html(draft.body, generation.footer_image_url(row["tracking_token"]))
-    if not generation.save_draft(row, draft, body_html, row["tracking_token"], provider, model, _now(), email_prompt_id):
-        raise ReviewError("The email changed while it was being regenerated; nothing was saved.")
-    return f"Regenerated with {provider} ({model})."
+    if not generation.save_draft(row, draft, body_html, row["tracking_token"], "template", template.name, _now(),
+                                 template.pk):
+        raise ReviewError("The email changed while it was being filled in; nothing was saved.")
+    return f"Filled in again from {template}."
 
 
 def bulk(action: str, ids: list[int]) -> tuple[int, int]:

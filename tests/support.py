@@ -34,7 +34,7 @@ def run_command(name: str, *args, env: dict | None = None) -> Result:
 
 
 QUALIFICATION_PROMPT = "TEST CRITERIA: appointment-based clinics that book by phone score high."
-EMAIL_PROMPT = "TEST EMAIL RULES: write a short first-touch email; return subject and body."
+EMAIL_TEXT = "TEST TEMPLATE"
 _unset = object()
 
 
@@ -46,11 +46,15 @@ def make_prompts(name=None, qualification=QUALIFICATION_PROMPT):
                                          prompt=qualification)
 
 
-def make_email_prompt(name=None, prompt=EMAIL_PROMPT, kind="initial"):
+def make_email_prompt(name=None, text=EMAIL_TEXT, kind="initial", subject=None, body=None):
+    """An email template. `text` marks its body so tests can tell templates apart."""
     from pipeline.models import EmailPrompt
 
-    return EmailPrompt.objects.create(name=name or f"Email prompt {EmailPrompt.objects.count() + 1}", prompt=prompt,
-                                      kind=kind)
+    follow_up = kind == "follow_up"
+    subject = subject or ("Re: {{previous_subject}}" if follow_up else f"{text} for {{{{business_short_name}}}}")
+    body = body or ("Hi {{first_name|there}},\n\n" + text + " about {{business_name}}.\n\n{{sender_name}}")
+    return EmailPrompt.objects.create(name=name or f"Email template {EmailPrompt.objects.count() + 1}", kind=kind,
+                                      subject=subject, body=body)
 
 
 def make_campaign(campaign_prompt=_unset, initial_prompts=_unset, **fields) -> DiscoveryCampaign:
@@ -104,11 +108,9 @@ def make_email(status="in_review", body="Hi Ali,\n\nA short note.", subject="Hel
                                 status=status)
 
 
-def review_env(llm) -> dict:
-    return {
-        "EMAIL_TRACKING_BASE_URL": BASE, "OPENAI_API_KEY": "test", "OPENAI_BASE_URL": llm.url,
-        "OPENAI_MODEL": "fake-model", "GROQ_API_KEY": "", "GROK_API_KEY": "", "SENDER_NAME": "Sender",
-    }
+def review_env(llm=None) -> dict:
+    """Environment for writing and reviewing emails (templates need no AI key)."""
+    return {"EMAIL_TRACKING_BASE_URL": BASE, "SENDER_NAME": "Sender"}
 
 
 # Management-form fields of the follow-ups inline on the campaign form (empty inline).

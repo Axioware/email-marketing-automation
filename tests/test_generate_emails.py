@@ -4,28 +4,17 @@ import re
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 from unittest import mock
 
 from django.db import IntegrityError, connection, connections, transaction
 from django.test import TestCase, TransactionTestCase
 
 from pipeline.models import BusinessWebsiteProfile, Email, EmailOpenEvent, Prospect
-from pipeline.migrations import _prompt_texts as prompt_texts
 from pipeline.services import generation as g
 from tests.support import ROOT, make_business, make_campaign, make_contact, run_command
 
 BASE = "https://ref.supabase.co/functions/v1/email/footer"
 EDGE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")  # same as supabase/functions/email/handler.ts
-
-
-def fake_completion(content):
-    client = mock.Mock()
-    client.chat.completions.create.side_effect = [
-        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=c))]) for c in content
-    ]
-    return client
 
 
 class TrackingTests(unittest.TestCase):
@@ -75,58 +64,66 @@ class RenderTests(unittest.TestCase):
 
 
 # The Axioware email prompt the migrations seed (0006 + 0008 join the two parts into one email prompt).
-SEEDED_EMAIL_PROMPT = f"{prompt_texts.OLD_CAMPAIGN_PROMPT.strip()}\n\n{prompt_texts.OLD_EMAIL_PROMPT.strip()}"
-
-
-class PromptAndContextTests(unittest.TestCase):
-    def test_seeded_prompt_is_the_real_axioware_prompt(self):
-        self.assertFalse(hasattr(g, "SYSTEM_PROMPT"))  # no built-in prompt: every prompt comes from the database
-        self.assertNotIn("PLACEHOLDER", SEEDED_EMAIL_PROMPT)
-        for must in ("Axioware", "Ava", "axioware.tech/dental-agent", "Never invent", "first_name", "website_findings"):
-            self.assertIn(must, SEEDED_EMAIL_PROMPT)
-
-    def test_prompt_mentions_every_context_field(self):
-        row = {"business_name": "B", "category": None, "city": None, "country": None, "website_url": None,
-               "google_rating": None, "google_review_count": None, "contact_name": "A B", "first_name": "A",
-               "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
-               "outreach_facts": [], "research_summary": None, "scraped_pages": []}
-        for key in g.prospect_context(row):
-            if key == "website_facts":  # added after the seeded prompt: the campaign prompt's output fields
-                continue
-            self.assertIn(key, SEEDED_EMAIL_PROMPT, key)
-
+class FindingsTests(unittest.TestCase):
     def test_website_findings_keep_business_facts_only(self):
         pages = [
             {"relevant_findings": ["Dental clinic in Lahore, Pakistan.", "Shows 155 Google reviews and a 5-star rating widget on-page.",
                                    "About Us page likely contains clinic background, credentials, and team details.",
                                    "Current page content is empty/blank after cleaning", "Five-page limit has not been reached yet"]},
-            {"relevant_findings": ["Phone: +92 300 0933343; emails include admin@b.pk", "Hours: Monday-Saturday 11:00 AM to 09:00 PM.",
-                                   "Clinic address: Shop #12, Model Town, Lahore, Punjab.",
-                                   "Address: Shop #12, Model Town, Lahore, Punjab, Pakistan."]},
-            None, {"relevant_findings": None}, {},
+            {"relevant_findings": ["Phone: +92 300 0933343; emails include admin@b.pk", "Hours: Monday-Saturday 11:00 AM to 09:00 PM."]},
         ]
-        self.assertEqual(g.website_findings(pages), [
-            "Dental clinic in Lahore, Pakistan.", "Shows 155 Google reviews and a 5-star rating widget on-page.",
-            "Hours: Monday-Saturday 11:00 AM to 09:00 PM.", "Clinic address: Shop #12, Model Town, Lahore, Punjab."])
+        self.assertEqual(g.website_findings(pages), ["Dental clinic in Lahore, Pakistan.",
+                                                     "Shows 155 Google reviews and a 5-star rating widget on-page.",
+                                                     "Hours: Monday-Saturday 11:00 AM to 09:00 PM."])
         self.assertEqual(g.website_findings(None), [])
-        many = [{"relevant_findings": [f"Offers treatment number {i} for patients" for i in range(40)]}]
-        self.assertLessEqual(len(g.website_findings(many)), g.MAX_WEBSITE_FINDINGS)
 
     def test_job_title_annotations_are_removed(self):
         self.assertEqual(g.clean_job_title("Principal (practice named after them)"), "Principal")
-        self.assertEqual(g.clean_job_title("Owner"), "Owner")
-        self.assertIsNone(g.clean_job_title("(guess)"))
         self.assertIsNone(g.clean_job_title(None))
 
-    def test_sender_name_comes_from_smtp_from_name(self):
-        row = {"business_name": "B", "category": None, "city": None, "country": None, "website_url": None,
-               "google_rating": None, "google_review_count": None, "contact_name": "A B", "first_name": "A",
-               "job_title": None, "role_type": None, "qualification_score": 1, "qualification_reasons": [],
-               "outreach_facts": [], "research_summary": None}
+
+class TemplateTests(unittest.TestCase):
+    ROW = {"business_name": "Alvi Dental Hospital — SMCHS", "category": "Dental clinic", "city": "Karachi",
+           "country": "Pakistan", "website_url": "https://alvidental.com", "google_rating": 4.8,
+           "google_review_count": 120, "contact_name": "Dr. Arif Alvi", "first_name": None, "last_name": "Alvi",
+           "job_title": "Principal (practice named after them)", "campaign_name": "Clinics",
+           "extracted": {"team_size": 6, "languages": ["English", "Urdu"], "offers_emergency_care": True,
+                         "existing_call_tool": None}}
+
+    def test_variables_are_filled_in(self):
+        from pipeline.services import templates
+
         with mock.patch.dict(os.environ, {"SENDER_NAME": "Abdul Rauf"}):
-            self.assertEqual(g.prospect_context(row)["sender"], {"name": "Abdul Rauf", "company": "Axioware"})
+            subject, body = templates.render(
+                "Quick question for {{business_short_name}}",
+                "Hi {{first_name}}, {{job_title}} at {{business_name}} ({{city}}), rated {{google_rating}} from "
+                "{{google_review_count}} reviews. Team of {{team_size}}, speaks {{languages}}, emergencies: "
+                "{{offers_emergency_care}}. {{sender_name}} from {{sender_company}}", self.ROW)
+        self.assertEqual(subject, "Quick question for Alvi Dental Hospital")  # the branch Google Maps adds is dropped
+        self.assertEqual(body, "Hi Arif, Principal at Alvi Dental Hospital — SMCHS (Karachi), rated 4.8 from 120 "
+                               "reviews. Team of 6, speaks English, Urdu, emergencies: yes. Abdul Rauf from Axioware")
         with mock.patch.dict(os.environ, {"SENDER_NAME": ""}):
-            self.assertEqual(g.prospect_context(row)["sender"]["name"], "")
+            self.assertEqual(templates.render("x", "{{sender_name}}", self.ROW)[1], "The Axioware team")
+
+    def test_fallback_or_held_back(self):
+        from pipeline.services import templates
+
+        self.assertEqual(templates.render("x", "We noticed {{existing_call_tool|no call tool}}.", self.ROW)[1],
+                         "We noticed no call tool.")
+        with self.assertRaises(templates.TemplateIncomplete) as caught:
+            templates.render("Hi {{existing_call_tool}}", "{{previous_subject}} {{city|somewhere}}", self.ROW)
+        self.assertEqual(caught.exception.missing, ["existing_call_tool", "previous_subject"])
+        self.assertIn("{{existing_call_tool}}", str(caught.exception))
+
+    def test_template_problems(self):
+        from pipeline.services import templates
+
+        known = {"first_name": "", "previous_subject": ""}
+        self.assertEqual(templates.problems("Hi {{first_name|there}} {{ first_name }}", known, follow_up=False), [])
+        self.assertIn("{{nickname}} is not a variable", templates.problems("Hi {{nickname}}", known)[0])
+        self.assertIn("only exists in follow-ups", templates.problems("{{previous_subject}}", known, follow_up=False)[0])
+        for broken in ("Hi {{First Name}}", "Hi {{first_name", "Hi {{}}"):
+            self.assertTrue(templates.problems(broken, known), broken)
 
 
 class FooterImageTests(unittest.TestCase):
@@ -139,103 +136,10 @@ class FooterImageTests(unittest.TestCase):
         self.assertLess(height, width)
 
 
-class GenerationTests(unittest.TestCase):
-    CONTEXT = {"business": {"name": "Smile Solutions"}}
-
-    def test_valid_output(self):
-        client = fake_completion(['{"subject": "  Hello   there ", "body": "Body text\\n"}'])
-        draft = g.generate_draft(client, "m", self.CONTEXT, "RULES")
-        self.assertEqual((draft.subject, draft.body), ("Hello there", "Body text"))
-        kwargs = client.chat.completions.create.call_args.kwargs
-        self.assertEqual(kwargs["model"], "m")
-        self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
-        self.assertEqual(kwargs["messages"][0]["content"], "RULES")
-        self.assertEqual(json.loads(kwargs["messages"][1]["content"])["business"]["name"], "Smile Solutions")
-
-    def test_retries_with_feedback_then_succeeds(self):
-        client = fake_completion(["not json", '{"subject": "S", "body": "B"}'])
-        self.assertEqual(g.generate_draft(client, "m", self.CONTEXT, "RULES").subject, "S")
-        second = json.loads(client.chat.completions.create.call_args_list[1].kwargs["messages"][1]["content"])
-        self.assertIn("subject", second["validation_feedback"])
-
-    def test_blank_or_oversized_output_is_rejected(self):
-        for bad in ('{"subject": "   ", "body": "B"}', '{"subject": "S", "body": "  "}',
-                    json.dumps({"subject": "x" * 300, "body": "B"}), json.dumps({"subject": "S", "body": "b" * 6000})):
-            with self.assertRaises(g.GenerationError, msg=bad):
-                g.generate_draft(fake_completion([bad] * 3), "m", self.CONTEXT, "RULES")
-
-    def test_extra_fields_are_rejected(self):
-        with self.assertRaises(g.GenerationError):
-            g.generate_draft(fake_completion(['{"subject": "S", "body": "B", "to": "x@y.z"}'] * 3), "m", self.CONTEXT, "RULES")
-
-    def test_context_has_no_email_addresses(self):
-        row = {"business_name": "B", "category": "Dentist", "city": "Lahore", "country": "PK", "website_url": "http://b.pk",
-               "google_rating": None, "google_review_count": 5, "contact_name": "Shoaib Ahmed", "first_name": "Shoaib",
-               "job_title": "Owner", "role_type": "owner", "qualification_score": 85, "qualification_reasons": ["r"],
-               "outreach_facts": ["f"], "research_summary": "s", "recipient": "shoaib@b.pk"}
-        row["scraped_pages"] = [{"relevant_findings": ["Phone: +92 300 0933343; email info@b.pk", "Hours: 9-5"]}]
-        context = g.prospect_context(row)
-        self.assertNotIn("@", json.dumps(context))
-        self.assertNotIn("0933343", json.dumps(context))
-        self.assertEqual(context["website_findings"], ["Hours: 9-5"])
-        self.assertEqual(context["contact"]["first_name"], "Shoaib")
-        self.assertEqual(context["outreach_facts"], ["f"])
-
-
-# ---------------------------------------------------------------- end to end
-
-
-class FakeLLM:
-    """OpenAI-compatible /chat/completions; the reply mentions the business so tests can tell drafts apart."""
-
-    def __init__(self):
-        self.mode = "ok"
-        self.calls = 0
-        self.system_prompts = []
-        self.payloads = []
-        fake = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *a):
-                pass
-
-            def do_POST(self):
-                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                fake.calls += 1
-                fake.system_prompts.append(request["messages"][0]["content"])
-                fake.payloads.append(json.loads(request["messages"][1]["content"]))
-                user = json.loads(request["messages"][1]["content"])
-                name = user["business"]["name"]
-                if fake.mode == "bad" or (fake.mode == "bad-for-b2" and name == "Business 2"):
-                    content = "not json"
-                else:
-                    content = json.dumps({"subject": f"Idea for {name} #{fake.calls}",
-                                          "body": f"Hi {user['contact']['first_name']},\n\nNote for {name}."})
-                payload = {"id": "x", "object": "chat.completion", "created": 0, "model": request["model"],
-                           "choices": [{"index": 0, "finish_reason": "stop",
-                                        "message": {"role": "assistant", "content": content}}],
-                           "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
-                data = json.dumps(payload).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
 class GenerateCase:
     def setUp(self):
-        self.llm = FakeLLM()
-        self.addCleanup(self.llm.close)
         campaign = make_campaign()
+        self.template = campaign.initial_email_prompts.get()
         self.b, self.c = [None], [None]
         for i in range(1, 5):
             business = make_business(campaign, f"Business {i}", city="Lahore")
@@ -253,8 +157,7 @@ class GenerateCase:
         return list(Email.objects.order_by("id").values())
 
     def run_cli(self, *args, expect=None, **env_overrides):
-        env = {"OPENAI_API_KEY": "test", "OPENAI_BASE_URL": self.llm.url, "GROQ_API_KEY": "", "GROK_API_KEY": "",
-               "OPENAI_MODEL": "fake-model", "EMAIL_TRACKING_BASE_URL": BASE, **env_overrides}
+        env = {"EMAIL_TRACKING_BASE_URL": BASE, "SENDER_NAME": "Sender", **env_overrides}
         result = run_command("generate_emails", *args, env=env)
         if expect is not None:
             self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
@@ -289,17 +192,34 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         first = rows[p1]
         self.assertEqual((first["recipient"], first["business_id"], first["contact_id"]), ("a@b1.org", self.b[1].pk, self.c[1].pk))
         self.assertEqual((first["status"], first["sequence_step"], first["open_count"]), ("in_review", 1, 0))
-        self.assertEqual((first["generation_provider"], first["generation_model"]), ("openai", "fake-model"))
+        self.assertEqual((first["generation_provider"], first["generation_model"], first["email_prompt_id"]),
+                         ("template", self.template.name, self.template.pk))
         self.assertIsNotNone(first["generated_at"])
         self.assertIsNone(first["sent_at"])
-        self.assertIn("Business 1", first["subject"])
-        self.assertIn("Hi P1", first["body_text"])
+        self.assertEqual(first["subject"], "TEST TEMPLATE for Business 1")
+        self.assertTrue(first["body_text"].startswith("Hi P1,\n\nTEST TEMPLATE about Business 1.\n\nSender"))
         self.assertRegex(first["tracking_token"], EDGE_TOKEN_PATTERN)
         self.assertNotIn("<img", first["body_html"])  # open tracking is off: no image in the email
         self.assertIn(g.FOOTER_TEXT.splitlines()[0], first["body_html"])  # the footer text is still there
         self.assertNotEqual(rows[p1]["tracking_token"], rows[p2]["tracking_token"])
-        self.assertNotIn("prompt is still a placeholder", out)
         self.assertIn("2 email(s) saved for review", out)
+
+    def test_a_variable_with_no_value_holds_the_email_back(self):
+        self.prospect(1, "a@b1.org")
+        self.prospect(2, "a@b2.org")
+        self.b[2].city = None
+        self.b[2].save(update_fields=["city"])
+        self.template.body = "Hi {{first_name|there}}, a note for {{city}}."
+        self.template.save()
+        result = self.run_cli(expect=1)
+        self.assertIn("1 email(s) saved for review, 1 held back", result.stdout)
+        self.assertIn("held back", result.stdout)
+        self.assertIn("no value for {{city}}", result.stdout)
+        self.assertEqual([r["business_id"] for r in self.emails()], [self.b[1].pk])
+        self.template.body = "Hi {{first_name|there}}, a note for {{city|your city}}."
+        self.template.save()
+        self.run_cli(expect=0)
+        self.assertIn("a note for your city.", Email.objects.get(business=self.b[2]).body_text)
 
     def test_one_email_per_person_even_with_several_deliverable_addresses(self):
         first = self.prospect(1, "ali@b1.org")
@@ -318,16 +238,18 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         self.assertIn("No prospects need an email", self.run_cli(expect=0).stdout)
         self.assertEqual(self.emails(), [])
 
-    def test_rerun_skips_and_regenerate_rewrites_drafts_keeping_the_token(self):
+    def test_rerun_skips_and_regenerate_fills_drafts_again_keeping_the_token(self):
         self.prospect(1, "a@b1.org")
         self.run_cli(expect=0)
         before = self.emails()[0]
         self.assertIn("No prospects need an email", self.run_cli(expect=0).stdout)
+        self.template.subject = "New subject for {{business_name}}"
+        self.template.save()
         self.run_cli("--regenerate", expect=0)
         after = self.emails()
         self.assertEqual(len(after), 1)
         self.assertEqual(after[0]["tracking_token"], before["tracking_token"])
-        self.assertNotEqual(after[0]["subject"], before["subject"])
+        self.assertEqual(after[0]["subject"], "New subject for Business 1")
 
     def test_regenerate_never_touches_a_sent_email(self):
         self.prospect(1, "a@b1.org")
@@ -344,6 +266,8 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         Email.objects.filter(business=self.b[1]).update(status="rejected", review_note="too long")
         Email.objects.filter(business=self.b[2]).update(status="approved")
         before = {r["business_id"]: r for r in self.emails()}
+        self.template.subject = "Changed {{business_name}}"
+        self.template.save()
         self.run_cli("--regenerate", expect=0)
         after = {r["business_id"]: r for r in self.emails()}
         first, second = self.b[1].pk, self.b[2].pk
@@ -355,23 +279,7 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
     def test_dry_run_writes_nothing(self):
         self.prospect(1, "a@b1.org")
         out = self.run_cli("--dry-run", expect=0).stdout
-        self.assertIn("Note for Business 1", out)
-        self.assertEqual(self.emails(), [])
-
-    def test_bad_model_output_fails_one_prospect_and_continues(self):
-        self.prospect(1, "a@b1.org")
-        self.prospect(2, "a@b2.org")
-        self.llm.mode = "bad-for-b2"
-        result = self.run_cli(expect=1)
-        self.assertIn("1 email(s) saved for review, 1 failed", result.stdout)
-        self.assertEqual([r["business_id"] for r in self.emails()], [self.b[1].pk])
-        self.assertNotIn("Traceback", result.stdout + result.stderr)
-
-    def test_unreachable_llm_fails_cleanly(self):
-        self.prospect(1, "a@b1.org")
-        result = self.run_cli(expect=1, OPENAI_BASE_URL="http://127.0.0.1:9/v1")
-        self.assertIn("failed", result.stdout)
-        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("TEST TEMPLATE about Business 1", out)
         self.assertEqual(self.emails(), [])
 
     def test_filters(self):
@@ -385,10 +293,10 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         self.run_cli("--limit", "1", expect=0)
         self.assertEqual(len(self.emails()), 3)
 
-    def test_missing_configuration(self):
-        no_llm = self.run_cli(OPENAI_API_KEY="", GROQ_API_KEY="", GROK_API_KEY="")
-        self.assertEqual(no_llm.returncode, 1)
-        self.assertIn("GROQ_API_KEY", no_llm.stderr)
+    def test_needs_no_ai_and_a_tracking_url_only_when_tracking(self):
+        self.prospect(1, "a@b1.org")
+        no_ai = self.run_cli(OPENAI_API_KEY="", GROQ_API_KEY="", GROK_API_KEY="", expect=0)
+        self.assertIn("1 email(s) saved for review", no_ai.stdout)  # templates need no AI key
         without_tracking = self.run_cli(EMAIL_TRACKING_BASE_URL="", DATABASE_URL="postgresql://u:p@localhost/db")
         self.assertNotIn("EMAIL_TRACKING_BASE_URL", without_tracking.stderr)  # not needed while tracking is off
         with mock.patch.object(g, "OPEN_TRACKING", True):

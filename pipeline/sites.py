@@ -70,7 +70,7 @@ def worker_status() -> dict:
 
 
 def sequence_results() -> list[dict]:
-    """Sent emails per step and initial-email prompt (the A/B group), with reply rates."""
+    """Sent emails per step and initial-email template (the A/B group), with reply rates."""
     from pipeline.models import Email
     rows = (Email.objects.filter(sent_at__isnull=False)
             .values("sequence_step", "prospect__initial_email_prompt__name")
@@ -101,7 +101,29 @@ class PipelineAdminSite(admin.AdminSite):
         return apps
 
     def get_urls(self):
-        return [path("guide/", self.admin_view(self.guide_view), name="guide")] + super().get_urls()
+        return [path("guide/", self.admin_view(self.guide_view), name="guide"),
+                path("email-variables/", self.admin_view(self.variables_view), name="email_variables")] + super().get_urls()
+
+    def variables_view(self, request):
+        """Every variable an email template can use, with its value for one real prospect."""
+        from pipeline.models import Prospect
+        from pipeline.services import generation, templates
+
+        prospect = generation.ready_prospects().order_by("-id").first() or Prospect.objects.order_by("-id").first()
+        example, values = None, {}
+        if prospect is not None:
+            row = generation.prospect_rows(Prospect.objects.filter(pk=prospect.pk))[0]
+            row["previous_subject"] = "Quick question for your clinic"
+            values = templates.values_for(row)
+            example = f"{row['business_name']} ({row['recipient']})"
+        research = templates.research_fields()
+        rows = [{"name": name, "token": "{{" + name + "}}", "description": description, "example": values.get(name),
+                 "group": "Research (campaign prompt output fields)" if name in research and name not in templates.VARIABLES
+                 else "Prospect, business and campaign"}
+                for name, description in templates.known_variables().items()]
+        context = {**self.each_context(request), "title": "Email variables", "rows": rows, "example": example,
+                   "plain": "{{first_name}}", "with_fallback": "{{first_name|there}}"}
+        return TemplateResponse(request, "admin/pipeline/email_variables.html", context)
 
     def guide_view(self, request):
         try:
@@ -203,7 +225,7 @@ class PipelineAdminSite(admin.AdminSite):
             steps.append((f"{prospect_reviews} prospect address(es) could not be verified: approve or reject them.",
                           "Review prospects", changelist("prospect", outreach_status__exact="needs_review")))
         if ready_without_email:
-            steps.append((f"{ready_without_email} verified prospect(s) have no email yet.", "Generate emails",
+            steps.append((f"{ready_without_email} verified prospect(s) have no email yet.", "Write emails",
                           reverse("admin:pipeline_prospect_generate")))
         if unchecked_contacts:
             steps.append((f"{unchecked_contacts} contact(s) have emails that are not verified yet.", "Verify emails",
@@ -226,7 +248,8 @@ class PipelineAdminSite(admin.AdminSite):
         if not settings.AUTH_TOKEN:
             warnings.append("The API is disabled: set AUTH_TOKEN in .env.")
         if make_llm_client() is None:
-            warnings.append("No LLM key: set GROQ_API_KEY or OPENAI_API_KEY in .env (needed to research and write emails).")
+            warnings.append("No AI key: set GROQ_API_KEY or OPENAI_API_KEY (needed to research websites; emails are "
+                            "written from templates).")
         if settings.ON_VERCEL and not (os.environ.get("REACHER_URL") and os.environ.get("REACHER_SECRET")):
             warnings.append("Email verification is off: set REACHER_URL and REACHER_SECRET (your server's Reacher, "
                             "once outbound port 25 is open there).")

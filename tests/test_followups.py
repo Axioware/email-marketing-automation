@@ -1,4 +1,4 @@
-"""Follow-up sequences: A/B assignment over initial-email prompts, when follow-ups are written, prompt per step,
+"""Follow-up sequences: A/B assignment over initial-email templates, when follow-ups are written, template per step,
 replies (per prospect), admin and API."""
 import os
 from datetime import timedelta
@@ -13,15 +13,12 @@ from rest_framework.test import APIClient
 from pipeline import review
 from pipeline.models import Email, EmailPrompt, FollowUp, PipelineRun, Prospect
 from pipeline.services import followups, generation
-from tests.support import CAMPAIGN_INLINE, make_campaign, make_email, make_email_prompt, review_env, run_command
-from tests.test_generate_emails import FakeLLM
+from tests.support import BASE, CAMPAIGN_INLINE, make_campaign, make_email, make_email_prompt, run_command
 
 
 class FollowUpCase(TestCase):
     def setUp(self):
-        self.llm = FakeLLM()
-        self.addCleanup(self.llm.close)
-        env = mock.patch.dict(os.environ, review_env(self.llm))
+        env = mock.patch.dict(os.environ, {"EMAIL_TRACKING_BASE_URL": BASE, "SENDER_NAME": "Sender"})
         env.start()
         self.addCleanup(env.stop)
         self.user = get_user_model().objects.create_superuser("admin", "a@example.org", "pw")
@@ -62,7 +59,8 @@ class AssignmentTests(FollowUpCase):
         self.assertEqual(groups, ["First A", "First A", "First B", "First B"])
         for email in Email.objects.select_related("prospect"):
             self.assertEqual(email.email_prompt_id, email.prospect.initial_email_prompt_id)
-        self.assertEqual(sorted(self.llm.system_prompts), ["FIRST A", "FIRST A", "FIRST B", "FIRST B"])
+        self.assertEqual(sorted(email.body_text.split("\n\n")[1].split(" about")[0] for email in Email.objects.all()),
+                         ["FIRST A", "FIRST A", "FIRST B", "FIRST B"])  # each filled from its own template
         before = dict(Prospect.objects.values_list("id", "initial_email_prompt"))
         run_command("generate_emails", "--regenerate")
         self.assertEqual(dict(Prospect.objects.values_list("id", "initial_email_prompt")), before)  # never reassigned
@@ -79,8 +77,8 @@ class AssignmentTests(FollowUpCase):
         campaign = make_campaign(name="Bare", initial_prompts=[])
         make_email(campaign=campaign).delete()
         result = run_command("generate_emails")
-        self.assertIn("its campaign has no initial-email prompt", result.stdout)
-        self.assertEqual(self.llm.system_prompts, [])
+        self.assertIn("its campaign has no initial-email template", result.stdout)
+        self.assertFalse(Email.objects.exists())
 
 
 class DueTests(FollowUpCase):
@@ -93,10 +91,8 @@ class DueTests(FollowUpCase):
                          ("in_review", 2, just_sent.recipient, self.f1))
         self.assertNotEqual(follow_up.tracking_token, just_sent.tracking_token)
         self.assertNotIn("<img", follow_up.body_html)
-        payload = self.llm.payloads[-1]
-        self.assertEqual(payload["follow_up"], {"number": 1})
-        self.assertEqual([e["subject"] for e in payload["previous_emails"]], [just_sent.subject])
-        self.assertEqual(self.llm.system_prompts[-1], "F1 RULES")  # the step's prompt alone
+        self.assertEqual(follow_up.subject, f"Re: {just_sent.subject}")  # {{previous_subject}}
+        self.assertIn("F1 RULES about", follow_up.body_text)  # the step's template
         self.assertIn("1 follow-up(s) saved for review", result.stdout)
 
     def test_no_follow_up_after_a_reply_do_not_contact_a_stop_or_twice(self):
@@ -136,7 +132,8 @@ class DueTests(FollowUpCase):
         self.write()
         second = self.followup_of(first, step=3)
         self.assertEqual(second.email_prompt, self.f2)
-        self.assertEqual(len(self.llm.payloads[-1]["previous_emails"]), 2)
+        self.assertEqual(second.subject, f"Re: Re: {first.subject}")  # follow-up 1's subject was "Re: ..."
+        self.assertIn("F2 RULES about", second.body_text)
         Email.objects.filter(pk=second.pk).update(status="sent", sent_at=timezone.now())
         self.assertIn("No follow-ups are due", self.write().stdout)  # the campaign has two follow-ups
 
@@ -210,11 +207,12 @@ class ReplyTests(FollowUpCase):
         first = self.sent_email()
         self.write()
         follow_up = self.followup_of(first)
-        old_subject = follow_up.subject
+        self.f1.subject = "Following up: {{previous_subject}}"
+        self.f1.save()
         self.client.post(reverse("admin:pipeline_email_regenerate", args=[follow_up.pk]))
         follow_up.refresh_from_db()
         self.assertEqual((follow_up.sequence_step, follow_up.status, follow_up.email_prompt), (2, "in_review", self.f1))
-        self.assertNotEqual(follow_up.subject, old_subject)
+        self.assertEqual(follow_up.subject, f"Following up: {first.subject}")
 
 
 class AdminAndApiTests(FollowUpCase):
@@ -223,7 +221,7 @@ class AdminAndApiTests(FollowUpCase):
         page = self.client.get(reverse("admin:pipeline_discoverycampaign_change", args=[self.campaign.pk]))
         content = page.content.decode()
         self.assertIn("follow_ups-0-email_prompt", content)
-        self.assertIn("Follow-up 3 has no email prompt", content)
+        self.assertIn("Follow-up 3 has no template", content)
         options = page.context["inline_admin_formsets"][0].formset.forms[0].fields["email_prompt"].queryset
         self.assertEqual(set(options), {self.f1, self.f2})  # follow-up prompts only
         response = self.client.post(reverse("admin:pipeline_discoverycampaign_add"), {
@@ -238,7 +236,8 @@ class AdminAndApiTests(FollowUpCase):
 
     def test_email_prompt_kind_cannot_change_while_used(self):
         url = reverse("admin:pipeline_emailprompt_change", args=[self.first_a.pk])
-        response = self.client.post(url, {"name": "First A", "kind": "follow_up", "prompt": "FIRST A"})
+        response = self.client.post(url, {"name": "First A", "kind": "follow_up", "subject": "Re: {{previous_subject}}",
+                                          "body": "Hi {{first_name|there}}"})
         self.assertContains(response, "Campaigns use it for their initial email")
         page = self.client.get(url).content.decode()
         self.assertIn("initial email", page)  # "Used by" lists the campaign
@@ -254,7 +253,7 @@ class AdminAndApiTests(FollowUpCase):
         self.sent_email()
         dashboard = self.client.get(reverse("admin:index")).content.decode()
         self.assertIn("1 follow-up(s) can be written for review", dashboard)
-        self.assertIn("Results by step and initial-email prompt", dashboard)
+        self.assertIn("Results by step and initial-email template", dashboard)
 
     @override_settings(AUTH_TOKEN="fu-key")
     def test_api(self):

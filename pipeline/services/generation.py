@@ -1,20 +1,20 @@
-"""Generate one outreach email per prospect and store it in `emails` for review.
+"""Write one outreach email per prospect from its campaign's templates and store it in `emails` for review.
 
 For every prospect that is ready for outreach (deliverable email or approved by a person, `outreach_status =
-'ready'`, not `do_not_contact`) the LLM writes a subject and body from what earlier modules learned about the
-business and the contact, following one of the campaign's initial-email prompts (several: split equally as an A/B
-test; none: the prospect is skipped). Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below): the email
-carries no image. When it is on, the HTML footer image points at the tracking edge function
-(`/email/footer/{token}`), which records opens once the email has been sent.
+'ready'`, not `do_not_contact`) one of the campaign's initial-email templates (several: split equally as an A/B
+test; none: the prospect is skipped) is filled in with the prospect's details (pipeline/services/templates.py). No AI
+writes any email. A template that needs a value the prospect does not have (and gives no fallback) holds that email
+back, with the reason. Each email gets a random tracking token. Open tracking is switched off (OPEN_TRACKING below):
+the email carries no image.
 
-Nothing is sent here: emails are stored with status `in_review`; approve or edit them in the admin
-(Pipeline > Emails) or through the API. Approved emails are scheduled and handed to GoHighLevel (see outreach.py). The LLM is Groq when its key is set, otherwise OpenAI (see `llm.py`).
+Nothing is sent here: emails are stored with status `in_review`; approve or edit them in the admin (Pipeline >
+Emails) or through the API. Approved emails are scheduled and handed to GoHighLevel (see outreach.py).
 """
 import html
-import json
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
@@ -22,16 +22,11 @@ from django.core.management.base import CommandError
 from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
 from django.db.models.functions import Lower
-from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from pipeline.management.base import OutOfTime, out_of_time, time_limit_note
+from pipeline.management.base import out_of_time, time_limit_note
 from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, FollowUp, Prospect
-from pipeline.services.llm import complete, make_llm_client, rejected_output
+from pipeline.services import templates
 
-# The model's instructions are one email prompt (email_prompts table, edited in the admin), chosen per campaign, step and
-# A/B group; it receives the JSON built by `prospect_context` as the user message. There is no built-in prompt.
-SENDER_NAME_ENV = "SENDER_NAME"  # name used in the sign-off; empty -> "The Axioware team"
 MAX_WEBSITE_FINDINGS = 12
 
 # Added under every email, in text and HTML. Outreach law (e.g. CAN-SPAM, GDPR/PECR) generally requires identifying
@@ -45,10 +40,7 @@ FOOTER_LINK = "https://axioware.tech"
 
 REGENERATABLE_STATUSES = ("in_review", "rejected")
 SEQUENCE_STEP = 1  # emails.sequence_step of the first email; follow-up N is stored as step N + 1
-MAX_ATTEMPTS = 3
-MAX_COMPLETION_TOKENS = 2500  # a short email; Groq counts this budget against its per-minute token limit
-LLM_TIMEOUT = 60
-EMAIL_RESERVE_SECONDS = 70  # with a deadline (the web app): an email starts only if the AI can answer in time
+EMAIL_RESERVE_SECONDS = 5  # with a deadline (the web app): filling a template takes a moment
 MAX_SUBJECT_CHARS = 200
 MAX_BODY_CHARS = 5000
 FOOTER_ALT = "Axioware"
@@ -61,15 +53,12 @@ OPEN_TRACKING = False
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")  # must match the edge function's check
 
 
-class EmailDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+@dataclass
+class Draft:
+    """A filled-in template."""
 
-    subject: str = Field(..., min_length=1)
-    body: str = Field(..., min_length=1)
-
-
-class GenerationError(RuntimeError):
-    pass
+    subject: str
+    body: str
 
 
 # ---------------------------------------------------------------- tracking
@@ -193,75 +182,43 @@ def clean_job_title(title: str | None) -> str | None:
     return re.sub(r"\s*\([^)]*\)", "", title).strip() or None if title else None
 
 
-def prospect_context(row: dict) -> dict:
-    """The facts the model may use. Only data earlier modules stored; no email addresses or phone numbers."""
-    return {
-        "sender": {"name": os.environ.get(SENDER_NAME_ENV, "").strip(), "company": "Axioware"},
-        "business": {
-            "name": row["business_name"],
-            "category": row["category"],
-            "city": row["city"],
-            "country": row["country"],
-            "website": row["website_url"],
-            "google_rating": float(row["google_rating"]) if row["google_rating"] is not None else None,
-            "google_review_count": row["google_review_count"],
-        },
-        "contact": {
-            "name": row["contact_name"],
-            "first_name": row["first_name"],
-            "job_title": clean_job_title(row["job_title"]),
-            "role_type": row["role_type"],
-        },
-        "qualification": {
-            "score": row["qualification_score"],
-            "reasons": row["qualification_reasons"] or [],
-        },
-        "website_findings": website_findings(row.get("scraped_pages")),
-        "website_facts": {name: value for name, value in (row.get("extracted") or {}).items() if value is not None},
-        "outreach_facts": row["outreach_facts"] or [],
-        "research_summary": row["research_summary"],
-    }
+def resolve_template(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None,
+                     sequence: int = 0) -> EmailPrompt | None:
+    """The template for one prospect and step (sequence 0 = the initial email, n = follow-up n).
 
-
-def resolve_prompt(row: dict, chosen: EmailPrompt | None = None, cache: dict | None = None,
-                   sequence: int = 0) -> tuple[str, int] | None:
-    """(system prompt, email prompt id) for one prospect and step (sequence 0 = the initial email, n = follow-up n).
-
-    A chosen email prompt wins. Otherwise the initial email uses the prospect's initial-email prompt (its A/B group,
-    see assign_initial_prompt) and follow-up n the prompt of the campaign's follow-up step n. None when there is
+    A chosen template wins. Otherwise the initial email uses the prospect's initial-email template (its A/B group,
+    see assign_initial_prompt) and follow-up n the template of the campaign's follow-up step n. None when there is
     none: that email is skipped.
     """
     if chosen is not None:
-        return chosen.prompt, chosen.pk
+        return chosen
     cache = {} if cache is None else cache
     if sequence == 0:
-        prompt_id = row.get("initial_email_prompt_id")
-        key = ("prompt", prompt_id)
+        template_id = row.get("initial_email_prompt_id")
+        key = ("template", template_id)
         if key not in cache:
-            cache[key] = EmailPrompt.objects.filter(pk=prompt_id).first() if prompt_id else None
-        prompt = cache[key]
+            cache[key] = EmailPrompt.objects.filter(pk=template_id).first() if template_id else None
     else:
         key = ("follow_up", row.get("campaign_id"), sequence)
         if key not in cache:
             step = FollowUp.objects.select_related("email_prompt").filter(
                 campaign_id=row.get("campaign_id"), sequence=sequence).first()
             cache[key] = step.email_prompt if step else None
-        prompt = cache[key]
-    return (prompt.prompt, prompt.pk) if prompt is not None else None
+    return cache[key]
 
 
 def missing_prompt_reason(row: dict, sequence: int = 0) -> str:
     if sequence == 0:
-        return "its campaign has no initial-email prompt (choose one on the campaign)"
+        return "its campaign has no initial-email template (choose one on the campaign)"
     if not FollowUp.objects.filter(campaign_id=row.get("campaign_id"), sequence=sequence).exists():
         return f"its campaign has no follow-up {sequence}"
-    return f"follow-up {sequence} of its campaign has no email prompt (choose one on the campaign)"
+    return f"follow-up {sequence} of its campaign has no template (choose one on the campaign)"
 
 
 def assign_initial_prompt(row: dict, save: bool = True) -> int | None:
-    """The prospect's initial-email prompt (its A/B group): kept if it has one, else the campaign's initial-email
-    prompt with the fewest prospects of the campaign so far (equal split). Stored on the prospect unless `save` is
-    False. None when the campaign has no initial-email prompt."""
+    """The prospect's initial-email template (its A/B group): kept if it has one, else the campaign's initial-email
+    template with the fewest prospects of the campaign so far (equal split). Stored on the prospect unless `save` is
+    False. None when the campaign has no initial-email template."""
     if row.get("initial_email_prompt_id"):
         return row["initial_email_prompt_id"]
     available = sorted(DiscoveryCampaign.initial_email_prompts.through.objects
@@ -272,60 +229,20 @@ def assign_initial_prompt(row: dict, save: bool = True) -> int | None:
                                           initial_email_prompt_id__in=available)
                   .values_list("initial_email_prompt_id").annotate(n=Count("id"))
                   .values_list("initial_email_prompt_id", "n"))
-    prompt_id = min(available, key=lambda value: (counts.get(value, 0), value))
+    template_id = min(available, key=lambda value: (counts.get(value, 0), value))
     if save:
         Prospect.objects.filter(pk=row["prospect_id"], initial_email_prompt__isnull=True).update(
-            initial_email_prompt_id=prompt_id)
-    row["initial_email_prompt_id"] = prompt_id
-    return prompt_id
+            initial_email_prompt_id=template_id)
+    row["initial_email_prompt_id"] = template_id
+    return template_id
 
 
-def generate_draft(client: OpenAI, model: str, context: dict, system_prompt: str,
-                   deadline: float | None = None) -> EmailDraft:
-    response_format = {
-        "type": "json_schema",
-        "json_schema": {"name": "outreach_email", "strict": True, "schema": EmailDraft.model_json_schema()},
-    }
-    feedback = None
-    for _ in range(MAX_ATTEMPTS):
-        payload = {**context, "validation_feedback": feedback}
-        try:
-            response = complete(
-                client,
-                deadline,
-                timeout=LLM_TIMEOUT,
-                model=model,
-                temperature=0.7,
-                max_completion_tokens=MAX_COMPLETION_TOKENS,
-                response_format=response_format,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-            )
-            content = response.choices[0].message.content or ""
-        except Exception as error:
-            content = rejected_output(error)  # the provider refused the answer's shape: check it here instead
-            if content is None:
-                raise
-        try:
-            draft = EmailDraft.model_validate_json(content)
-        except ValidationError:
-            feedback = "Return a JSON object with a non-empty subject and body."
-            continue
-        subject = " ".join(draft.subject.split())
-        body = draft.body.strip()
-        if not subject or not body:
-            feedback = "Subject and body must not be empty."
-            continue
-        if len(subject) > MAX_SUBJECT_CHARS or len(body) > MAX_BODY_CHARS:
-            feedback = f"Keep the subject under {MAX_SUBJECT_CHARS} and the body under {MAX_BODY_CHARS} characters."
-            continue
-        return EmailDraft(subject=subject, body=body)
-    raise GenerationError(feedback or "The model did not return a valid email.")
-
-
-# ---------------------------------------------------------------- database
+def fill_template(template: EmailPrompt, row: dict) -> Draft:
+    """The template filled in for one prospect; templates.TemplateIncomplete when a variable has no value."""
+    subject, body = templates.render(template.subject, template.body, row)
+    if not subject or not body:
+        raise templates.TemplateIncomplete(["subject" if not subject else "body"])
+    return Draft(subject[:MAX_SUBJECT_CHARS], body[:MAX_BODY_CHARS])
 
 
 # A prospect that may get emails: verified deliverable (or approved by a person), ready, not stopped.
@@ -347,6 +264,8 @@ PROSPECT_FIELDS = {
     "google_review_count": F("business__google_review_count"),
     "contact_name": F("contact__name"),
     "first_name": F("contact__first_name"),
+    "last_name": F("contact__last_name"),
+    "campaign_name": F("business__discovery_campaign__name"),
     "job_title": F("contact__job_title"),
     "role_type": F("contact__role_type"),
     "qualification_reasons": F("business__website_profile__qualification_reasons"),
@@ -407,7 +326,7 @@ def prospect_rows(queryset) -> list[dict]:
     return list(queryset.values(*PROSPECT_COLUMNS, **PROSPECT_FIELDS))
 
 
-def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provider: str, model: str,
+def save_draft(row: dict, draft: Draft, body_html: str, token: str, provider: str, model: str,
                now: datetime, email_prompt_id: int | None = None, sequence_step: int = SEQUENCE_STEP) -> bool:
     """Insert the email for review, or replace an existing one that is in review or rejected (it goes back to
     review). Approved, sent and failed emails are never modified. Returns whether anything was written."""
@@ -455,14 +374,15 @@ def save_draft(row: dict, draft: EmailDraft, body_html: str, token: str, provide
 
 
 def add_arguments(parser) -> None:
-    parser.add_argument("--prospect-id", type=int, action="append", help="Generate for this prospect only (repeatable).")
-    parser.add_argument("--business-id", type=int, action="append", help="Generate for this business only (repeatable).")
+    parser.add_argument("--prospect-id", type=int, action="append", help="Only this prospect (repeatable).")
+    parser.add_argument("--business-id", type=int, action="append", help="Only this business (repeatable).")
     parser.add_argument("--limit", type=int, help="Maximum number of prospects in this run.")
     parser.add_argument("--regenerate", action="store_true",
-                        help="Rewrite emails that are in review or rejected (approved and sent emails are never touched).")
-    parser.add_argument("--email-prompt-id", type=int,
-                        help="Write every email with this email prompt (default: each campaign's default prompt).")
-    parser.add_argument("--dry-run", action="store_true", help="Generate and print without writing to the database.")
+                        help="Fill again the emails that are in review or rejected (approved and sent emails are never "
+                             "touched).")
+    parser.add_argument("--email-prompt-id", "--template-id", type=int, dest="email_prompt_id",
+                        help="Use this template for every email (default: each campaign's initial-email templates).")
+    parser.add_argument("--dry-run", action="store_true", help="Fill and print without writing to the database.")
 
 
 def run(options: dict) -> int:
@@ -470,59 +390,52 @@ def run(options: dict) -> int:
         raise CommandError("--limit must be a positive integer")
     if OPEN_TRACKING and not default_tracking_base_url():
         raise CommandError("Set EMAIL_TRACKING_BASE_URL (e.g. https://<project>.supabase.co/functions/v1/email/footer) in .env")
-    llm = make_llm_client()
-    if llm is None:
-        raise CommandError("Set GROQ_API_KEY (or GROK_API_KEY) or OPENAI_API_KEY in the environment or project .env file")
-    client, model, provider = llm
     chosen = None
     if options.get("email_prompt_id") is not None:
         chosen = EmailPrompt.objects.filter(pk=options["email_prompt_id"]).first()
         if chosen is None:
-            raise CommandError(f"Email prompt {options['email_prompt_id']} does not exist.")
-        print(f"Using email prompt: {chosen}")
+            raise CommandError(f"Template {options['email_prompt_id']} does not exist.")
+        print(f"Using template: {chosen}")
     if FOOTER_IS_PLACEHOLDER:
         print("Warning: the email footer is still a placeholder (FOOTER_TEXT in pipeline/services/generation.py).")
-    print(f"Using {provider} model {model}. Open tracking is " + ("on." if OPEN_TRACKING else "off (no image in emails)."))
 
     try:
         queue = load_prospects(options)
         if not queue:
-            print("No prospects need an email (use --regenerate to rewrite emails in review).")
+            print("No prospects need an email (use --regenerate to fill again emails in review).")
             return 0
 
-        print(f"Generating emails for {len(queue)} prospect(s).")
-        created = failed = skipped = 0
-        prompts: dict = {}
+        print(f"Writing emails from templates for {len(queue)} prospect(s).")
+        created = held = skipped = 0
+        cache: dict = {}
         for position, row in enumerate(queue):
             if out_of_time(options, EMAIL_RESERVE_SECONDS):
                 time_limit_note(len(queue) - position, "email(s)")
                 break
-            token = row["tracking_token"] or new_tracking_token()  # a regenerated email keeps its token
+            label = f"Prospect {row['prospect_id']} <{row['recipient']}>"
             if chosen is None and assign_initial_prompt(row, save=not options["dry_run"]) is None:
                 skipped += 1
-                print(f"  Prospect {row['prospect_id']} <{row['recipient']}> skipped: {missing_prompt_reason(row)}.")
+                print(f"  {label} skipped: {missing_prompt_reason(row)}.")
                 continue
-            system_prompt, email_prompt_id = resolve_prompt(row, chosen, prompts)
+            template = resolve_template(row, chosen, cache)
             try:
-                draft = generate_draft(client, model, prospect_context(row), system_prompt, options.get("deadline"))
-            except OutOfTime as error:
-                print(f"  Stopped: {error}.")
-                time_limit_note(len(queue) - position, "email(s)")
-                break
-            except Exception as error:  # one bad prospect (bad output, API error) must not stop the run
-                failed += 1
-                print(f"  Prospect {row['prospect_id']} <{row['recipient']}> failed ({type(error).__name__}): {error}")
+                draft = fill_template(template, row)
+            except templates.TemplateIncomplete as error:
+                held += 1
+                print(f"  {label} held back ({template}): {error}.")
                 continue
-            body_html = render_html(draft.body, footer_image_url(token))
-            print(f"  Prospect {row['prospect_id']} <{row['recipient']}> (prompt #{email_prompt_id}): {draft.subject}")
+            token = row["tracking_token"] or new_tracking_token()  # an email filled again keeps its token
+            print(f"  {label} ({template}): {draft.subject}")
             if options["dry_run"]:
                 print("    " + draft.body.replace("\n", "\n    "))
             else:
-                save_draft(row, draft, body_html, token, provider, model, datetime.now(timezone.utc), email_prompt_id)
+                save_draft(row, draft, render_html(draft.body, footer_image_url(token)), token, "template",
+                           template.name, datetime.now(timezone.utc), template.pk)
             created += 1
-        verb = "generated (dry run, not saved)" if options["dry_run"] else "saved for review"
-        print(f"Done: {created} email(s) {verb}, {failed} failed" + (f", {skipped} skipped (no email prompt)." if skipped else "."))
-        return 1 if failed or skipped else 0
+        verb = "filled (dry run, not saved)" if options["dry_run"] else "saved for review"
+        print(f"Done: {created} email(s) {verb}" + (f", {held} held back (a variable with no value)" if held else "")
+              + (f", {skipped} skipped (no template)" if skipped else "") + ".")
+        return 1 if held or skipped else 0
     except DatabaseError as error:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")
         print("Check DATABASE_URL and run `python manage.py migrate` first.")
