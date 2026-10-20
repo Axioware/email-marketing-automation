@@ -1,6 +1,6 @@
 # User guide
 
-This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. You queue approved emails in the **Outbox** and the app sends them from **your own mailbox**, each at its time. Leads move through a **Pipeline** you update when people reply. Everything runs on your computer.
+This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. You queue approved emails in the **Outbox** and the app sends them from **your own mailbox**, each at its time. Leads move through a **Pipeline** you update when people reply. The app runs on your computer; the data is kept in Supabase.
 
 You do everything from the **admin** in your browser. Nothing is ever sent without your approval.
 
@@ -9,7 +9,7 @@ You do everything from the **admin** in your browser. Nothing is ever sent witho
 Open a terminal in the project folder and run:
 
 ```sh
-docker compose up -d          # the database and web search (once after each restart of the computer)
+docker compose up -d          # web search (once after each restart of the computer)
 source .venv/bin/activate
 python manage.py runserver
 ```
@@ -342,11 +342,11 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 
 | Setting | Needed for |
 |---|---|
-| `DATABASE_URL`, `LOCAL_DB_PASSWORD` | Everything (the database on this computer, from `docker compose up -d`) |
+| `DATABASE_URL` | Everything (the Supabase database) |
 | `DJANGO_SECRET_KEY` | Logging in (any long random text) |
 | `AUTH_TOKEN` | The API: every request must send it in the `Auth` header |
 | `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) |
-| `SEARXNG_URL`, `SEARXNG_SECRET` | Web search for decision makers (step 4); the local SearXNG |
+| `SEARXNG_URL` | Web search for decision makers (step 4); the local SearXNG |
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD` | Sending (step 8): your mailbox's SMTP server and login (Gmail / Google Workspace: an app password) |
 | `SENDER_EMAIL`, `SENDER_NAME` | Sending: the From address and name; the name is also the sign-off (empty: "The Axioware team") |

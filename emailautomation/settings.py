@@ -36,6 +36,8 @@ def database_from_url(url: str) -> dict:
         "OPTIONS": dict(parse_qsl(parts.query)),
         "CONN_MAX_AGE": 60,
         "CONN_HEALTH_CHECKS": True,
+        # Supabase's transaction pooler (port 6543) cannot keep server-side cursors open between transactions.
+        "DISABLE_SERVER_SIDE_CURSORS": parts.port == 6543 or env_bool("DATABASE_POOLER"),
     }
 
 

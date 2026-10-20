@@ -1,6 +1,6 @@
 # Email Marketing Automation
 
-Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each from your templates and lets you review and approve them. You queue approved emails in the **Outbox** and the app **sends them from your own mailbox (SMTP)**, each at its time; leads move through a **Pipeline** (New Lead → ... → Won / Lost) that you update by hand on replies. Everything runs **on your machine**: the Django app, the database, SearXNG, Reacher and the scraper container (Docker). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command.
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each from your templates and lets you review and approve them. You queue approved emails in the **Outbox** and the app **sends them from your own mailbox (SMTP)**, each at its time; leads move through a **Pipeline** (New Lead → ... → Won / Lost) that you update by hand on replies. Everything runs **on your machine** (the Django app, SearXNG, Reacher and the scraper container in Docker); the data lives in **Supabase** (PostgreSQL). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command.
 
 **Using the admin day to day:** see the [user guide](docs/USER_GUIDE.md), also available in the admin under **Guide** (top right).
 
@@ -14,7 +14,7 @@ python -m venv .venv && source .venv/bin/activate    # skip if .venv already exi
 python -m pip install -r requirements.txt
 python -m playwright install chromium               # Modules 1 and 2
 cp .env.example .env                                # then fill it in (see below)
-docker compose up -d                                # the database and SearXNG (docker-compose.yml)
+docker compose up -d                                # SearXNG (docker-compose.yml)
 python manage.py migrate                            # creates / updates every table
 python manage.py createsuperuser                    # your admin login
 python manage.py runserver                          # http://127.0.0.1:8000/admin/
@@ -24,11 +24,11 @@ Generate a `DJANGO_SECRET_KEY` for `.env` with `python -c "import secrets; print
 
 **Database created before the move to Django** (with Alembic): run `python manage.py migrate --fake-initial` once instead of `migrate`. It adopts the existing tables without touching their data, converts the three remaining `json` columns to `jsonb`, re-applies the triggers and the open-tracking function, adds Django's own tables, and turns on row level security for every table (so the Supabase REST API cannot read them). The old `alembic_version` table is no longer used and can be dropped.
 
-Also needed, all on this machine:
+Also needed:
 
-- **Docker**: `docker compose up -d` starts the database (Postgres on `127.0.0.1:5433`; set `LOCAL_DB_PASSWORD` and the same password in `DATABASE_URL`) and SearXNG (`127.0.0.1:8888`, set `SEARXNG_SECRET`; `SEARXNG_URL=http://127.0.0.1:8888`). Email verification (Module 4) starts Reacher itself (see "Docker setup" below); the Google Maps scraper container runs from its own repo (`MAPS_SCRAPER_URL`, default `http://127.0.0.1:8001`).
+- **Supabase**: the database (`DATABASE_URL`; the pooler URL if your network has no IPv6). Run `python manage.py migrate` against it after pulling new code.
+- **Docker**: `docker compose up -d` starts SearXNG (`SEARXNG_URL=http://127.0.0.1:8888`, reachable from this machine only). Email verification (Module 4) starts Reacher itself (see "Docker setup" below); the Google Maps scraper container runs from its own repo (`MAPS_SCRAPER_URL`, default `http://127.0.0.1:8001`).
 - **Your mailbox** for sending: the `SMTP_` settings and `SENDER_EMAIL` in `.env` (see [Sending from your mailbox](#sending-from-your-mailbox-the-outbox)).
-- **Moving data from the old Supabase database** (optional): with the old `DATABASE_URL`, `python manage.py dumpdata --natural-foreign --exclude contenttypes --exclude auth.permission --exclude admin.logentry --exclude sessions -o backup.json`; then switch `DATABASE_URL` to the local one, `python manage.py migrate` and `python manage.py loaddata backup.json`.
 
 ### Docker setup (Reacher, for email verification)
 
@@ -80,10 +80,10 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 
 | Needed for | Keys |
 |---|---|
-| Everything | `DATABASE_URL` (the local Postgres), `LOCAL_DB_PASSWORD`, `DJANGO_SECRET_KEY` (`DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS` optional) |
+| Everything | `DATABASE_URL` (Supabase), `DJANGO_SECRET_KEY` (`DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS` optional) |
 | The API | `AUTH_TOKEN` (sent in every request's `Auth` header) |
 | Website research | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
-| Decision makers | `SEARXNG_URL` (the local SearXNG), `SEARXNG_SECRET` |
+| Decision makers | `SEARXNG_URL` (the local SearXNG) |
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
 | Sending | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SENDER_EMAIL`, `SENDER_NAME` (also the sign-off; empty: "The Axioware team") |
 
@@ -403,7 +403,7 @@ Tests never use the `.env` database or real services: they run against a throwaw
 | `emailautomation/` | Django settings and URLs |
 | `pipeline/models.py` | one model per table |
 | `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` (send times, the queue, stopping and resuming), `sending.py` (the SMTP sender), `stages.py` (the lead pipeline) |
-| `docker-compose.yml`, `docker/` | the local database and SearXNG |
+| `docker-compose.yml`, `docker/` | the local SearXNG |
 | `pipeline/services/searxng.py` | web search through your SearXNG instance (decision makers) |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |
