@@ -1,6 +1,0 @@
-# Everything, for the machine that runs the pipeline steps (and for local development and tests).
--r requirements.txt
-playwright>=1.40
-trafilatura>=1.12
-lxml_html_clean>=0.4
-selenium>=4.20

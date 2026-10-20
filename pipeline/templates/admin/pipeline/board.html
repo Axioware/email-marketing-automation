@@ -1,0 +1,42 @@
+{% extends "admin/base_site.html" %}
+{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">Home</a> › Pipeline</div>{% endblock %}
+{% block coltype %}colM{% endblock %}
+{% block content %}
+<div id="content-main">
+  <form method="get" class="pipeline-board-filter">
+    <input type="search" name="q" value="{{ query }}" placeholder="Search email, business or contact" aria-label="Search">
+    <select name="campaign" aria-label="Campaign">
+      <option value="">All campaigns</option>
+      {% for c in campaigns %}<option value="{{ c.pk }}" {% if campaign == c.pk|stringformat:"s" %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
+    </select>
+    <input type="submit" value="Filter">
+    <span class="help">Sending moves leads to Ready to Send, Initial Email and Follow-up. Move a lead to Replied, Demo Booked, Demo Done, Won, Lost or Quota Exhausted to stop its emails; back to Initial Email or Follow-up to resume them.</span>
+  </form>
+  <div class="pipeline-board">
+    {% for column in columns %}
+      <section class="pipeline-column" id="stage-{{ column.value }}">
+        <h2>{{ column.label }} <small>{{ column.total }}</small></h2>
+        {% for lead in column.leads %}
+          <article class="pipeline-lead">
+            <a href="{% url 'admin:pipeline_prospect_change' lead.pk %}"><b>{{ lead.business.name }}</b></a>
+            <div>{{ lead.contact.name|default:"" }}</div>
+            <div class="pipeline-lead-email">{{ lead.email }}</div>
+            <small>{{ lead.business.discovery_campaign.name }}{% if lead.email_sequence %} · {{ lead.email_sequence.name }}{% endif %}</small>
+            {% if lead.sequence_stopped_at %}<small class="pipeline-lead-stopped">Emails stopped</small>{% endif %}
+            <form method="post" action="{% url 'admin:pipeline_board_move' lead.pk %}">{% csrf_token %}
+              <input type="hidden" name="next" value="{{ request.get_full_path }}">
+              <select name="stage" aria-label="Move to">
+                {% for value, label in stages %}<option value="{{ value }}" {% if value == column.value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+              </select>
+              <input type="submit" value="Move">
+            </form>
+          </article>
+        {% empty %}
+          <p class="pipeline-empty">No leads</p>
+        {% endfor %}
+        {% if column.more %}<p class="help">and {{ column.more }} more (search or filter to find them)</p>{% endif %}
+      </section>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

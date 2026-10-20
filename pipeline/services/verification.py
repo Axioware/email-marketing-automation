@@ -598,7 +598,7 @@ def add_arguments(parser) -> None:
 
 
 def run(options: dict) -> int:
-    """Check the contacts' addresses. With a "deadline" (the web app on Vercel, pipeline/webruns.py) no check starts
+    """Check the contacts' addresses. With a "deadline" (a caller's time limit) no check starts
     unless it can finish in time, and addresses that came back unknown before are not checked again, so each run gets
     further (--recheck checks them)."""
     if options["delay"] < 0 or options["reacher_timeout"] <= 0 or options["max_candidates"] < 0:

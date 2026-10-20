@@ -11,7 +11,8 @@
 {% url 'admin:pipeline_email_reopen' email.pk as reopen_url %}
 {% url 'admin:pipeline_email_regenerate' email.pk as regenerate_url %}
 {% url 'admin:pipeline_email_replied' email.pk as replied_url %}
-{% url 'admin:pipeline_email_handover' email.pk as handover_url %}
+{% url 'admin:pipeline_email_queue' email.pk as queue_url %}
+{% url 'admin:pipeline_email_unqueue' email.pk as unqueue_url %}
 <div class="pipeline-review">
   <div class="pipeline-card">
     <h2>{% if email.sequence_step > 1 %}Follow-up {{ email.sequence_step|add:"-1" }}{% else %}First email{% endif %}
@@ -21,8 +22,7 @@
     {% if email.prospect.sequence_stopped_at %}<p class="pipeline-note">This prospect's sequence was stopped on {{ email.prospect.sequence_stopped_at|date:"Y-m-d" }} ({{ email.prospect.sequence_stop_reason }}): no more emails go to them.</p>{% endif %}
     {% if email.review_note %}<p class="pipeline-note">Review note: {{ email.review_note }}</p>{% endif %}
     {% if email.send_error %}<p class="pipeline-error">Last send error: {{ email.send_error }}</p>{% endif %}
-    {% if email.ghl_error %}<p class="pipeline-error">GoHighLevel: {{ email.ghl_error }}</p>{% endif %}
-    {% if not prospect_ready and email.status in "in_review approved scheduled" %}<p class="pipeline-error">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</p>{% endif %}
+    {% if not prospect_ready and email.status in "in_review approved queued" %}<p class="pipeline-error">The prospect is no longer ready for outreach (do-not-contact, rejected or not deliverable). It will not be sent.</p>{% endif %}
     {% if has_placeholder %}<p class="pipeline-error">Contains placeholder text; edit it before approving.</p>{% endif %}
 
     <div class="pipeline-actions">
@@ -30,16 +30,19 @@
         <form method="post" action="{{ approve_url }}">{% csrf_token %}
           <input type="submit" class="default" value="Approve" {% if has_placeholder %}disabled{% endif %}></form>
       {% endif %}
-      {% if email.status == "in_review" or email.status == "approved" or email.status == "scheduled" %}
+      {% if email.status == "in_review" or email.status == "approved" or email.status == "queued" or email.status == "failed" %}
         <form method="post" action="{{ reject_url }}">{% csrf_token %}
           <input type="text" name="note" placeholder="Reason (optional)" maxlength="2000">
           <input type="submit" class="danger" value="Reject"></form>
       {% endif %}
-      {% if email.status == "rejected" or email.status == "approved" or email.status == "scheduled" %}
+      {% if email.status == "rejected" or email.status == "approved" or email.status == "queued" or email.status == "failed" %}
         <form method="post" action="{{ reopen_url }}">{% csrf_token %}<input type="submit" value="Back to review"></form>
       {% endif %}
-      {% if email.status == "approved" %}
-        <form method="post" action="{{ handover_url }}">{% csrf_token %}<input type="submit" class="default" value="Hand to GoHighLevel"></form>
+      {% if email.status == "approved" or email.status == "failed" %}
+        <form method="post" action="{{ queue_url }}">{% csrf_token %}<input type="submit" class="default" value="Queue for sending"></form>
+      {% endif %}
+      {% if email.status == "queued" %}
+        <form method="post" action="{{ unqueue_url }}">{% csrf_token %}<input type="submit" value="Take out of the queue"></form>
       {% endif %}
       {% if email.status == "sent" or email.status == "opened" %}
         <form method="post" action="{{ replied_url }}">{% csrf_token %}<input type="submit" value="Mark replied"></form>
@@ -54,10 +57,12 @@
       {% endif %}
     </div>
 
-    {% if email.status == "scheduled" or email.status == "sending" %}
-      <p class="pipeline-note">In GoHighLevel since {{ email.released_at|date:"Y-m-d H:i T" }}, due {{ email.scheduled_at|date:"Y-m-d H:i T" }}; GoHighLevel sends it then. Editing, rejecting or sending it back to review takes it back out of GoHighLevel first.</p>
+    {% if email.status == "queued" %}
+      <p class="pipeline-note">Queued: sent from your mailbox at {{ email.scheduled_at|date:"Y-m-d H:i T" }}. Editing, rejecting or sending it back to review takes it out of the queue.</p>
+    {% elif email.status == "sending" %}
+      <p class="pipeline-note">Being sent right now.</p>
     {% elif email.status == "approved" %}
-      <p class="pipeline-note">Approved{% if email.scheduled_at %} for {{ email.scheduled_at|date:"Y-m-d H:i T" }}{% endif %} but not in GoHighLevel yet. Hand it over when GoHighLevel can take it.</p>
+      <p class="pipeline-note">Approved for {{ email.scheduled_at|date:"Y-m-d H:i T" }}. Queue it (here or in the <a href="{% url 'admin:pipeline_outboxemail_changelist' %}">Outbox</a>) to send it then.</p>
     {% endif %}
 
     <h3>What we know about them</h3>

@@ -197,7 +197,7 @@ class EmailApiTests(ApiCase):
         email = make_email()
         response = self.api.post(f"/api/emails/{email.pk}/approve/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["email"]["status"], "approved")  # GoHighLevel is not set up in this test: it waits, with its time
+        self.assertEqual(response.json()["email"]["status"], "approved")  # approved, with its send time; queueing sends it
         self.assertIsNotNone(response.json()["email"]["scheduled_at"])
         self.assertEqual(self.api.post(f"/api/emails/{email.pk}/approve/").status_code, 409)  # not in review any more
         self.api.post(f"/api/emails/{email.pk}/reject/", {"note": "Too long"}, format="json")
@@ -214,12 +214,11 @@ class EmailApiTests(ApiCase):
         self.assertIn("TEST TEMPLATE for Clinic", response.json()["email"]["subject"])
         self.assertEqual(response.json()["email"]["tracking_token"], email.tracking_token)
 
-    def test_there_is_no_send_endpoint(self):
+    def test_there_is_no_send_now_endpoint(self):
         email = make_email("approved")
         response = self.api.post(f"/api/emails/{email.pk}/send/", {"confirm": email.recipient}, format="json")
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 404)  # emails are queued and sent at their times
         self.assertEqual(Email.objects.get(pk=email.pk).status, "approved")
-        self.assertEqual(self.api.post("/api/runs/", {"command": "send_emails"}, format="json").status_code, 400)
 
     def test_bulk(self):
         a, b = make_email(), make_email(body="PLACEHOLDER")
@@ -252,7 +251,7 @@ class RunApiTests(ApiCase):
     def test_commands_lists_options(self):
         commands = {c["command"]: c for c in self.api.get("/api/runs/commands/").json()}
         self.assertEqual(set(commands), {"run_pipeline", "fetch_businesses", "refresh_businesses", "research_websites", "find_stakeholders",
-                                         "verify_emails", "generate_emails", "generate_followups", "ghl_sync"})
+                                         "verify_emails", "generate_emails", "generate_followups", "send_emails"})
         options = {o["name"]: o for o in commands["verify_emails"]["options"]}
         self.assertEqual(options["business_id"]["type"], "list")
         self.assertEqual(options["dry_run"]["type"], "flag")

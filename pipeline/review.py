@@ -1,20 +1,20 @@
 """Reviewing emails filled from templates: edit, approve, reject, reopen, fill in again. Used by the admin and the API.
 
 Every change is a conditional update on the email's current status, so two reviewers can never move an email through
-an invalid transition. Editing always sends an email back to review. Approving schedules the email; GoHighLevel sends
-it when its time comes (pipeline/services/outreach.py).
+an invalid transition. Editing always sends an email back to review. Approving gives the email its send time; queueing it
+on the Outbox page sends it then (pipeline/services/outreach.py, sending.py).
 """
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from django.db.models import Count, Q
 
 from pipeline.models import Business, Email, EmailPrompt
-from pipeline.services import generation, ghl, outreach, templates
+from pipeline.services import generation, outreach, stages, templates
 
-EDITABLE = ("in_review", "approved", "scheduled", "rejected")
-STATUS_ORDER = ("in_review", "approved", "scheduled", "sending", "rejected", "sent", "opened", "replied", "failed")
-LEGACY_STATUSES = ("sending", "opened", "failed")  # from SMTP sending and open tracking; no longer set
+EDITABLE = ("in_review", "approved", "queued", "rejected", "failed")
+NOT_SENT = ("in_review", "approved", "queued", "failed")  # may still be rejected
+STATUS_ORDER = ("in_review", "approved", "queued", "sending", "failed", "rejected", "sent", "opened", "replied")
+LEGACY_STATUSES = ("opened",)  # open tracking; off
 MAX_SUBJECT = generation.MAX_SUBJECT_CHARS
 MAX_BODY = generation.MAX_BODY_CHARS
 
@@ -40,14 +40,14 @@ def prospect_ready(email: Email) -> bool:
             and prospect.sequence_stopped_at is None)
 
 
-def mark_replied(email: Email) -> str:
-    """Record a reply to a sent email: the email becomes Replied and its prospect gets no more emails (each prospect
-    has its own sequence; others at the same business are not affected)."""
+def mark_replied(email: Email, user=None) -> str:
+    """Record a reply to a sent email: the email becomes Replied, the lead moves to Replied on the pipeline and its
+    prospect gets no more emails (each prospect has its own sequence; others at the same business are not affected)."""
     if email.status == "replied":
         return "Already marked as replied."
     if not _transition(email.pk, ("sent", "opened"), status="replied"):
         raise ReviewError("Only sent or opened emails can be marked replied.")
-    outreach.stop_prospect(email.prospect, "replied")
+    stages.move(email.prospect, stages.PipelineStage.REPLIED, user, note="marked replied")
     return "Marked replied. No more emails go to this prospect."
 
 
@@ -100,16 +100,6 @@ def next_in_review(after_id: int) -> int | None:
     return queue.filter(id__gt=after_id).first() or queue.exclude(id=after_id).first()
 
 
-def _take_back(email: Email) -> None:
-    """A handed-over email is taken back out of GoHighLevel before it changes here; if GHL cannot be reached
-    nothing changes (it could still be sent)."""
-    if email.status in (*outreach.HANDED, "approved"):
-        try:
-            outreach.withdraw(email)
-        except outreach.OutreachError as error:
-            raise ReviewError(str(error)) from error
-
-
 def save_edit(email: Email, subject: str, body: str) -> str:
     subject, body = " ".join((subject or "").split()), (body or "").replace("\r\n", "\n").strip()
     if not subject or not body:
@@ -118,15 +108,13 @@ def save_edit(email: Email, subject: str, body: str) -> str:
         raise ReviewError(f"Keep the subject under {MAX_SUBJECT} and the body under {MAX_BODY} characters.")
     if generation.OPEN_TRACKING and not generation.default_tracking_base_url():
         raise ReviewError("Cannot build the tracking URL; set EMAIL_TRACKING_BASE_URL.")
-    if email.status in EDITABLE:
-        _take_back(email)
     changed = _transition(
         email.pk, EDITABLE,
         subject=subject,
         body_text=generation.render_text(body),
         body_html=generation.render_html(body, generation.footer_image_url(email.tracking_token)),
         edited_at=_now(),
-        status="in_review", reviewed_at=None, scheduled_at=None,  # an edited email always needs a fresh approval
+        status="in_review", reviewed_at=None, scheduled_at=None, queued_at=None,  # edited: approve it again
     )
     if not changed:
         raise ReviewError("This email can no longer be edited.")
@@ -134,8 +122,7 @@ def save_edit(email: Email, subject: str, body: str) -> str:
 
 
 def approve(email: Email) -> str:
-    """Approve and hand over: the email gets its send time and is written into its GoHighLevel contact, which waits
-    until then and sends it. If GHL cannot take it, it stays approved with the error; hand it over again later."""
+    """Approve: the email gets its send time. Queue it on the Outbox page to send it then."""
     if has_placeholder(email):
         raise ReviewError("This email still contains placeholder text; edit it first.")
     if not prospect_ready(email):
@@ -143,43 +130,49 @@ def approve(email: Email) -> str:
     if not _transition(email.pk, ("in_review",), status="approved", reviewed_at=_now(), review_note=None):
         raise ReviewError("Only emails in review can be approved.")
     try:
-        slot = outreach.schedule(email)
+        outreach.schedule(email)
     except outreach.OutreachError as error:
         _transition(email.pk, ("approved",), status="in_review", reviewed_at=None)
         raise ReviewError(f"Not approved: {error}") from error
-    zone = email.business.discovery_campaign.send_timezone
-    when = f"{slot.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M')} ({zone})"
-    if not ghl.configured():
-        return f"Approved for {when}; GoHighLevel is not set up, so it waits here (hand it over once it is)."
-    try:
-        outreach.hand_over(email)
-    except (outreach.OutreachError, ghl.GhlError) as error:
-        return f"Approved for {when}, but not handed to GoHighLevel: {error}"
-    return f"Approved and handed to GoHighLevel; due {when}."
+    if email.sequence_step == generation.SEQUENCE_STEP:
+        stages.advance(email.prospect, stages.PipelineStage.READY_TO_SEND, note="first email approved")
+    return f"Approved for {outreach.local_time(email)}. Queue it in the Outbox to send it then."
 
 
-def hand_over(email: Email) -> str:
-    """Hand an approved email (whose earlier hand-over failed or was interrupted) to GoHighLevel."""
-    try:
-        due = outreach.hand_over(email)
-    except (outreach.OutreachError, ghl.GhlError) as error:
-        raise ReviewError(f"Not handed over: {error}") from error
-    return f"Handed to GoHighLevel; due {due}."
+def queue(emails) -> str:
+    """Queue emails for sending and make sure the sender runs."""
+    from pipeline import jobs
+
+    result = outreach.queue(emails)
+    message = f"{result['queued']} email(s) queued."
+    if result["skipped"]:
+        message += " Skipped: " + "; ".join(f"#{pk} ({why})" for pk, why in result["skipped"][:10])
+        message += "." if len(result["skipped"]) <= 10 else f" and {len(result['skipped']) - 10} more."
+    if result["queued"] or Email.objects.filter(status="queued").exists():
+        from pipeline.services import sending
+
+        if not sending.configured():
+            return message + f" Sending is not set up ({sending.missing_settings()} in .env), so they wait in the queue."
+        run, started = jobs.ensure_sender()
+        message += f" The sender {'started' if started else 'is running'} (run #{run.pk}); each email goes at its time."
+    return message
+
+
+def unqueue(emails) -> str:
+    return f"{outreach.unqueue(emails)} email(s) taken out of the queue (still approved, same times)."
 
 
 def reject(email: Email, note: str = "") -> str:
-    _take_back(email)
-    if not _transition(email.pk, ("in_review", "approved", "scheduled"), status="rejected", reviewed_at=_now(),
-                       review_note=(note or "").strip()[:2000] or None, scheduled_at=None):
-        raise ReviewError("Only emails in review, approved or scheduled can be rejected.")
+    if not _transition(email.pk, NOT_SENT, status="rejected", reviewed_at=_now(),
+                       review_note=(note or "").strip()[:2000] or None, scheduled_at=None, queued_at=None):
+        raise ReviewError("Only emails not sent yet can be rejected.")
     return "Rejected."
 
 
 def reopen(email: Email) -> str:
-    _take_back(email)
-    if not _transition(email.pk, ("rejected", "approved", "scheduled"), status="in_review", reviewed_at=None,
-                       scheduled_at=None):
-        raise ReviewError("Only rejected, approved or scheduled emails can go back to review.")
+    if not _transition(email.pk, ("rejected", "approved", "queued", "failed"), status="in_review", reviewed_at=None,
+                       scheduled_at=None, queued_at=None):
+        raise ReviewError("Only rejected, approved, queued or failed emails can go back to review.")
     return "Back in review."
 
 
@@ -217,7 +210,8 @@ def regenerate(email: Email, email_prompt: EmailPrompt | None = None) -> str:
 
 
 def bulk(action: str, ids: list[int]) -> tuple[int, int]:
-    """Approve or reject many emails. Returns (done, skipped); skipped ones had the wrong status or placeholder text."""
+    """Approve or reject many emails. Returns (done, skipped); skipped ones had the wrong status or placeholder text.
+    (Queueing many emails: queue().)"""
     if action not in ("approve", "reject"):
         raise ReviewError("Unknown action; use approve or reject.")
     done = skipped = 0

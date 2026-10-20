@@ -2,13 +2,8 @@
 
 A run is a row in `pipeline_runs`. It executes as `manage.py run_pipeline_job <id>`, which runs the command exactly
 as the CLI would and streams everything it prints into the row, so the admin and the API can show progress while it
-works. Long steps (scraping, research, verification) therefore never block a web request.
-
-RUN_MODE=local (default): starting a run spawns that process on this machine.
-RUN_MODE=queue (the web app on Vercel, which cannot run background processes, browsers or Docker): starting a run
-only stores it; `manage.py run_worker` on a machine with the browsers and Docker picks queued runs up, and a stop
-request is passed to it through the database. Steps that only call the scraper container or Reacher on your own server
-run on Vercel itself, inside the request that starts them (pipeline/webruns.py).
+works. Long steps (scraping, research, verification, sending) therefore never block a web request. Everything runs
+on this machine.
 """
 import argparse
 import os
@@ -42,7 +37,7 @@ COMMANDS = {
     "verify_emails": "Module 4 - verify emails with Reacher (creates prospects)",
     "generate_emails": "Module 5 - generate outreach emails for review",
     "generate_followups": "Follow-ups - write the next follow-ups for review",
-    "ghl_sync": "GoHighLevel - create contacts and hand approved emails to GoHighLevel",
+    "send_emails": "Sending - send the queued emails at their times (SMTP); stops when the queue is empty",
 }
 # Options every Django command has; they are not pipeline options.
 DJANGO_OPTIONS = {"help", "version", "verbosity", "settings", "pythonpath", "traceback", "no_color", "force_color",
@@ -137,32 +132,27 @@ def build_arguments(command: str, options: dict | None = None, arguments: list |
 # ---------------------------------------------------------------- starting and stopping
 
 
-def queue_mode() -> bool:
-    """Runs wait for a worker instead of starting here (RUN_MODE=queue, e.g. on Vercel)."""
-    return os.environ.get("RUN_MODE", "local").strip().lower() == "queue"
-
-
 def start_run(command: str, arguments: list[str], user=None) -> PipelineRun:
-    """Record a run and start it in the background once the surrounding transaction commits (in queue mode a
-    worker starts it)."""
+    """Record a run and start it in a background process once the surrounding transaction commits."""
     run = PipelineRun.objects.create(command=command, arguments=arguments,
                                      created_by=user if getattr(user, "is_authenticated", False) else None)
-    dispatch(run)
+    transaction.on_commit(lambda: launch(run.pk))
     return run
 
 
-def dispatch(run: PipelineRun) -> None:
-    """Decide where a new run executes and start it once the surrounding transaction commits: right here in this
-    request (Vercel, steps that only call your own server; the request answers when the run is done), on a worker
-    (queue mode), or in a background process here."""
-    from pipeline import webruns
+def active_run(command: str) -> PipelineRun | None:
+    """A run of this command that is waiting to start or running (after clearing runs whose process died)."""
+    refresh_stale_runs()
+    return PipelineRun.objects.filter(command=command, status__in=(PipelineRun.Status.QUEUED,
+                                                                   PipelineRun.Status.RUNNING)).first()
 
-    if webruns.web_capable(run.command, run.arguments):
-        PipelineRun.objects.filter(pk=run.pk).update(runs_on="web")
-        run.runs_on = "web"
-        transaction.on_commit(lambda: webruns.execute(run.pk))
-    elif not queue_mode():
-        transaction.on_commit(lambda: launch(run.pk))
+
+def ensure_sender(user=None) -> tuple[PipelineRun, bool]:
+    """The run sending queued emails: the one already running, or a new one. Returns (run, started_now)."""
+    current = active_run("send_emails")
+    if current is not None:
+        return current, False
+    return start_run("send_emails", [], user), True
 
 
 def log_path(run_id: int) -> Path:
@@ -191,11 +181,6 @@ def cancel_run(run: PipelineRun) -> str:
     run.refresh_from_db()
     if run.status != PipelineRun.Status.RUNNING:
         return "This run is not running."
-    if run.runs_on == "web":
-        return "This run is working inside the request that started it; it finishes on its own within 5 minutes."
-    if queue_mode():  # it runs on the worker's machine: the worker sees the request and stops it
-        PipelineRun.objects.filter(pk=run.pk).update(cancel_requested=True)
-        return "Stop requested; the worker stops the run within a few seconds."
     if not run.pid:
         return "This run is not running."
     if not process_alive(run.pid):
@@ -222,13 +207,7 @@ def process_alive(pid: int) -> bool:
 
 
 def refresh_stale_runs() -> None:
-    """Mark runs failed whose process died without recording a result (e.g. the machine restarted). In queue mode the
-    processes live on the worker's machine, so the worker does this itself (run_worker)."""
-    from pipeline import webruns
-
-    webruns.fail_cut_off_runs()
-    if queue_mode():
-        return
+    """Mark runs failed whose process died without recording a result (e.g. the machine restarted)."""
     fail_dead_runs(queued_too=True)
 
 
@@ -236,8 +215,7 @@ def fail_dead_runs(queued_too: bool = False) -> None:
     """Running runs whose process (on this machine) is gone are marked failed; with `queued_too`, also runs that
     never started within QUEUED_TIMEOUT."""
     now = timezone.now()
-    worker_runs = PipelineRun.objects.filter(runs_on="worker")  # web runs have no process (pipeline/webruns.py)
-    for run in worker_runs.filter(status=PipelineRun.Status.RUNNING).exclude(pid=None):
+    for run in PipelineRun.objects.filter(status=PipelineRun.Status.RUNNING).exclude(pid=None):
         if not process_alive(run.pid):
             PipelineRun.objects.filter(pk=run.pk, status=PipelineRun.Status.RUNNING).update(
                 status=PipelineRun.Status.FAILED, finished_at=now,
@@ -245,7 +223,7 @@ def fail_dead_runs(queued_too: bool = False) -> None:
             )
     if not queued_too:
         return
-    for run in worker_runs.filter(status=PipelineRun.Status.QUEUED, created_at__lt=now - QUEUED_TIMEOUT):
+    for run in PipelineRun.objects.filter(status=PipelineRun.Status.QUEUED, created_at__lt=now - QUEUED_TIMEOUT):
         PipelineRun.objects.filter(pk=run.pk, status=PipelineRun.Status.QUEUED).update(
             status=PipelineRun.Status.FAILED, finished_at=now,
             output="[The run never started.]\n" + _log_tail(run.pk),
@@ -315,7 +293,7 @@ def _store_output(run_id: int, text: str) -> None:
 
 def execute_run(run_id: int) -> int:
     """Run a queued pipeline run in this process and record the result. Returns the exit code."""
-    if not PipelineRun.objects.filter(pk=run_id, status=PipelineRun.Status.QUEUED, runs_on="worker").update(
+    if not PipelineRun.objects.filter(pk=run_id, status=PipelineRun.Status.QUEUED).update(
         status=PipelineRun.Status.RUNNING, started_at=timezone.now(), pid=os.getpid()
     ):
         return 0  # cancelled before it started, or already taken

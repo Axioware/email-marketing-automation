@@ -7,9 +7,9 @@ from django.core.management.base import BaseCommand, CommandError
 class ServiceCommand(BaseCommand):
     """A management command that runs one pipeline service module (its `add_arguments` and `run`).
 
-    The web app on Vercel also passes `deadline` (time.monotonic() by which the step must be done, so the request
-    answers within Vercel's time limit; pipeline/webruns.py). It is not a command-line option: steps check it with
-    out_of_time() before starting new work and say what is left for the next run.
+    A caller may pass `deadline` (time.monotonic() by which the step must be done; the full pipeline and tests do).
+    It is not a command-line option: steps check it with out_of_time() before starting new work and say what is left
+    for the next run.
     """
 
     service = None

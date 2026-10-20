@@ -71,7 +71,7 @@ class AdminPagesTests(AdminCase):
         self.assertNotIn("Email open events", page)  # open tracking is off: nothing to show
         self.assertIn("Settings", page)
         detail = self.client.get(reverse("admin:pipeline_email_change", args=[email.pk])).content.decode()
-        for unused in ("Open count", "Sent from", "Message id", "Tracking token"):
+        for unused in ("Open count", "Tracking token"):
             self.assertNotIn(unused, detail)
 
     def test_settings_page_is_the_one_settings_row(self):
@@ -84,7 +84,8 @@ class AdminPagesTests(AdminCase):
         self.assertIn("all campaigns together", page)
         self.assertNotIn("Delete", page)
         saved = self.client.post(url, {"daily_cap": "25", "gap_fixed_seconds": "60", "gap_random_min_seconds": "10",
-                                       "gap_random_max_seconds": "20", "footer_text": "Acme\r\nReply STOP to opt out."},
+                                       "gap_random_max_seconds": "20", "reply_window_days": "5",
+                                       "footer_text": "Acme\r\nReply STOP to opt out."},
                                 follow=True)
         self.assertContains(saved, "Settings saved.")
         current = SendingSettings.current()
@@ -270,7 +271,7 @@ class EmailReviewTests(AdminCase):
         self.assertIn("Email footer", page)
         self.assertIn("If you would rather not hear from us", page)  # the default
         form = {"daily_cap": "40", "gap_fixed_seconds": "120", "gap_random_min_seconds": "180",
-                "gap_random_max_seconds": "300"}
+                "gap_random_max_seconds": "300", "reply_window_days": "3"}
         self.assertContains(self.client.post(url, {**form, "footer_text": "   "}), "This field is required")
         self.assertEqual(SendingSettings.current().footer_text, g.DEFAULT_FOOTER_TEXT)  # nothing saved
         response = self.client.post(url, {**form, "footer_text": "Acme Clinics\r\n1 Main St\r\nReply STOP to opt out."})
@@ -321,7 +322,7 @@ class EmailReviewTests(AdminCase):
         response = self.post_action(first, "approve", follow=False)
         self.assertEqual(response["Location"], self.change_url(second))
         row = self.row(first)
-        self.assertEqual(row["status"], "approved")  # GoHighLevel is not set up here: approved, with its send time
+        self.assertEqual(row["status"], "approved")  # approved, with its send time; queueing sends it
         self.assertIsNotNone(row["reviewed_at"])
         self.assertIsNotNone(row["scheduled_at"])
 
@@ -376,11 +377,12 @@ class EmailReviewTests(AdminCase):
         self.assertContains(self.post_action(eid, "regenerate"), "no value for {{team_size}}")
         self.assertEqual(self.row(eid)["subject"], "Hello there")
 
-    def test_approved_email_has_no_send_button(self):
+    def test_approved_email_is_queued_not_sent_from_its_page(self):
         eid = self.email()
         self.post_action(eid, "approve")
         page = self.client.get(self.change_url(eid)).content.decode()
-        self.assertIn("not in GoHighLevel yet", page)  # GoHighLevel is not set up in this test
+        self.assertIn("Queue for sending", page)
+        self.assertIn("Queue it (here or in the", page)
         self.assertNotIn("Send now", page)
         self.assertNotIn("/send/", page)
         self.client.post(self.change_url(eid).replace("change/", "send/"), {"confirm": self.row(eid)["recipient"]})
@@ -418,7 +420,7 @@ class DashboardTests(AdminCase):
         with mock.patch.dict(os.environ, {"VERIFY_HELO": ""}):
             page = self.client.get(reverse("admin:index")).content.decode()
         self.assertIn("Create your first campaign", page)
-        self.assertNotIn("Sending is not set up", page)
+        self.assertIn("Sending is not set up", page)  # no SMTP settings in tests
         self.assertIn("VERIFY_HELO is not set", page)
 
     def test_sidebar_follows_the_pipeline(self):

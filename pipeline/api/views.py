@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from pipeline import jobs, review
+from pipeline.services import stages
 from pipeline.api import serializers as s
 from pipeline.models import (
     Business,
@@ -150,7 +151,23 @@ class ProspectViewSet(viewsets.ModelViewSet):
     queryset = Prospect.objects.all()
     serializer_class = s.ProspectSerializer
     filterset_fields = ["business", "contact", "email_status", "verdict", "outreach_status", "email_sequence",
-                        "approved_by_person", "do_not_contact"]
+                        "pipeline_stage", "approved_by_person", "do_not_contact"]
+
+    @extend_schema(request=s.MoveStageSerializer, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=["post"], url_path="move-stage")
+    def move_stage(self, request, pk=None):
+        """Move the lead on the pipeline. Replied, Demo Booked, Demo Done, Won, Lost and Quota Exhausted stop its
+        sequence; Initial Email or Follow-up resumes a stopped one."""
+        params = s.MoveStageSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        prospect = self.get_object()
+        try:
+            message = stages.move(prospect, params.validated_data["stage"], request.user,
+                                  params.validated_data.get("note", ""))
+        except stages.StageError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_409_CONFLICT)
+        prospect.refresh_from_db()
+        return Response({"detail": message, "prospect": s.ProspectSerializer(prospect).data})
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     @action(detail=True, methods=["post"], url_path="mark-replied")
@@ -185,15 +202,27 @@ class EmailViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Upda
     @extend_schema(request=None, responses={200: OpenApiResponse(description="Approved"), 409: OpenApiResponse(description="Not allowed now")})
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        """Approve and hand to GoHighLevel (it waits until the email's send time and sends it)."""
+        """Approve: the email gets its send time. Queue it (emails/queue/) to send it then."""
         return self._act(request, review.approve)
 
-    @extend_schema(request=None, responses={200: OpenApiResponse(description="Handed over"),
-                                            409: OpenApiResponse(description="Not allowed now")})
-    @action(detail=True, methods=["post"], url_path="hand-over")
-    def hand_over(self, request, pk=None):
-        """Hand an approved email whose hand-over failed to GoHighLevel again."""
-        return self._act(request, review.hand_over)
+    @extend_schema(request=s.IdsSerializer, responses=OpenApiTypes.OBJECT)
+    @action(detail=False, methods=["post"])
+    def queue(self, request):
+        """Queue approved (or failed) emails for sending; the sender starts and sends each at its time."""
+        params = s.IdsSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        emails = list(Email.objects.filter(pk__in=params.validated_data["ids"]))
+        message = review.queue(emails)
+        return Response({"detail": message, "queued": Email.objects.filter(pk__in=params.validated_data["ids"],
+                                                                         status="queued").count()})
+
+    @extend_schema(request=s.IdsSerializer, responses=OpenApiTypes.OBJECT)
+    @action(detail=False, methods=["post"])
+    def unqueue(self, request):
+        """Take queued emails out of the queue (they stay approved, with the same times)."""
+        params = s.IdsSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        return Response({"detail": review.unqueue(list(Email.objects.filter(pk__in=params.validated_data["ids"])))})
 
     @extend_schema(request=s.RejectSerializer)
     @action(detail=True, methods=["post"])
@@ -275,7 +304,6 @@ class PipelineRunViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         run = serializer.save()
-        run.refresh_from_db()  # a run the web app executes directly (pipeline/webruns.py) is already finished
         return Response(s.PipelineRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
 
     def destroy(self, request, *args, **kwargs):
@@ -307,6 +335,17 @@ class EmailVariablesView(APIView):
 
         return Response([{"name": name, "description": description}
                          for name, description in templates.known_variables().items()])
+
+
+class PipelineView(APIView):
+    """The lead pipeline: how many leads are in each stage (move one with POST prospects/{id}/move-stage/)."""
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        stages.expire_finished()
+        return Response({"stages": [{"stage": value, "label": label, "leads": count}
+                                    for (value, label), count in zip(stages.PipelineStage.choices,
+                                                                     stages.counts().values())]})
 
 
 class SendingSettingsView(APIView):

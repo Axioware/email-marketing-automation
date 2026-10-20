@@ -1,0 +1,30 @@
+# Local services: the database and SearXNG (web search for decision makers). Start them with
+#   docker compose up -d
+# Reacher (email verification) is started by the app itself; the Google Maps scraper container runs from its own repo.
+services:
+  db:
+    image: postgres:16
+    container_name: email-automation-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432"  # 5432 is left for the test database
+    environment:
+      POSTGRES_DB: email_automation
+      POSTGRES_USER: email_automation
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:?Set LOCAL_DB_PASSWORD in .env}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: email-automation-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
+    volumes:
+      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+volumes:
+  db-data:

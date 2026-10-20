@@ -1,9 +1,9 @@
 """The complete pipeline for one campaign: fetch -> research -> decision makers -> verify -> write emails ->
-write due follow-ups -> create GoHighLevel contacts.
+write due follow-ups.
 
 Each step runs exactly as its own command would, on the campaign's businesses, and only processes what still needs
 it, so rerunning the pipeline continues where it stopped. It never sends: emails end up In review for a person to
-approve. A step that finishes with some errors (e.g. one website failed) does not stop the pipeline; a step that
+approve and queue. A step that finishes with some errors (e.g. one website failed) does not stop the pipeline; a step that
 cannot run at all (missing LLM key, Reacher not available, Google CAPTCHA) stops it, keeping everything saved so far.
 """
 from django.core.management import call_command
@@ -20,7 +20,6 @@ STEPS = {
     "verify": "Verify emails",
     "generate": "Write emails for review",
     "followups": "Write due follow-ups for review",
-    "ghl": "Create GoHighLevel contacts",
 }
 PARTIAL_FAILURE = "Finished with errors"  # how a step reports that only some items failed
 STEP_RESERVE_SECONDS = 45  # with a deadline (the web app): a step starts only with this much time left
@@ -79,21 +78,18 @@ def run(options: dict) -> int:
             return businesses
         if step == "followups":  # follow-ups use the prompt of each step
             return ["--campaign-id", str(campaign_id)] if campaign_id is not None else []
-        if step == "ghl":  # every ready prospect without a GHL contact, whichever campaign
-            return []
         prompt = ["--email-prompt-id", str(options["email_prompt_id"])] if options["email_prompt_id"] else []
         return [*businesses, *prompt]
 
     commands = {"fetch": "fetch_businesses", "research": "research_websites", "stakeholders": "find_stakeholders",
-                "verify": "verify_emails", "generate": "generate_emails", "followups": "generate_followups",
-                "ghl": "ghl_sync"}
+                "verify": "verify_emails", "generate": "generate_emails", "followups": "generate_followups"}
     planned = [step for step in STEPS if step not in skip]
     scope = f"campaign {campaign_id}" if campaign_id is not None else "all businesses"
     print(f"Full pipeline for {scope}: " + " -> ".join(STEPS[step] for step in planned) + ". Nothing is sent.")
     partial = []
     for number, step in enumerate(planned, start=1):
         args = arguments(step)
-        if step not in ("fetch", "followups", "ghl") and campaign_id is not None and "--business-id" not in args:
+        if step not in ("fetch", "followups") and campaign_id is not None and "--business-id" not in args:
             # Without business ids a step would process every business, not just this campaign's.
             print("\nThe campaign has no businesses yet; nothing more to do.")
             return 1 if partial else 0

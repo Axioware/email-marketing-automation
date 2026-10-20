@@ -8,7 +8,8 @@ back, with the reason. Each email gets a random tracking token. Open tracking is
 the email carries no image.
 
 Nothing is sent here: emails are stored with status `in_review`; approve or edit them in the admin (Pipeline >
-Emails) or through the API. Approved emails are scheduled and handed to GoHighLevel (see outreach.py).
+Emails) or through the API. Approved emails get a send time; queued on the Outbox page, they are sent from this
+machine then (see outreach.py, sending.py).
 """
 import html
 import os
@@ -292,7 +293,7 @@ def ready_prospects():
     ready address (candidate order: its own email, then the likeliest guesses) counts, and none once another address
     of the contact has an email or is do-not-contact. And one address can belong to several prospects (an info@ of
     two branches, a person found at two businesses): it gets one sequence, from the prospect that has emails or a
-    GoHighLevel contact, else the oldest; none if any of them is do-not-contact."""
+    a pipeline stage, else the oldest; none if any of them is do-not-contact."""
     same_contact = Prospect.objects.filter(contact_id=OuterRef("contact_id")).exclude(pk=OuterRef("pk"))
     same_address = (Prospect.objects.annotate(address=Lower("email")).filter(address=OuterRef("address"))
                     .exclude(pk=OuterRef("pk")))
@@ -302,7 +303,7 @@ def ready_prospects():
         .exclude(Exists(same_contact.filter(do_not_contact=True)))
         .exclude(Exists(same_contact.filter(READY_PROSPECT, id__lt=OuterRef("pk"))))
         .exclude(Exists(same_address.filter(do_not_contact=True)))
-        .exclude(Exists(same_address.filter(Q(ghl_contact_id__isnull=False) | Q(emails__isnull=False))))
+        .exclude(Exists(same_address.filter(Q(pipeline_stage__isnull=False) | Q(emails__isnull=False))))
         .exclude(Exists(same_address.filter(READY_PROSPECT, id__lt=OuterRef("pk"))))
     )
 

@@ -17,7 +17,9 @@ from django.http import HttpResponseNotAllowed, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
+from django.utils import timezone
 from django.utils.html import format_html, format_html_join
+from django.utils.safestring import mark_safe
 from django.utils.text import Truncator
 
 from pipeline import jobs, review
@@ -27,6 +29,8 @@ from pipeline.models import (
     EmailPrompt,
     EmailSequence,
     FollowUp,
+    OutboxEmail,
+    PipelineStage,
     BusinessContact,
     BusinessSource,
     BusinessWebsiteProfile,
@@ -1057,16 +1061,17 @@ class GenerateEmailsForm(forms.Form):
 @admin.register(Prospect)
 class ProspectAdmin(PipelineAdmin):
     list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge",
-                    "email_sequence", "do_not_contact", "in_ghl", "qualification_score", "email_verified_at",
+                    "email_sequence", "stage_badge", "do_not_contact", "qualification_score", "email_verified_at",
                     "last_contacted_at"]
-    list_filter = ["email_status", "verdict", "outreach_status", "email_sequence", "approved_by_person",
-                   "do_not_contact", "email_verification_provider"]
+    list_filter = ["email_status", "verdict", "outreach_status", "pipeline_stage", "email_sequence",
+                   "approved_by_person", "do_not_contact", "email_verification_provider"]
     search_fields = ["email", "business__name", "contact__name"]
     list_select_related = ["business", "contact", "email_sequence"]
     autocomplete_fields = ["business", "contact"]
     readonly_fields = ["email_verified_at", "email_verification_provider", "last_contacted_at", "created_at",
-                       "updated_at", "emails_link", "verification_details_display", "ghl_contact_id",
-                       "sequence_stopped_at", "sequence_stop_reason", "email_sequence"]
+                       "updated_at", "emails_link", "verification_details_display", "pipeline_stage",
+                       "stage_changed_at", "stage_history", "sequence_stopped_at", "sequence_stop_reason",
+                       "email_sequence"]
     fieldsets = [
         (None, {"fields": ["business", "contact", "email", "do_not_contact"]}),
         ("Verification (Module 4)", {"fields": ["email_status", "verdict", "verification_note",
@@ -1074,22 +1079,38 @@ class ProspectAdmin(PipelineAdmin):
                                                 "email_verified_at", "qualification_score"]}),
         ("Outreach", {"fields": ["outreach_status", "approved_by_person", "email_sequence", "outreach_priority",
                                  "outreach_facts", "research_summary", "last_contacted_at", "emails_link"]}),
-        ("GoHighLevel", {"fields": ["ghl_contact_id", "sequence_stopped_at", "sequence_stop_reason"]}),
+        ("Pipeline", {"fields": ["pipeline_stage", "stage_changed_at", "sequence_stopped_at", "sequence_stop_reason",
+                                 "stage_history"],
+                      "description": "Move the lead on the Pipeline page."}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
     actions = ["approve_prospects", "reject_prospects", "generate_emails", "regenerate_emails", "mark_replied",
                "mark_do_not_contact", "clear_do_not_contact"]
 
-    @admin.display(description="In GHL", boolean=True)
-    def in_ghl(self, obj):
-        return bool(obj.ghl_contact_id)
+    @admin.display(description="Stage", ordering="pipeline_stage")
+    def stage_badge(self, obj):
+        if obj.pipeline_stage is None and not obj.is_ready:
+            return "-"
+        return format_html('<span class="pipeline-badge pipeline-stage-{}">{}</span>', obj.stage,
+                           PipelineStage(obj.stage).label)
+
+    @admin.display(description="Stage history")
+    def stage_history(self, obj):
+        changes = list(obj.stage_changes.select_related("changed_by")[:20]) if obj.pk else []
+        if not changes:
+            return "-"
+        return format_html_join(
+            mark_safe("<br>"), "{}: {} &rarr; {} ({}{})",
+            ((timezone.localtime(c.changed_at).strftime("%Y-%m-%d %H:%M"),
+              PipelineStage(c.from_stage).label if c.from_stage else "New Lead", PipelineStage(c.to_stage).label,
+              c.changed_by or "the app", f", {c.note}" if c.note else "") for c in changes))
 
     @admin.action(description="Approve: email these addresses although verification did not confirm them")
     def approve_prospects(self, request, queryset):
         count = queryset.filter(outreach_status__in=["needs_review", "pending", "rejected"]).exclude(
             email_status="undeliverable").update(outreach_status="ready", approved_by_person=True)
-        self.message_user(request, f"{count} prospect(s) approved; they get emails and become GoHighLevel contacts. "
-                                   "Undeliverable addresses are never approved.")
+        self.message_user(request, f"{count} prospect(s) approved; they get emails and appear on the Pipeline as New "
+                                   "Lead. Undeliverable addresses are never approved.")
 
     @admin.action(description="Reject: never email these addresses")
     def reject_prospects(self, request, queryset):
@@ -1250,12 +1271,12 @@ class EmailAdmin(PipelineAdmin):
     list_filter = [EmailStatusFilter, "sequence_step", "email_prompt", "generation_provider"]
     search_fields = ["business__name", "recipient", "subject"]
     list_select_related = ["business", "prospect", "email_prompt"]
-    actions = ["approve_selected", "hand_over_selected", "reject_selected", "mark_replied_selected"]
+    actions = ["approve_selected", "queue_selected", "unqueue_selected", "reject_selected", "mark_replied_selected"]
     change_form_template = "admin/pipeline/email/change_form.html"
     change_list_template = "admin/pipeline/email/change_list.html"
     details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by", "email_prompt",
                "generated_at", "reviewed_at", "review_note", "edited_at"]
-    delivery = ["scheduled_at", "released_at", "ghl_error", "sent_at"]
+    delivery = ["scheduled_at", "queued_at", "sent_at", "sent_from", "message_id", "send_error"]
 
     def has_add_permission(self, request):
         return False  # emails are written by generate_emails
@@ -1359,17 +1380,13 @@ class EmailAdmin(PipelineAdmin):
         extra = f", {skipped} skipped (not sent yet)" if skipped else ""
         self.message_user(request, f"{done} email(s) marked replied{extra}.")
 
-    @admin.action(description="Hand approved emails to GoHighLevel (those whose hand-over failed)")
-    def hand_over_selected(self, request, queryset):
-        done, errors = 0, []
-        for email in queryset.filter(status="approved"):
-            try:
-                review.hand_over(email)
-                done += 1
-            except review.ReviewError as error:
-                errors.append(f"#{email.pk}: {error}")
-        self.message_user(request, f"{done} email(s) handed to GoHighLevel." + (" " + " ".join(errors[:5]) if errors else ""),
-                          messages.WARNING if errors else messages.SUCCESS)
+    @admin.action(description="Queue for sending (approved or failed; each goes at its send time)")
+    def queue_selected(self, request, queryset):
+        self.message_user(request, review.queue(list(queryset)))
+
+    @admin.action(description="Take out of the queue")
+    def unqueue_selected(self, request, queryset):
+        self.message_user(request, review.unqueue(list(queryset)))
 
     @admin.action(description="Approve selected emails (in review only)")
     def approve_selected(self, request, queryset):
@@ -1390,7 +1407,8 @@ class EmailAdmin(PipelineAdmin):
             path(f"<int:object_id>/{name}/", self.admin_site.admin_view(view), name=f"pipeline_email_{name}")
             for name, view in (("approve", self.approve_view), ("reject", self.reject_view),
                                ("reopen", self.reopen_view), ("regenerate", self.regenerate_view),
-                               ("replied", self.replied_view), ("handover", self.handover_view))
+                               ("replied", self.replied_view), ("queue", self.queue_view),
+                               ("unqueue", self.unqueue_view))
         ]
         return actions + super().get_urls()
 
@@ -1454,8 +1472,144 @@ class EmailAdmin(PipelineAdmin):
     def replied_view(self, request, object_id):
         return self._review_action(request, object_id, review.mark_replied)
 
-    def handover_view(self, request, object_id):
-        return self._review_action(request, object_id, review.hand_over)
+    def queue_view(self, request, object_id):
+        return self._review_action(request, object_id, lambda e: review.queue([e]))
+
+    def unqueue_view(self, request, object_id):
+        return self._review_action(request, object_id, lambda e: review.unqueue([e]))
+
+
+# ---------------------------------------------------------------- outbox
+
+
+class OutboxStatusFilter(admin.SimpleListFilter):
+    title = "status"
+    parameter_name = "status"
+
+    def lookups(self, request, model_admin):
+        return [(status, Email.Status(status).label) for status in OUTBOX_STATUSES]
+
+    def queryset(self, request, queryset):
+        return queryset.filter(status=self.value()) if self.value() else queryset
+
+
+OUTBOX_STATUSES = ("approved", "queued", "sending", "failed")
+
+
+@admin.register(OutboxEmail)
+class OutboxAdmin(PipelineAdmin):
+    """Approved emails with their send times: tick them and queue them; queued ones are sent from your mailbox at
+    their times (pipeline/services/sending.py)."""
+
+    list_display = ["send_time", "status_badge", "recipient", "business", "campaign", "step", "subject_link",
+                    "problem"]
+    list_display_links = None
+    list_filter = [OutboxStatusFilter, "business__discovery_campaign", "sequence_step"]
+    search_fields = ["business__name", "recipient", "subject"]
+    list_select_related = ["business__discovery_campaign"]
+    ordering = ["scheduled_at", "id"]
+    actions = ["queue_selected", "unqueue_selected", "back_to_review"]
+    change_list_template = "admin/pipeline/outboxemail/change_list.html"
+    list_per_page = 200
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).filter(status__in=OUTBOX_STATUSES)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return obj is None  # the list and its actions; an email is edited on its own page
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from pipeline.services import outreach, sending
+
+        sender = jobs.active_run("send_emails")
+        extra_context = {
+            **(extra_context or {}),
+            "sender": sender,
+            "sender_url": admin_url(sender) if sender else None,
+            "sending_configured": sending.configured(),
+            "missing_settings": sending.missing_settings(),
+            "queued_count": Email.objects.filter(status="queued").count(),
+            "stuck_count": outreach.stuck_emails().count(),
+            "start_url": reverse("admin:pipeline_outboxemail_start"),
+        }
+        return super().changelist_view(request, extra_context)
+
+    def get_urls(self):
+        return [path("start-sender/", self.admin_site.admin_view(self.start_sender_view),
+                     name="pipeline_outboxemail_start")] + super().get_urls()
+
+    def start_sender_view(self, request):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        from pipeline.services import sending
+
+        if not sending.configured():
+            self.message_user(request, f"Sending is not set up: set {sending.missing_settings()} in .env.",
+                              messages.ERROR)
+        elif not Email.objects.filter(status="queued").exists():
+            self.message_user(request, "Nothing is queued.", messages.WARNING)
+        else:
+            run, started = jobs.ensure_sender(request.user)
+            self.message_user(request, f"The sender {'started' if started else 'is already running'} (run #{run.pk}).")
+        return HttpResponseRedirect(reverse("admin:pipeline_outboxemail_changelist"))
+
+    @admin.display(description="Send time", ordering="scheduled_at")
+    def send_time(self, obj):
+        if obj.scheduled_at is None:
+            return "-"
+        zone = obj.business.discovery_campaign.send_timezone
+        from zoneinfo import ZoneInfo
+
+        local = obj.scheduled_at.astimezone(ZoneInfo(zone))
+        late = obj.status in ("approved", "failed") and obj.scheduled_at < timezone.now()
+        return format_html('{}<br><small>{}{}</small>', local.strftime("%Y-%m-%d %H:%M"), zone,
+                           " - time passed; queueing gives it a new time" if late else "")
+
+    @admin.display(description="Status", ordering="status")
+    def status_badge(self, obj):
+        return badge(obj.status, obj.get_status_display())
+
+    @admin.display(description="Campaign", ordering="business__discovery_campaign__name")
+    def campaign(self, obj):
+        return obj.business.discovery_campaign.name
+
+    @admin.display(description="Email", ordering="sequence_step")
+    def step(self, obj):
+        return "First email" if obj.sequence_step == generation.SEQUENCE_STEP else f"Follow-up {obj.sequence_step - 1}"
+
+    @admin.display(description="Subject")
+    def subject_link(self, obj):
+        return format_html('<a href="{}">{}</a>', reverse("admin:pipeline_email_change", args=[obj.pk]),
+                           Truncator(obj.subject).chars(70))
+
+    @admin.display(description="Problem")
+    def problem(self, obj):
+        return obj.send_error or "-"
+
+    @admin.action(description="Queue for sending (each goes at its send time)")
+    def queue_selected(self, request, queryset):
+        self.message_user(request, review.queue(list(queryset)))
+
+    @admin.action(description="Take out of the queue")
+    def unqueue_selected(self, request, queryset):
+        self.message_user(request, review.unqueue(list(queryset)))
+
+    @admin.action(description="Send back to review")
+    def back_to_review(self, request, queryset):
+        done = 0
+        for email in queryset:
+            try:
+                review.reopen(email)
+                done += 1
+            except review.ReviewError:
+                pass
+        self.message_user(request, f"{done} email(s) back in review.")
 
 
 # ---------------------------------------------------------------- pipeline runs
@@ -1489,11 +1643,14 @@ class SendingSettingsAdmin(admin.ModelAdmin):
 
     fieldsets = [
         ("Sending (all campaigns together)", {
-            "fields": ["daily_cap", "gap_fixed_seconds", ("gap_random_min_seconds", "gap_random_max_seconds")],
+            "fields": ["daily_cap", "gap_fixed_seconds", ("gap_random_min_seconds", "gap_random_max_seconds"),
+                       "reply_window_days"],
             "description": "Each approved email gets a send time: the latest planned send of any campaign plus the "
                            "fixed gap plus a random gap between the two values (e.g. 120 s + 180-300 s), inside its "
                            "campaign's send window, and at most the daily cap per day for all campaigns together. "
-                           "GoHighLevel sends it then. Changes apply to emails approved from now on."}),
+                           "Queued emails are sent from your mailbox then (Outbox). Changes apply to emails approved "
+                           "from now on. After a sequence's last email, a lead with no reply moves to Quota Exhausted "
+                           "once the reply window has passed."}),
         ("Email footer", {
             "fields": ["footer_text"],
             "description": "Added under every email (text and HTML), after your template's sign-off: who you are, an "
@@ -1525,7 +1682,7 @@ class PipelineRunAdmin(PipelineAdmin):
     list_filter = ["status", "command"]
     search_fields = ["output", "command"]
     change_form_template = "admin/pipeline/pipelinerun/change_form.html"
-    readonly = ["command_line", "status_badge", "runs_on", "exit_code", "created_by", "created_at", "started_at",
+    readonly = ["command_line", "status_badge", "exit_code", "created_by", "created_at", "started_at",
                 "finished_at", "duration", "output_display"]
 
     def has_change_permission(self, request, obj=None):
@@ -1546,7 +1703,7 @@ class PipelineRunAdmin(PipelineAdmin):
         obj.arguments = form.cleaned_data["arguments"]
         obj.created_by = request.user
         super().save_model(request, obj, form, change)
-        jobs.dispatch(obj)
+        transaction.on_commit(lambda: jobs.launch(obj.pk))
 
     def response_add(self, request, obj, post_url_continue=None):
         self.message_user(request, f"Started: {obj.command_line}", messages.SUCCESS)

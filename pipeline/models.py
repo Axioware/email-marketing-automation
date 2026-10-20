@@ -278,7 +278,7 @@ If you would rather not hear from us, reply with "unsubscribe"."""
 
 
 class SendingSettings(models.Model):
-    """How fast emails go out, for all campaigns together (GoHighLevel sends them all from one mailbox), and the footer
+    """How fast emails go out, for all campaigns together (they all go from one mailbox), and the footer
     under every email. One row, edited on the admin's Settings page (or the API's /api/settings/); read it with
     SendingSettings.current()."""
 
@@ -288,6 +288,9 @@ class SendingSettings(models.Model):
     gap_random_min_seconds = models.PositiveIntegerField(default=180, help_text="Plus a random gap of at least this many "
                                                                                "seconds...")
     gap_random_max_seconds = models.PositiveIntegerField(default=300, help_text="...and at most this many seconds.")
+    reply_window_days = models.PositiveIntegerField(
+        default=3, db_default=3, help_text="Days to wait for a reply after a sequence's last email before the lead moves "
+                                           "to Quota Exhausted on the Pipeline page.")
     footer_text = models.TextField(
         "footer", default=DEFAULT_FOOTER_TEXT, db_default=DEFAULT_FOOTER_TEXT,
         help_text="Added under every email: who you are, an address and how to opt out. Plain text; each line stays a "
@@ -495,6 +498,22 @@ class BusinessContact(models.Model):
         return self.name or f"Contact {self.pk}"
 
 
+class PipelineStage(models.TextChoices):
+    """The lead pipeline. Sending moves leads through the first stages;
+    a person moves them on replies and meetings (pipeline/services/stages.py)."""
+
+    NEW_LEAD = "new_lead", "New Lead"
+    READY_TO_SEND = "ready_to_send", "Ready to Send"
+    INITIAL_EMAIL = "initial_email", "Initial Email"
+    FOLLOW_UP = "follow_up", "Follow-up"
+    REPLIED = "replied", "Replied"
+    DEMO_BOOKED = "demo_booked", "Demo Booked"
+    DEMO_DONE = "demo_done", "Demo Done"
+    WON = "won", "Won"
+    LOST = "lost", "Lost"
+    QUOTA_EXHAUSTED = "quota_exhausted", "Quota Exhausted"
+
+
 class Prospect(models.Model):
     """Module 4: a checked contact email with its verification result. Only deliverable ones are ready to email."""
 
@@ -548,8 +567,10 @@ class Prospect(models.Model):
                   "come from it.")
     approved_by_person = models.BooleanField(
         default=False, db_default=False, help_text="A person approved emailing this address although verification did not confirm it.")
-    ghl_contact_id = models.CharField(max_length=64, null=True, blank=True, db_index=True,
-                                      help_text="Its contact in GoHighLevel.")
+    pipeline_stage = models.CharField(
+        max_length=32, choices=PipelineStage.choices, null=True, blank=True, db_index=True,
+        help_text="Where the lead is on the Pipeline page. Empty: not in the pipeline yet (shown as New Lead once ready).")
+    stage_changed_at = models.DateTimeField(null=True, blank=True)
     sequence_stopped_at = models.DateTimeField(null=True, blank=True,
                                                help_text="No more emails to this prospect (reply or a manual stage move).")
     sequence_stop_reason = models.CharField(max_length=64, null=True, blank=True)
@@ -573,6 +594,31 @@ class Prospect(models.Model):
         return ((self.email_status == "deliverable" or self.approved_by_person) and self.outreach_status == "ready"
                 and not self.do_not_contact)
 
+    @property
+    def stage(self) -> str:
+        """The pipeline stage, New Lead until something moved it."""
+        return self.pipeline_stage or PipelineStage.NEW_LEAD
+
+
+class StageChange(models.Model):
+    """One move of a lead between pipeline stages: by a person (who) or by the app (sending)."""
+
+    prospect = models.ForeignKey(Prospect, on_delete=models.CASCADE, related_name="stage_changes")
+    from_stage = models.CharField(max_length=32, choices=PipelineStage.choices, null=True, blank=True)
+    to_stage = models.CharField(max_length=32, choices=PipelineStage.choices)
+    changed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name="+", help_text="Empty: the app (sending, the sequence ending).")
+    note = models.CharField(max_length=255, blank=True, default="")
+    changed_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "stage_changes"
+        ordering = ["-changed_at", "-id"]
+        verbose_name = "stage change"
+
+    def __str__(self):
+        return f"{self.prospect_id}: {self.from_stage or 'new_lead'} -> {self.to_stage}"
+
 
 class Email(models.Model):
     """Module 5: one generated outreach email, its review state, delivery and opens."""
@@ -580,7 +626,7 @@ class Email(models.Model):
     class Status(models.TextChoices):
         IN_REVIEW = "in_review", "In review"
         APPROVED = "approved", "Approved"
-        SCHEDULED = "scheduled", "In GoHighLevel"
+        QUEUED = "queued", "Queued"
         REJECTED = "rejected", "Rejected"
         SENDING = "sending", "Sending"
         SENT = "sent", "Sent"
@@ -608,15 +654,13 @@ class Email(models.Model):
     review_note = models.TextField(null=True, blank=True)
     edited_at = models.DateTimeField(null=True, blank=True)
     scheduled_at = models.DateTimeField(null=True, blank=True, db_index=True,
-                                        help_text="When it goes out: the slot given when it was approved (written to "
-                                                  "GoHighLevel as Email Due At).")
-    released_at = models.DateTimeField(null=True, blank=True,
-                                       help_text="When it was handed to GoHighLevel (written into the contact).")
-    ghl_error = models.TextField(null=True, blank=True, help_text="The last GoHighLevel error for this email.")
+                                        help_text="When it goes out: the slot given when it was approved. Queued "
+                                                  "emails are sent then (Outbox).")
+    queued_at = models.DateTimeField(null=True, blank=True, help_text="When it was queued for sending (Outbox).")
     sent_at = models.DateTimeField(null=True, blank=True)
     sent_from = models.CharField(max_length=320, null=True, blank=True)
     message_id = models.CharField(max_length=255, null=True, blank=True)
-    send_error = models.TextField(null=True, blank=True)
+    send_error = models.TextField(null=True, blank=True, help_text="Why the last send failed.")
     first_opened_at = models.DateTimeField(null=True, blank=True)
     last_opened_at = models.DateTimeField(null=True, blank=True)
     open_count = models.IntegerField(default=0)
@@ -629,7 +673,7 @@ class Email(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["prospect", "sequence_step"], name="uq_emails_prospect_step"),
             models.CheckConstraint(
-                condition=models.Q(status__in=["in_review", "approved", "scheduled", "rejected", "sending", "sent",
+                condition=models.Q(status__in=["in_review", "approved", "queued", "rejected", "sending", "sent",
                                                "opened", "failed", "replied"]),
                 name="ck_emails_status",
             ),
@@ -637,6 +681,15 @@ class Email(models.Model):
 
     def __str__(self):
         return f"#{self.pk} to {self.recipient}"
+
+
+class OutboxEmail(Email):
+    """Emails waiting to be sent (approved, queued, failed), for the Outbox page."""
+
+    class Meta:
+        proxy = True
+        verbose_name = "outbox email"
+        verbose_name_plural = "outbox"
 
 
 class EmailOpenEvent(models.Model):
@@ -658,8 +711,8 @@ class EmailOpenEvent(models.Model):
 
 
 class PipelineRun(models.Model):
-    """One run of a pipeline command, started from the admin or the API and executed in a background process (or, on
-    Vercel, inside the request that started it; pipeline/webruns.py)."""
+    """One run of a pipeline command, started from the admin or the API and executed in a background process on this
+    machine (pipeline/jobs.py)."""
 
     class Status(models.TextChoices):
         QUEUED = "queued", "Queued"
@@ -676,12 +729,7 @@ class PipelineRun(models.Model):
     output = models.TextField(blank=True, default="")
     exit_code = models.IntegerField(null=True, blank=True)
     pid = models.IntegerField(null=True, blank=True)
-    cancel_requested = models.BooleanField(default=False, db_default=False, help_text="Stop asked for; the worker running it stops it.")
-    runs_on = models.CharField(
-        max_length=8, choices=[("worker", "Worker"), ("web", "Web app, directly")], default="worker",
-        db_default="worker",
-        help_text="Worker: a machine running run_worker. Web app: Vercel itself, inside the request that started it "
-                  "(steps that only call the scraper container or Reacher on your server).")
+    cancel_requested = models.BooleanField(default=False, db_default=False, help_text="Stop asked for.")
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -703,19 +751,3 @@ class PipelineRun(models.Model):
         import shlex
 
         return " ".join(["python manage.py", self.command, *(shlex.quote(str(a)) for a in self.arguments)])
-
-
-class WorkerHeartbeat(models.Model):
-    """The worker that runs queued pipeline runs (when the web app is hosted on Vercel) reports in here."""
-
-    name = models.CharField(max_length=128, primary_key=True)
-    last_seen = models.DateTimeField()
-    info = models.JSONField(default=dict, blank=True, help_text="e.g. whether the scraper container answers.")
-
-    class Meta:
-        db_table = "worker_heartbeats"
-        ordering = ["-last_seen"]
-        verbose_name = "worker"
-
-    def __str__(self):
-        return self.name

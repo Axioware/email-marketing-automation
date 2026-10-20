@@ -15,6 +15,7 @@ from pipeline.models import (
     Email,
     EmailOpenEvent,
     PipelineRun,
+    PipelineStage,
     Prospect,
     SendingSettings,
     check_output_fields,
@@ -187,7 +188,8 @@ class ProspectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Prospect
         fields = "__all__"
-        read_only_fields = ["email_sequence", "ghl_contact_id", "sequence_stopped_at", "sequence_stop_reason",
+        read_only_fields = ["email_sequence", "pipeline_stage", "stage_changed_at", "sequence_stopped_at",
+                            "sequence_stop_reason",
                             "email_verification_provider", "email_verified_at", "verdict", "verification_note",
                             "verification_details", "last_contacted_at", "created_at", "updated_at"]
 
@@ -209,9 +211,8 @@ class EmailSerializer(serializers.ModelSerializer):
         fields = ["id", "prospect", "business", "contact", "sequence_step", "recipient", "subject", "body",
                   "body_text", "body_html", "status", "prospect_ready", "generation_provider", "generation_model",
                   "email_prompt",
-                  "generated_at", "reviewed_at", "review_note", "edited_at", "scheduled_at", "released_at",
-                  "ghl_error", "sent_at", "sent_from", "message_id",
-                  "send_error", "open_count", "first_opened_at", "last_opened_at", "tracking_token", "created_at",
+                  "generated_at", "reviewed_at", "review_note", "edited_at", "scheduled_at", "queued_at",
+                  "send_error", "sent_at", "sent_from", "message_id", "open_count", "first_opened_at", "last_opened_at", "tracking_token", "created_at",
                   "updated_at"]
         read_only_fields = [field for field in fields if field not in ("subject", "body")]
         extra_kwargs = {"subject": {"max_length": review.MAX_SUBJECT, "required": False}}
@@ -249,6 +250,15 @@ class BulkReviewSerializer(serializers.Serializer):
     ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=1000)
 
 
+class IdsSerializer(serializers.Serializer):
+    ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=1000)
+
+
+class MoveStageSerializer(serializers.Serializer):
+    stage = serializers.ChoiceField(choices=PipelineStage.choices)
+    note = serializers.CharField(max_length=255, required=False, allow_blank=True)
+
+
 class RunPipelineSerializer(serializers.Serializer):
     fetch_limit = serializers.IntegerField(min_value=0, default=20, help_text="New businesses to fetch (0 skips fetching).")
     skip = serializers.ListField(child=serializers.ChoiceField(choices=["fetch", "research", "stakeholders", "verify",
@@ -280,9 +290,9 @@ class PipelineRunSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PipelineRun
-        fields = ["id", "command", "arguments", "options", "command_line", "status", "runs_on", "exit_code", "output",
+        fields = ["id", "command", "arguments", "options", "command_line", "status", "exit_code", "output",
                   "created_by", "created_at", "started_at", "finished_at"]
-        read_only_fields = ["status", "runs_on", "exit_code", "output", "created_by", "created_at", "started_at",
+        read_only_fields = ["status", "exit_code", "output", "created_by", "created_at", "started_at",
                             "finished_at"]
         extra_kwargs = {"arguments": {"required": False, "help_text": 'Raw arguments, e.g. ["--limit", "5"].'}}
 

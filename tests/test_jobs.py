@@ -142,7 +142,7 @@ class BackgroundProcessTests(TransactionTestCase):
         db = connection.settings_dict
         url = f"postgresql://{db['USER']}:{db['PASSWORD']}@{db['HOST']}:{db['PORT']}/{db['NAME']}"
         run = PipelineRun.objects.create(command="generate_followups", arguments=["--limit", "5"])
-        blank = {name: "" for name in ("GHL_API_KEY", "GHL_LOCATION_ID", "GROQ_API_KEY", "GROK_API_KEY",
+        blank = {name: "" for name in ("SMTP_HOST", "SENDER_EMAIL", "GROQ_API_KEY", "GROK_API_KEY",
                                        "OPENAI_API_KEY")}  # the process reads .env; empty values win
         with mock.patch.dict(os.environ, {"DATABASE_URL": url, "DJANGO_DEBUG": "1", **blank}):
             jobs.launch(run.pk)

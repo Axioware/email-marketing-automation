@@ -269,7 +269,7 @@ class TimeLimitTests(TestCase):
 
 
 class ResumeTests(TestCase):
-    """An interrupted research continues where it stopped (each run on Vercel may only get a few AI answers)."""
+    """An interrupted research continues where it stopped (e.g. after a rate limit or a time limit)."""
 
     PAGE = {"url": "https://clinic.pk/", "content": "Home", "emails": ["a@clinic.pk"], "summary": "Home page",
             "relevant_findings": ["f"], "request_reason": "team page",

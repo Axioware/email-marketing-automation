@@ -1,9 +1,0 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "emailautomation/wsgi.py": {
-      "maxDuration": 300,
-      "excludeFiles": "{.venv/**,tests/**,assets/**,results.csv,supabase/**,deploy/**}"
-    }
-  }
-}

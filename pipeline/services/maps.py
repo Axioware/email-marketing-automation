@@ -686,7 +686,7 @@ def add_arguments(parser) -> None:
 
 def run(options: dict) -> int:
     """Fetch for a campaign. With a "deadline" (the web app on Vercel) the scraper container's searches are smaller
-    and none starts without time for it (pipeline/webruns.py)."""
+    and none starts without time for it (a caller's time limit)."""
     if options["delay"] < 0:
         raise CommandError("--delay cannot be negative")
     if options["limit"] is not None and options["limit"] < 1:

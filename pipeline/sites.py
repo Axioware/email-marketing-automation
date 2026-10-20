@@ -1,23 +1,26 @@
-"""The admin site: a pipeline dashboard as the home page, the sidebar in pipeline order, and the user guide."""
+"""The admin site: a pipeline dashboard as the home page, the sidebar in pipeline order, the lead Pipeline board and
+the user guide."""
 import os
 from pathlib import Path
 
 import markdown
-from datetime import timedelta
 
 from django.conf import settings
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.db.models import Count, Q
+from django.http import HttpResponseNotAllowed, HttpResponseRedirect
+from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils.safestring import mark_safe
 
 GUIDE_PATH = Path(settings.BASE_DIR) / "docs" / "USER_GUIDE.md"
-WORKER_STALE_AFTER = timedelta(minutes=2)  # no heartbeat for this long: the worker is shown as not running
+BOARD_CARDS_PER_STAGE = 200
 
-# Sidebar order: the pipeline's own order, then the supporting tables.
-MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "emailsequence", "business", "businesswebsiteprofile", "businesscontact", "prospect", "email",
-               "pipelinerun", "sendingsettings", "businesssource"]
+# Sidebar order: the pipeline's own order, then the supporting tables. "pipelineboard" is the Pipeline page.
+MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "emailsequence", "business", "businesswebsiteprofile",
+               "businesscontact", "prospect", "email", "outboxemail", "pipelineboard", "pipelinerun", "sendingsettings",
+               "businesssource"]
 
 
 def changelist(model_name: str, **filters) -> str:
@@ -34,8 +37,8 @@ def run_url(command: str, arguments: str = "") -> str:
 
 
 def lead_sources() -> dict:
-    """The "Get leads" panel: recent campaigns with a fetch button per lead source (the built-in browser only where
-    Chromium is available, not on Vercel), and whether the scraper container answers."""
+    """The "Get leads" panel: recent campaigns with a fetch button per lead source, and whether the scraper container
+    answers."""
     from pipeline.models import DiscoveryCampaign
     from pipeline.services import scraper_api
 
@@ -45,7 +48,7 @@ def lead_sources() -> dict:
     campaigns = DiscoveryCampaign.objects.annotate(business_total=Count("businesses")).order_by("-created_at")[:8]
     problem = scraper_api.status(timeout=1.5)
     return {
-        "browser": not settings.ON_VERCEL,
+        "browser": True,
         "campaigns": [{"campaign": campaign, "browser_url": fetch(campaign.pk, "browser"),
                        "scraper_url": fetch(campaign.pk, "scraper_api"),
                        "url": reverse("admin:pipeline_discoverycampaign_change", args=[campaign.pk])}
@@ -54,19 +57,6 @@ def lead_sources() -> dict:
         "scraper_problem": problem,
         "scraper_needed": any(campaign.lead_source == "scraper_api" for campaign in campaigns),
     }
-
-
-def worker_status() -> dict:
-    """The most recent worker heartbeat (queue mode: runs execute on a worker machine)."""
-    from django.utils import timezone
-
-    from pipeline.models import WorkerHeartbeat
-
-    beat = WorkerHeartbeat.objects.order_by("-last_seen").first()
-    if beat is None:
-        return {"alive": False, "name": None, "last_seen": None, "info": {}}
-    return {"alive": timezone.now() - beat.last_seen < WORKER_STALE_AFTER, "name": beat.name,
-            "last_seen": beat.last_seen, "info": beat.info or {}}
 
 
 def sequence_results() -> list[dict]:
@@ -95,6 +85,9 @@ class PipelineAdminSite(admin.AdminSite):
         apps = super().get_app_list(request, app_label)
         for app in apps:
             if app["app_label"] == "pipeline":
+                app["models"].append({"name": "Pipeline", "object_name": "PipelineBoard", "perms": {"view": True},
+                                      "admin_url": reverse("admin:pipeline_board"), "add_url": None,
+                                      "view_only": True})
                 app["models"].sort(key=lambda m: MODEL_ORDER.index(m["object_name"].lower())
                                    if m["object_name"].lower() in MODEL_ORDER else len(MODEL_ORDER))
         apps.sort(key=lambda app: app["app_label"] != "pipeline")  # the pipeline first
@@ -102,7 +95,60 @@ class PipelineAdminSite(admin.AdminSite):
 
     def get_urls(self):
         return [path("guide/", self.admin_view(self.guide_view), name="guide"),
-                path("email-variables/", self.admin_view(self.variables_view), name="email_variables")] + super().get_urls()
+                path("email-variables/", self.admin_view(self.variables_view), name="email_variables"),
+                path("pipeline-board/", self.admin_view(self.board_view), name="pipeline_board"),
+                path("pipeline-board/<int:prospect_id>/move/", self.admin_view(self.move_view),
+                     name="pipeline_board_move")] + super().get_urls()
+
+    # ------------------------------------------------------------ the lead pipeline
+
+    def board_view(self, request):
+        """Every lead in its stage, like GoHighLevel's opportunity pipeline. Opening it moves finished sequences with
+        no reply to Quota Exhausted (stages.expire_finished)."""
+        from pipeline.models import PipelineStage
+        from pipeline.services import stages
+
+        expired = stages.expire_finished()
+        if expired:
+            messages.info(request, f"{expired} lead(s) moved to Quota Exhausted (no reply within the reply window).")
+        leads = stages.leads()
+        campaign = request.GET.get("campaign") or ""
+        if campaign.isdigit():
+            leads = leads.filter(business__discovery_campaign_id=int(campaign))
+        query = (request.GET.get("q") or "").strip()
+        if query:
+            leads = leads.filter(Q(email__icontains=query) | Q(business__name__icontains=query)
+                                 | Q(contact__name__icontains=query))
+        by_stage = {value: [] for value in PipelineStage.values}
+        totals = dict.fromkeys(PipelineStage.values, 0)
+        for lead in leads.order_by("-stage_changed_at", "-id"):
+            stage = lead.stage
+            totals[stage] += 1
+            if len(by_stage[stage]) < BOARD_CARDS_PER_STAGE:
+                by_stage[stage].append(lead)
+        from pipeline.models import DiscoveryCampaign
+
+        columns = [{"value": value, "label": label, "leads": by_stage[value], "total": totals[value],
+                    "more": totals[value] - len(by_stage[value])} for value, label in PipelineStage.choices]
+        context = {**self.each_context(request), "title": "Pipeline", "columns": columns, "stages": PipelineStage.choices,
+                   "campaigns": DiscoveryCampaign.objects.order_by("name"),
+                   "campaign": campaign, "query": query}
+        return TemplateResponse(request, "admin/pipeline/board.html", context)
+
+    def move_view(self, request, prospect_id):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        from pipeline.models import Prospect
+        from pipeline.services import stages
+
+        prospect = get_object_or_404(Prospect, pk=prospect_id)
+        try:
+            message = stages.move(prospect, request.POST.get("stage", ""), request.user, request.POST.get("note", ""))
+            messages.success(request, f"{prospect.email}: {message}")
+        except stages.StageError as error:
+            messages.error(request, f"{prospect.email}: {error}")
+        back = request.POST.get("next") or reverse("admin:pipeline_board")
+        return HttpResponseRedirect(back if back.startswith("/") and not back.startswith("//") else reverse("admin:pipeline_board"))
 
     def variables_view(self, request):
         """Every variable an email template can use, with its value for one real prospect."""
@@ -150,9 +196,10 @@ class PipelineAdminSite(admin.AdminSite):
             DiscoveryCampaign,
             Email,
             PipelineRun,
+            PipelineStage,
             Prospect,
         )
-        from pipeline.services import generation, ghl, outreach, qualify
+        from pipeline.services import generation, outreach, qualify, sending, stages
         from pipeline.services.llm import make_llm_client
 
         jobs.refresh_stale_runs()
@@ -179,7 +226,7 @@ class PipelineAdminSite(admin.AdminSite):
         ready = generation.ready_prospects()
         ready_without_email = ready.filter(emails__isnull=True).count()
         prospect_reviews = Prospect.objects.filter(outreach_status="needs_review", do_not_contact=False).count()
-        scheduled = emails["scheduled"] + emails["sending"]
+        stages.expire_finished()
 
         funnel = [
             ("Businesses found", businesses["total"], changelist("business"), "Module 1"),
@@ -188,7 +235,9 @@ class PipelineAdminSite(admin.AdminSite):
             ("Contacts found", BusinessContact.objects.count(), changelist("businesscontact"), "Module 3"),
             ("Ready to email", ready.count(), changelist("prospect", outreach_status__exact="ready"), "Module 4"),
             ("Emails in review", emails["in_review"], changelist("email", status__exact="in_review"), "Module 5"),
-            ("Scheduled", scheduled, changelist("email", status__exact="scheduled"), "GoHighLevel sends them"),
+            ("Approved", emails["approved"], changelist("outboxemail", status="approved"), "Queue them in the Outbox"),
+            ("Queued", emails["queued"] + emails["sending"], changelist("outboxemail", status="queued"),
+             "Sent from your mailbox at their times"),
             ("Sent", sent, changelist("email", status__exact="sent"),
              f"{emails['replied']} replied" if emails["replied"] else "Delivery"),
         ]
@@ -213,14 +262,15 @@ class PipelineAdminSite(admin.AdminSite):
             steps.append((f"{business_reviews} business(es) scored below their campaign's minimum or could not be "
                           "researched: approve or reject them.", "Review businesses",
                           changelist("business", qualification="review")))
-        not_handed = outreach.not_handed_over().count()
-        if not_handed and ghl.configured():
-            steps.append((f"{not_handed} approved email(s) are not in GoHighLevel yet (the hand-over failed or was "
-                          "interrupted): hand them over.", "Hand to GoHighLevel", run_url("ghl_sync")))
-        missing_contacts = ready.filter(ghl_contact_id__isnull=True).count()
-        if missing_contacts and ghl.configured():
-            steps.append((f"{missing_contacts} ready prospect(s) are not GoHighLevel contacts yet.",
-                          "Create GHL contacts", run_url("ghl_sync", "--contacts-only")))
+        if emails["approved"]:
+            steps.append((f"{emails['approved']} approved email(s) are not queued: queue them to send them.",
+                          "Open the Outbox", changelist("outboxemail", status="approved")))
+        if emails["failed"]:
+            steps.append((f"{emails['failed']} email(s) failed to send: check the reason, then queue them again.",
+                          "Open the Outbox", changelist("outboxemail", status="failed")))
+        if (emails["queued"] and sending.configured() and jobs.active_run("send_emails") is None):
+            steps.append((f"{emails['queued']} email(s) are queued but the sender is not running.", "Open the Outbox",
+                          changelist("outboxemail", status="queued")))
         if prospect_reviews:
             steps.append((f"{prospect_reviews} prospect address(es) could not be verified: approve or reject them.",
                           "Review prospects", changelist("prospect", outreach_status__exact="needs_review")))
@@ -234,7 +284,7 @@ class PipelineAdminSite(admin.AdminSite):
             steps.append((f"{profiles['to_discover']} qualified business(es) still need a decision maker.",
                           "Find decision makers", run_url("find_stakeholders")))
         missing = Business.objects.filter(google_review_count__isnull=True).count()
-        if missing and not settings.ON_VERCEL:  # refreshing Maps details needs the built-in browser
+        if missing:
             steps.append((f"{missing} business(es) have no Google review count or category yet.",
                           "Refresh Google Maps details", run_url("refresh_businesses")))
         if to_research:
@@ -250,28 +300,18 @@ class PipelineAdminSite(admin.AdminSite):
         if make_llm_client() is None:
             warnings.append("No AI key: set GROQ_API_KEY or OPENAI_API_KEY (needed to research websites; emails are "
                             "written from templates).")
-        if settings.ON_VERCEL and not (os.environ.get("REACHER_URL") and os.environ.get("REACHER_SECRET")):
-            warnings.append("Email verification is off: set REACHER_URL and REACHER_SECRET (your server's Reacher, "
-                            "once outbound port 25 is open there).")
-        elif not settings.ON_VERCEL and not os.environ.get("VERIFY_HELO"):
+        if not os.environ.get("VERIFY_HELO"):
             warnings.append("VERIFY_HELO is not set in .env, so email verification cannot run.")
         if not os.environ.get("SEARXNG_URL"):
             warnings.append("SEARXNG_URL is not set: finding decision makers only reads the businesses' websites, "
                             "with no web search.")
-        if not ghl.configured():
-            warnings.append("GoHighLevel is not set up: add GHL_API_KEY and GHL_LOCATION_ID to .env, or approved emails "
-                            "are never sent.")
-        if not os.environ.get("GHL_WEBHOOK_SECRET"):
-            warnings.append("GHL_WEBHOOK_SECRET is not set: GoHighLevel cannot report sent emails or replies.")
+        if not sending.configured():
+            warnings.append(f"Sending is not set up: set {sending.missing_settings()} and the other SMTP_ settings in "
+                            ".env; queued emails wait until then.")
         stuck = outreach.stuck_emails().count()
         if stuck:
-            warnings.append(f"{stuck} email(s) in GoHighLevel are over a day past their send time and were never reported "
-                            "sent: check the sending workflow (published?) and its email-sent webhook.")
-        worker = worker_status()
-        uses_worker = jobs.queue_mode() and not settings.ON_VERCEL  # on Vercel every run executes in its request
-        if uses_worker and not worker["alive"]:
-            warnings.append("No worker is running: queued runs wait until `python manage.py run_worker` is started on "
-                            "the machine with the browsers and Docker.")
+            warnings.append(f"{stuck} email(s) were left half-sent by a sender that stopped: check your Sent folder "
+                            "(they become Failed when the sender next starts).")
         leads = lead_sources()
         if leads["scraper_needed"] and leads["scraper_problem"]:
             warnings.append(f"A campaign gets its leads from the scraper container, but it is {leads['scraper_problem']} "
@@ -279,6 +319,8 @@ class PipelineAdminSite(admin.AdminSite):
 
         return {
             "leads": leads,
+            "pipeline": [{"label": label, "count": count, "url": f"{reverse('admin:pipeline_board')}#stage-{value}"}
+                         for (value, label), count in zip(PipelineStage.choices, stages.counts().values())],
             "results": sequence_results(),
             "funnel": funnel,
             "steps": steps,

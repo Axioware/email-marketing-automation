@@ -1,6 +1,6 @@
 # User guide
 
-This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. Approved emails are scheduled and **GoHighLevel sends them**.
+This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. You queue approved emails in the **Outbox** and the app sends them from **your own mailbox**, each at its time. Leads move through a **Pipeline** you update when people reply. Everything runs on your computer.
 
 You do everything from the **admin** in your browser. Nothing is ever sent without your approval.
 
@@ -9,11 +9,12 @@ You do everything from the **admin** in your browser. Nothing is ever sent witho
 Open a terminal in the project folder and run:
 
 ```sh
+docker compose up -d          # the database and web search (once after each restart of the computer)
 source .venv/bin/activate
 python manage.py runserver
 ```
 
-Then open **http://127.0.0.1:8000/admin/** and log in. Keep the terminal open while you work; press `Ctrl+C` in it to stop the app.
+Then open **http://127.0.0.1:8000/admin/** and log in. Keep the terminal open while you work; press `Ctrl+C` in it to stop the app. Queued emails are only sent while the app (and the computer) is on.
 
 > **New team member?** An admin creates your login under **Users > Add user**. Tick **Staff status** and **Superuser status** so you can use every page.
 
@@ -21,13 +22,14 @@ Then open **http://127.0.0.1:8000/admin/** and log in. Keep the terminal open wh
 
 The home page shows the whole pipeline at a glance:
 
-- **The counters** follow a business from left to right: found on Google Maps, website researched, qualified, contact found, ready to email, email in review, scheduled, sent. Click any counter to see those records.
+- **The counters** follow a business from left to right: found on Google Maps, website researched, qualified, contact found, ready to email, email in review, approved, queued, sent. Click any counter to see those records.
 - **Get leads** lists your campaigns with two buttons each, one per way of finding businesses on Google Maps: **Built-in browser** and **Scraper container**. It also shows whether the scraper container is running. See [Step 2](#step-2-fetch-businesses).
+- **Pipeline** shows how many leads are in each stage; click one to open the [Pipeline](#step-9-the-pipeline-leads) page.
 - **What to do next** lists the jobs that are waiting, with a button for each, e.g. "3 emails are waiting for your review: Start reviewing".
 - **Recent pipeline runs** shows the jobs you started and whether they finished.
 - **Yellow warnings** at the top mean something in the settings is missing (for example the AI key). See [Settings](#9-settings).
 
-The left sidebar lists the pages in pipeline order (its **Jump to a page** box only narrows this list of pages, it does not filter records): **Campaigns > Businesses > Website research > Contacts > Prospects > Emails**, then **Pipeline runs**, **Settings** and **Google Maps listings**.
+The left sidebar lists the pages in pipeline order (its **Jump to a page** box only narrows this list of pages, it does not filter records): **Campaigns > Businesses > Website research > Contacts > Prospects > Emails > Outbox > Pipeline**, then **Pipeline runs**, **Settings** and **Google Maps listings**.
 
 ## 3. How the pipeline works
 
@@ -40,10 +42,11 @@ The left sidebar lists the pages in pipeline order (its **Jump to a page** box o
 | 5. Verify emails | Each guessed address is checked and saved with its result; only real ones are ready to email | Businesses > **Verify contact emails** |
 | 3b. Review low scores | Businesses below the campaign's minimum score (or not researchable) wait for you | Businesses > **Needs your review** |
 | 5b. Review unverified addresses | Addresses verification could not confirm wait for you | Prospects > Needs review |
-| 6. Write emails | Your email template is filled in for each prospect; each becomes a GoHighLevel contact | Prospects > **Write emails from templates** |
-| 7. Review | You read, edit, approve or reject each email; approving schedules it | Emails |
-| 8. Send | GoHighLevel sends each email at its time | Automatic |
-| 9. Follow-ups | Written for review after each email is sent, sent the same way | Emails |
+| 6. Write emails | Your email template is filled in for each prospect | Prospects > **Write emails from templates** |
+| 7. Review | You read, edit, approve or reject each email; approving gives it a send time | Emails |
+| 8. Send | You queue approved emails; each goes from your mailbox at its time | **Outbox** |
+| 9. Leads | You move leads when they reply, book a demo, win or lose | **Pipeline** |
+| 10. Follow-ups | Written for review after each email is sent, queued and sent the same way | Emails, Outbox |
 
 Each step only processes what still needs it, so it is always safe to run a step again.
 
@@ -145,7 +148,7 @@ Each address is checked with the mail server, **without sending anything**, and 
 
 On the Prospects list, use the **By email status** and **By verdict** filters on the right, e.g. to see every catch-all address. Hover over a verdict to see the reason in words; open a prospect to see the details Reacher found. Only **Ready** prospects are ever emailed.
 
-> **Sure a risky or unknown address is real?** On **Prospects**, filter **Needs review**, tick it and choose **Approve**: it gets emails and becomes a GoHighLevel contact like a verified one. **Reject** means it is never emailed. Undeliverable addresses cannot be approved.
+> **Sure a risky or unknown address is real?** On **Prospects**, filter **Needs review**, tick it and choose **Approve**: it gets emails like a verified one. **Reject** means it is never emailed. Undeliverable addresses cannot be approved.
 
 ### Step 6: Write emails
 
@@ -211,18 +214,40 @@ Editing:
 
 To approve or reject many emails at once: on the Emails list tick them, choose **Approve selected emails** or **Reject selected emails** in the Action menu, and click **Go**. Emails that still contain the word `PLACEHOLDER` cannot be approved.
 
-### Step 8: Sending (through GoHighLevel)
+### Step 8: Sending (the Outbox)
 
-GoHighLevel sends the emails from your connected mailbox, at the time this app gives each one.
+Emails go from **your own mailbox**, at the time the app gives each one. Nothing is sent until you queue it.
 
-- **Contacts:** every prospect ready to email (verified, or approved by you) is created in GoHighLevel with the tags `outreach-app` and `campaign-<name>` (the full pipeline does it at the end; **Create GHL contacts** on the dashboard does it any time). Your GHL workflow turns them into **New Lead** opportunities. One email address gets one sequence, even if two prospects share it.
-- **Approve = hand to GoHighLevel.** Each approved email gets a send time: the latest planned email of any campaign plus the gap (Settings; default 2 minutes plus a random 3-5 minutes), only inside its campaign's send window, and at most the daily cap per day for all campaigns together (one mailbox sends them all). A follow-up never goes before its days after the previous email. The email is written into its contact at once (**Email Subject**, **Email Body**, **Follow-up Count**, **Email Due At**, and **Initial Email Type** = the person's sequence, for a first email), and GoHighLevel waits until Email Due At and sends it. The email shows **In GoHighLevel** with its due time.
-- **If GoHighLevel could not take it**, the email stays **Approved** with the reason shown; click **Hand to GoHighLevel** on it (or the dashboard button) once the problem is fixed. It is never sent twice.
-- **Changed your mind?** Edit, reject or send it back to review before it is sent: it is taken back out of GoHighLevel first. If GoHighLevel cannot be reached, nothing changes and you are told (it could still be sent).
-- **After it is sent**, GoHighLevel tells the app, the email becomes **Sent**, and the next follow-up is written for your review.
-- **Replies:** when someone replies (or you move their opportunity by hand), GHL tells the app: that person's sequence stops and anything not sent yet is cancelled. Other people at the same business are not affected. **Mark replied** in the app does the same.
+1. **Approve** an email (Step 7): it gets a send time. That time comes after the latest planned email of any campaign, plus the gap (Settings; default 2 minutes plus a random 3-5 minutes). It is only inside its campaign's send window, and the daily cap (default 40) applies to all campaigns together, since one mailbox sends them all. A follow-up never goes before its days after the previous email.
+2. Sidebar > **Outbox**. It lists approved, queued and failed emails with their send times (in each campaign's time zone).
+3. **Tick the ones to send**, choose **Queue for sending** in the Action menu and click **Go**. (One email: **Queue for sending** on its page.)
+4. The **sender** starts in the background (it shows under Pipeline runs). It waits until each queued email's time, sends it, and stops when nothing is queued any more.
 
-Statuses: In review → Approved → **In GoHighLevel** → **Sent** (→ Replied). The dashboard warns if GoHighLevel is not set up, if approved emails are not in GoHighLevel yet, or if an email is over a day past its send time and was never reported sent (check the GHL workflow).
+What else to know:
+
+- **Queued late?** An email whose time has already passed gets a new time when you queue it, so a backlog never goes out all at once.
+- **Changed your mind?** **Take out of the queue** keeps it approved with the same time. Editing it, rejecting it or sending it back to review also takes it out of the queue.
+- **After it is sent**, it becomes **Sent**, the lead moves to Initial Email or Follow-up on the Pipeline, and the next follow-up is written for your review.
+- **A send failed?** The Outbox shows it as **Failed** with the reason. Fix the problem and queue it again.
+- **The computer was off or restarted?** The Outbox says "queued but the sender is not running": click **Start the sender**. Emails whose time passed go out one after another.
+- **Set up once:** your mailbox's SMTP details in `.env` (see [Settings](#9-settings)). Until then queued emails just wait, and the dashboard says so.
+
+Statuses: In review → Approved → **Queued** → **Sent** (→ Replied), or **Failed**.
+
+### Step 9: The Pipeline (leads)
+
+Sidebar > **Pipeline** shows every lead in its stage: **New Lead, Ready to Send, Initial Email, Follow-up, Replied, Demo Booked, Demo Done, Won, Lost, Quota Exhausted**. Search or pick a campaign at the top. On each card, choose a stage and click **Move**.
+
+- **The app moves leads while sending:**
+  - first email approved → Ready to Send;
+  - sent → Initial Email;
+  - a follow-up sent → Follow-up;
+  - no reply within the reply window (Settings, default 3 days) after the last email of their sequence → Quota Exhausted.
+- **You move leads when something happens.** Read your inbox and move the lead:
+  - **Replied, Demo Booked, Demo Done, Won, Lost** or **Quota Exhausted** stops their emails: anything not sent yet is cancelled. **Replied** also marks their last email as replied.
+  - **Back to Initial Email or Follow-up** resumes a stopped lead (e.g. the "reply" was an out-of-office). The cancelled emails come back to review, and the next follow-up is written if needed.
+- Other people at the same business are not affected; each person has their own sequence.
+- Every move is recorded: the prospect's page shows the **Stage history** (who moved it and when).
 
 ### Email sequences and follow-ups
 
@@ -233,19 +258,19 @@ An **email sequence** is one whole flow: the first email, then follow-ups for pe
 
 Each step uses its own template, so B can open with another first email, follow up sooner, and send more follow-ups than A.
 
-**1. Build a sequence.** Sidebar > **Email sequences** > **Add**. Give it a **Name** (it is what GoHighLevel and the results table show), pick its **Initial-email template**, and add one row per follow-up in the **Follow-ups** table: **Sequence** (1, 2, ...), **Days after previous** and **Template** (a follow-up template). Save. The page shows the flow, e.g. *Initial email: First touch → Follow-up 1 (+3 days): Gentle nudge*, and which campaigns use it.
+**1. Build a sequence.** Sidebar > **Email sequences** > **Add**. Give it a **Name** (it is what the Pipeline and the results table show), pick its **Initial-email template**, and add one row per follow-up in the **Follow-ups** table: **Sequence** (1, 2, ...), **Days after previous** and **Template** (a follow-up template). Save. The page shows the flow, e.g. *Initial email: First touch → Follow-up 1 (+3 days): Gentle nudge*, and which campaigns use it.
 
 **2. Choose sequences on the campaign.** Open the campaign and tick one or more under **Email sequences**. With one, everybody gets it. With several, it is an A/B test: new prospects are split equally between them, and each person keeps their sequence to the end (first email and every follow-up). A sequence can be used by several campaigns. Changing a campaign's sequences later does not move people who already started one.
 
-**3. Follow-ups are written right after the previous email is sent.** As soon as GoHighLevel reports an email sent, the next step of *that person's* sequence is filled in for review (if it was held back for a missing value, fix it and use **Write follow-ups** on the dashboard). You have the days in between to review it.
+**3. Follow-ups are written right after the previous email is sent.** As soon as an email is sent, the next step of *that person's* sequence is filled in for review (if it was held back for a missing value, fix it and use **Write follow-ups** on the dashboard). You have the days in between to review it.
 
 **4. Review and approve** like first emails. Approving schedules it for no earlier than the previous email's send time plus that step's days.
 
-**5. The end.** After a sequence's last follow-up is sent, the contact's **Follow-up Count** is emptied, which tells GoHighLevel the sequence is over (Quota Exhausted). A follow-up step without a template also ends the sequence there. Sequences can have different lengths: in the example, A ends after one follow-up and B after three.
+**5. The end.** After a sequence's last follow-up is sent and the reply window passes with no reply, the lead moves to **Quota Exhausted**. A follow-up step without a template also ends the sequence there. Sequences can have different lengths: in the example, A ends after one follow-up and B after three.
 
 No follow-up is written once the person replied, their sequence was stopped, or they are do-not-contact.
 
-**Results:** the dashboard's **Results by email sequence (A/B) and step** table shows, per sequence and step: emails sent, replies and reply rate. Each sequence's page shows its own numbers. GoHighLevel's **Initial Email Type** field holds the person's sequence name, so you can report on it there too.
+**Results:** the dashboard's **Results by email sequence (A/B) and step** table shows, per sequence and step: emails sent, replies and reply rate. Each sequence's page shows its own numbers.
 
 ## 5. Pipeline runs
 
@@ -317,14 +342,14 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 
 | Setting | Needed for |
 |---|---|
-| `DATABASE_URL` | Everything (the Supabase database) |
+| `DATABASE_URL`, `LOCAL_DB_PASSWORD` | Everything (the database on this computer, from `docker compose up -d`) |
 | `DJANGO_SECRET_KEY` | Logging in (any long random text) |
 | `AUTH_TOKEN` | The API: every request must send it in the `Auth` header |
-| `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) and writing emails (step 6) |
+| `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) |
+| `SEARXNG_URL`, `SEARXNG_SECRET` | Web search for decision makers (step 4); the local SearXNG |
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
-| `SENDER_NAME` | Optional: the name in each email's sign-off (empty: "The Axioware team") |
-| `GHL_API_KEY`, `GHL_LOCATION_ID` | Sending: the GoHighLevel sub-account's Private Integration token and location id |
-| `GHL_WEBHOOK_SECRET` | Sending: GoHighLevel sends it with its webhooks (Custom Data key `secret`) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD` | Sending (step 8): your mailbox's SMTP server and login (Gmail / Google Workspace: an app password) |
+| `SENDER_EMAIL`, `SENDER_NAME` | Sending: the From address and name; the name is also the sign-off (empty: "The Axioware team") |
 | `MAPS_SCRAPER_URL` | Optional: where the scraper container answers (default `http://127.0.0.1:8001`) |
 
 ## 10. Troubleshooting
@@ -334,15 +359,13 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | A yellow warning on the dashboard | Add the missing setting to `.env` and restart the app |
 | A run failed | Open it under **Pipeline runs**; the last lines of the output say why |
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
-| Verify: "Cannot reach Reacher" | Your server's Reacher is down (`docker ps` on the server), or `REACHER_URL` is wrong |
-| Verify: "needs your server's Reacher" | Set `REACHER_URL` and `REACHER_SECRET` in Vercel (after port 25 is open on the server) |
-| A run says "Time limit reached ... start the run again" | Normal on Vercel: each run has about 4 minutes. Click **Run again**; finished work is skipped |
-| Fetch: "The built-in browser (Chromium) is not available here" | On Vercel use the scraper container: set the campaign's **Lead source** to Scraper container |
-| "past their send time ... never reported sent" | The GHL sending workflow is not published, or its webhook to `/api/ghl/email-sent/` fails (check the URL and the Custom Data key `secret`) |
-| An email shows a GoHighLevel error | Check `GHL_API_KEY`/`GHL_LOCATION_ID` and the custom fields, then click **Hand to GoHighLevel** on it |
+| Verify: "Cannot reach Reacher" | Is Docker running? The app starts Reacher itself; check `REACHER_URL` |
+| Sending: "The mail server refused the login" | Check `SMTP_USERNAME` / `SMTP_PASSWORD` (Gmail needs an app password); the email stays queued, then click **Start the sender** in the Outbox |
+| An email is **Failed** in the Outbox | Read the reason next to it, fix it, then queue it again |
+| "queued but the sender is not running" | The app was restarted: click **Start the sender** in the Outbox |
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
 | Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
-| Find decision makers: "Search failed: SearXNG ... is not reachable" | Check `SEARXNG_URL` and that the SearXNG container runs on the server; the business is retried next run |
+| Find decision makers: "Search failed: SearXNG ... is not reachable" | Run `docker compose up -d` and check `SEARXNG_URL`; the business is retried next run |
 | Write emails: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to fill those in review again |
 | Write emails: "held back ... no value for {{x}}" | The template needs a value this prospect does not have: give the variable a fallback (`{{x|...}}`) or fill in the data, then run again |
 | "Only emails in review can be approved" | The email was already approved, rejected or sent, perhaps by someone else |

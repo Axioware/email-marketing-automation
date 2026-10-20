@@ -128,8 +128,8 @@ class SequenceFlowTests(FollowUpCase):
 
         self.assertEqual(outreach.earliest_send(self.followup_of(firsts["Flow B"], step=4)),
                          Email.objects.get(pk=b2.pk).sent_at + timedelta(days=9))  # its own step's days
-        self.assertIsNone(outreach.sequence_state(firsts["Flow A"].prospect, 2)["count"])  # A: nothing after F1
-        self.assertEqual(outreach.sequence_state(firsts["Flow B"].prospect, 2)["count"], 2)  # B: follow-up 2 next
+        self.assertFalse(outreach.has_next_step(firsts["Flow A"].prospect, 2))  # A: nothing after F1
+        self.assertTrue(outreach.has_next_step(firsts["Flow B"].prospect, 2))  # B: follow-up 2 next
 
 
 class DueTests(FollowUpCase):
@@ -190,7 +190,7 @@ class DueTests(FollowUpCase):
         self.assertIn("No follow-ups are due", self.write().stdout)  # the campaign has two follow-ups
 
     def test_unsent_or_failed_latest_email_is_not_followed_up(self):
-        for status in ("in_review", "approved", "scheduled", "sending", "failed", "replied"):
+        for status in ("in_review", "approved", "queued", "sending", "failed", "replied"):
             email = self.sent_email()
             Email.objects.filter(pk=email.pk).update(status=status)
         self.assertEqual(followups.find_due({}), [])

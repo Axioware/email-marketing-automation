@@ -1,118 +1,42 @@
-"""Sending through GoHighLevel: scheduling, hand-over at approval, contact and field writes, the webhooks,
-the review queues, queue mode with the worker, and the Vercel settings. GoHighLevel is a local fake server."""
-import json
+"""Sending from this machine: send times, the Outbox queue, the SMTP sender, the lead pipeline and the review queues."""
 import os
 import random
-import subprocess
-import sys
-import threading
+import smtplib
 from datetime import datetime, time as dt_time, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase, TransactionTestCase, override_settings
+from django.core import mail
+from django.core.management.base import CommandError
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from pipeline import jobs, review
+from pipeline import review
 from pipeline.models import (
-    SendingSettings,
-    Business,
     BusinessWebsiteProfile,
     DiscoveryCampaign,
     Email,
     FollowUp,
     PipelineRun,
+    PipelineStage,
     Prospect,
-    WorkerHeartbeat,
+    SendingSettings,
+    StageChange,
 )
-from pipeline.services import ghl, outreach, stakeholders
-from tests.support import make_business, make_campaign, make_contact, make_email, make_email_prompt, review_env
+from pipeline.services import outreach, sending, stages, stakeholders
+from tests.support import make_business, make_campaign, make_email, make_email_prompt, review_env
 
 KARACHI = ZoneInfo("Asia/Karachi")
-FIELD_IDS = {"contact.email_subject": "fSubject", "contact.email_body": "fBody", "contact.email_due_at": "fDue",
-             "contact.followup_count": "fCount", "contact.initial_email_type": "fType"}
-SECRET = "hook-secret"
+SMTP = {"EMAIL_HOST": "smtp.test", "SENDER_EMAIL": "ali@axioware.tech", "SENDER_NAME": "Ali Khan",
+        "EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend"}
 
 
-class FakeGhl:
-    """The LeadConnector endpoints this app uses: custom fields, contact upsert, contact update and read."""
-
-    def __init__(self):
-        self.contacts, self.requests, self.fail_with = {}, [], None
-        self.apply_then_fail = False  # a write GHL saves but answers with an error (like a timeout after saving)
-        ghl._field_cache.clear()
-        fake = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def reply(self, code, body):
-                data = json.dumps(body).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def handle_any(self, method):
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}") if length else None
-                fake.requests.append((method, self.path, body, self.headers.get("Authorization"),
-                                      self.headers.get("User-Agent")))
-                if fake.fail_with:
-                    return self.reply(fake.fail_with, {"message": "boom"})
-                if method == "GET" and "/customFields" in self.path:
-                    return self.reply(200, {"customFields": [{"id": i, "fieldKey": k} for k, i in FIELD_IDS.items()]})
-                if method == "POST" and self.path == "/contacts/upsert":
-                    existing = next((cid for cid, c in fake.contacts.items() if c["email"] == body["email"]), None)
-                    cid = existing or f"c{len(fake.contacts) + 1}"
-                    fake.contacts.setdefault(cid, {"email": body["email"], "fields": {}, "contact": body})
-                    return self.reply(201, {"contact": {"id": cid}, "new": existing is None})
-                cid = self.path.split("/")[2] if self.path.startswith("/contacts/") else None
-                if method == "PUT" and cid in fake.contacts:
-                    for field in body.get("customFields", []):
-                        fake.contacts[cid]["fields"][field["id"]] = field["field_value"]
-                    if fake.apply_then_fail:
-                        return self.reply(504, {"message": "gateway timeout"})
-                    return self.reply(200, {"succeded": True})
-                if method == "GET" and cid in fake.contacts:
-                    fields = [{"id": k, "value": v} for k, v in fake.contacts[cid]["fields"].items() if v not in ("", None)]
-                    return self.reply(200, {"contact": {"id": cid, "customFields": fields}})
-                return self.reply(404, {"message": "not found"})
-
-            def do_GET(self):
-                self.handle_any("GET")
-
-            def do_POST(self):
-                self.handle_any("POST")
-
-            def do_PUT(self):
-                self.handle_any("PUT")
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-
-    def fields(self, contact_id) -> dict:
-        names = {"fSubject": "subject", "fBody": "body", "fDue": "due", "fCount": "count", "fType": "type"}
-        return {names[k]: v for k, v in self.contacts[contact_id]["fields"].items() if v not in ("", None)}
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
+@override_settings(**SMTP)
 class OutreachCase(TestCase):
     def setUp(self):
-        self.ghl = FakeGhl()
-        self.addCleanup(self.ghl.close)
-        env = mock.patch.dict(os.environ, {**review_env(), "GHL_API_KEY": "pit-test", "GHL_LOCATION_ID": "loc1",
-                                           "GHL_BASE_URL": self.ghl.url, "GHL_WEBHOOK_SECRET": SECRET})
+        env = mock.patch.dict(os.environ, review_env())
         env.start()
         self.addCleanup(env.stop)
         self.initial = make_email_prompt("Initial A", "INITIAL A")
@@ -120,7 +44,8 @@ class OutreachCase(TestCase):
         self.campaign = make_campaign(name="Clinics", initial_prompts=[self.initial])  # default Settings: 120 s + 180-300 s, 40 a day
         self.sequence = self.campaign.email_sequences.get()  # "Initial A": the initial email, then Follow 1
         FollowUp.objects.create(email_sequence=self.sequence, sequence=1, days_after_previous=3, email_prompt=self.follow)
-        self.api = APIClient()
+        self.user = get_user_model().objects.create_superuser("q", "q@example.org", "pw")
+        self.client.force_login(self.user)
 
     def email(self, status="in_review", **fields):
         email = make_email(status, campaign=self.campaign, email_sequence=self.sequence, **fields)
@@ -128,21 +53,28 @@ class OutreachCase(TestCase):
         email.refresh_from_db()
         return email
 
-    def hook(self, path, body, secret=SECRET):
-        return self.api.post(f"/api/ghl/{path}/", body, format="json", HTTP_X_WEBHOOK_SECRET=secret)
+    def queued(self, minutes_ago=1, **fields):
+        """An approved email queued with a send time that has come."""
+        email = self.email()
+        review.approve(email)
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            review.queue([email])
+        Email.objects.filter(pk=email.pk).update(scheduled_at=outreach.now() - timedelta(minutes=minutes_ago), **fields)
+        email.refresh_from_db()
+        return email
 
-    def contact_id(self, email):
-        return Prospect.objects.get(pk=email.prospect_id).ghl_contact_id
+    def send(self, **options):
+        return sending.run({"once": True, **options})
 
-    def puts(self):
-        return [r for r in self.ghl.requests if r[0] == "PUT"]
+    def stage(self, email):
+        return Prospect.objects.get(pk=email.prospect_id).stage
 
 
 class ScheduleTests(OutreachCase):
     def test_gap_between_sends(self):
         rng = random.Random(1)
         start = datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc)
-        first = self.email("scheduled")
+        first = self.email("queued")
         Email.objects.filter(pk=first.pk).update(scheduled_at=start)
         slot = outreach.next_slot(self.campaign, start - timedelta(hours=1), rng)
         gap = (slot - start).total_seconds()
@@ -155,12 +87,11 @@ class ScheduleTests(OutreachCase):
         SendingSettings.objects.update_or_create(pk=1, defaults={"daily_cap": 2})
         self.campaign.refresh_from_db()
         night = datetime(2026, 10, 20, 21, 0, tzinfo=KARACHI)
-        slot = outreach.next_slot(self.campaign, night)
-        self.assertEqual(slot, datetime(2026, 10, 21, 9, 0, tzinfo=KARACHI))  # next morning
+        self.assertEqual(outreach.next_slot(self.campaign, night), datetime(2026, 10, 21, 9, 0, tzinfo=KARACHI))
         morning = datetime(2026, 10, 21, 7, 0, tzinfo=KARACHI)
         self.assertEqual(outreach.next_slot(self.campaign, morning), datetime(2026, 10, 21, 9, 0, tzinfo=KARACHI))
         for minute in (0, 10):
-            email = self.email("scheduled")
+            email = self.email("queued")
             Email.objects.filter(pk=email.pk).update(scheduled_at=datetime(2026, 10, 21, 9, minute, tzinfo=KARACHI))
         full = outreach.next_slot(self.campaign, datetime(2026, 10, 21, 9, 30, tzinfo=KARACHI))
         self.assertEqual(full, datetime(2026, 10, 22, 9, 0, tzinfo=KARACHI))  # cap of 2 reached that day
@@ -171,33 +102,23 @@ class ScheduleTests(OutreachCase):
                                                                  "gap_random_min_seconds": 0,
                                                                  "gap_random_max_seconds": 0})
         other = make_campaign(name="Other", initial_prompts=[self.initial])
-        theirs = make_email("scheduled", campaign=other)
+        theirs = make_email("queued", campaign=other)
         start = datetime(2026, 10, 20, 10, 0, tzinfo=KARACHI)
         Email.objects.filter(pk=theirs.pk).update(scheduled_at=start)
         self.assertEqual(outreach.next_slot(self.campaign, start), datetime(2026, 10, 21, 0, 0, tzinfo=KARACHI))
         SendingSettings.objects.filter(pk=1).update(daily_cap=40)
         self.assertEqual(outreach.next_slot(self.campaign, start), start + timedelta(seconds=600))
 
-    def test_approve_hands_the_email_to_ghl(self):
+    def test_approve_gives_a_send_time_and_moves_the_lead(self):
         email = self.email()
         message = review.approve(email)
-        self.assertIn("Approved and handed to GoHighLevel; due", message)
+        self.assertIn("Approved for", message)
+        self.assertIn("Queue it in the Outbox", message)
         email.refresh_from_db()
-        self.assertEqual(email.status, "scheduled")
-        self.assertIsNotNone(email.released_at)
-        contact = self.contact_id(email)
-        payload = self.ghl.contacts[contact]["contact"]
-        self.assertEqual(payload["email"], email.recipient)
-        self.assertIn(ghl.OUTREACH_TAG, payload["tags"])
-        self.assertIn("campaign-clinics", payload["tags"])
-        fields = self.ghl.fields(contact)
-        self.assertEqual((fields["subject"], fields["count"], fields["type"]), (email.subject, 0, "Initial A"))
-        self.assertEqual(fields["due"], email.scheduled_at.astimezone(KARACHI).replace(microsecond=0).isoformat())
-        self.assertIn("<p>", fields["body"])
-        self.assertNotIn("<html", fields["body"])
-        self.assertIn("unsubscribe", fields["body"])  # the footer is part of the body
-        _, _, _, auth, agent = self.ghl.requests[0]
-        self.assertEqual((auth, agent), ("Bearer pit-test", ghl.USER_AGENT))
+        self.assertEqual(email.status, "approved")
+        self.assertIsNotNone(email.scheduled_at)
+        self.assertEqual(self.stage(email), PipelineStage.READY_TO_SEND)
+        self.assertEqual(len(mail.outbox), 0)  # approving never sends
 
     def test_follow_up_is_not_due_before_its_days(self):
         first = self.email("sent")
@@ -211,297 +132,286 @@ class ScheduleTests(OutreachCase):
         review.approve(follow_up)
         follow_up.refresh_from_db()
         self.assertGreaterEqual(follow_up.scheduled_at, sent_at + timedelta(days=3))
-        fields = self.ghl.fields(self.contact_id(first))
-        self.assertEqual(fields["count"], 1)
-        self.assertNotIn("type", fields)  # only initial emails set the type
 
-    def test_reject_or_reopen_takes_it_back_out_of_ghl(self):
+
+class QueueTests(OutreachCase):
+    def test_queue_starts_the_sender_once(self):
+        first, second = self.email(), self.email()
+        review.approve(first)
+        review.approve(second)
+        with mock.patch("pipeline.jobs.launch") as launch, self.captureOnCommitCallbacks(execute=True):
+            message = review.queue([first, second])
+        self.assertIn("2 email(s) queued", message)
+        self.assertIn("The sender started", message)
+        self.assertEqual(Email.objects.filter(status="queued").count(), 2)
+        run = PipelineRun.objects.get(command="send_emails")
+        launch.assert_called_once_with(run.pk)
+        with mock.patch("pipeline.jobs.launch") as launch, mock.patch("pipeline.jobs.process_alive", return_value=True):
+            PipelineRun.objects.filter(pk=run.pk).update(status="running", pid=12345)
+            third = self.email()
+            review.approve(third)
+            self.assertIn("The sender is running", review.queue([third]))
+        launch.assert_not_called()  # one sender at a time
+
+    def test_a_passed_time_gets_a_fresh_slot_and_unqueue_keeps_it(self):
         email = self.email()
         review.approve(email)
+        Email.objects.filter(pk=email.pk).update(scheduled_at=outreach.now() - timedelta(days=2))
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            review.queue([email])
         email.refresh_from_db()
-        review.reopen(email)
+        self.assertEqual(email.status, "queued")
+        self.assertGreater(email.scheduled_at, outreach.now() - timedelta(minutes=1))  # no burst of old emails
+        slot = email.scheduled_at
+        self.assertIn("1 email(s) taken out", review.unqueue([email]))
         email.refresh_from_db()
-        self.assertEqual((email.status, email.scheduled_at), ("in_review", None))
-        self.assertEqual(self.ghl.fields(self.contact_id(email)), {"count": 0, "type": "Initial A"})  # nothing to send
-        review.approve(email)
-        email.refresh_from_db()
-        self.ghl.fail_with = 500
-        with self.assertRaisesMessage(review.ReviewError, "Could not take it back out of GoHighLevel"):
-            review.reject(email, "no")
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "scheduled")  # unchanged: GHL could still send it
-        self.ghl.fail_with = None
-        review.reject(Email.objects.get(pk=email.pk), "no")
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "rejected")
-        self.assertNotIn("body", self.ghl.fields(self.contact_id(email)))
+        self.assertEqual((email.status, email.scheduled_at), ("approved", slot))
 
-    def test_editing_a_handed_over_email_takes_it_back(self):
+    def test_what_cannot_be_queued_is_skipped_with_the_reason(self):
+        in_review, stopped = self.email(), self.email()
+        review.approve(stopped)
+        outreach.stop_prospect(stopped.prospect, "replied")
+        message = review.queue([in_review, Email.objects.get(pk=stopped.pk)])
+        self.assertIn("0 email(s) queued", message)
+        self.assertIn(f"#{in_review.pk} (it is in review)", message)
+        self.assertEqual(PipelineRun.objects.count(), 0)
+
+    @override_settings(EMAIL_HOST="")
+    def test_without_smtp_settings_emails_wait_in_the_queue(self):
         email = self.email()
         review.approve(email)
-        review.save_edit(Email.objects.get(pk=email.pk), "New subject", "Hi Ali,\n\nChanged.")
+        message = review.queue([email])
+        self.assertIn("Sending is not set up (SMTP_HOST in .env)", message)
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
+        self.assertFalse(PipelineRun.objects.exists())
+        with self.assertRaisesMessage(CommandError, "Sending is not set up"):
+            self.send()
+
+    def test_editing_or_rejecting_takes_it_out_of_the_queue(self):
+        email = self.queued()
+        review.save_edit(email, "New subject", "Hi Ali,\n\nNew.")
         email.refresh_from_db()
-        self.assertEqual((email.status, email.scheduled_at), ("in_review", None))
-        self.assertNotIn("subject", self.ghl.fields(self.contact_id(email)))
+        self.assertEqual((email.status, email.scheduled_at, email.queued_at), ("in_review", None, None))
+        other = self.queued()
+        review.reject(other, "no")
+        self.assertEqual(Email.objects.get(pk=other.pk).status, "rejected")
 
-    def test_a_failed_hand_over_stays_approved_and_can_be_retried(self):
-        self.ghl.fail_with = 500
-        email = self.email()
-        message = review.approve(email)
-        self.assertIn("not handed to GoHighLevel", message)
-        email.refresh_from_db()
-        self.assertEqual(email.status, "approved")
-        self.assertIn("HTTP 500", email.ghl_error)
-        self.assertIsNotNone(email.scheduled_at)  # its slot is kept
-        self.assertEqual(list(outreach.not_handed_over()), [email])
-        self.ghl.fail_with = None
-        self.assertIn("Handed to GoHighLevel", review.hand_over(email))
-        email.refresh_from_db()
-        self.assertEqual((email.status, email.ghl_error), ("scheduled", None))
+    def test_outbox_page(self):
+        due = self.queued()
+        later = self.email()
+        review.approve(later)
+        url = reverse("admin:pipeline_outboxemail_changelist")
+        page = self.client.get(url)
+        self.assertEqual(set(page.context["cl"].result_list), {Email.objects.get(pk=due.pk), Email.objects.get(pk=later.pk)})
+        self.assertContains(page, "Queue for sending")
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(url, {"action": "queue_selected", "_selected_action": [later.pk]}, follow=True)
+        self.assertContains(response, "1 email(s) queued")
+        self.assertEqual(Email.objects.get(pk=later.pk).status, "queued")
+        PipelineRun.objects.all().delete()
+        page = self.client.get(url)
+        self.assertContains(page, "are queued but the sender is not running")
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            self.client.post(reverse("admin:pipeline_outboxemail_start"))
+        self.assertTrue(PipelineRun.objects.filter(command="send_emails").exists())
+        sent = self.email("sent")
+        self.assertNotIn(Email.objects.get(pk=sent.pk), self.client.get(url).context["cl"].result_list)
 
-    def test_a_write_ghl_saved_despite_an_error_is_never_written_twice(self):
-        email = self.email()
-        self.ghl.apply_then_fail = True  # GHL saves the email but answers with a timeout
-        review.approve(email)
-        email.refresh_from_db()
-        self.assertEqual(email.status, "approved")
-        self.assertEqual(len(self.puts()), 1)  # no automatic retry of the write
-        self.ghl.apply_then_fail = False
-        review.hand_over(email)
-        self.assertEqual(len(self.puts()), 1)  # GHL already had it: marked handed over without writing again
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "scheduled")
-
-    def test_only_one_email_of_a_prospect_waits_in_ghl(self):
-        email = self.email()
-        review.approve(email)
-        second = Email.objects.create(prospect=email.prospect, business=email.business, contact=email.contact,
-                                      sequence_step=2, recipient=email.recipient, subject="F", body_text="b",
-                                      body_html="h", tracking_token="v" * 40, status="approved")
-        with self.assertRaisesMessage(outreach.OutreachError, "is still waiting in GoHighLevel"):
-            outreach.hand_over(second)
-
-
-class WebhookTests(OutreachCase):
-    def handed_over(self):
+    def test_queue_on_the_email_page_and_api(self):
         email = self.email()
         review.approve(email)
-        return Email.objects.get(pk=email.pk)
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            self.client.post(reverse("admin:pipeline_email_queue", args=[email.pk]))
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
+        self.client.post(reverse("admin:pipeline_email_unqueue", args=[email.pk]))
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "approved")
+        with override_settings(AUTH_TOKEN="k" * 20):
+            api = APIClient()
+            api.credentials(HTTP_AUTH="k" * 20)
+            with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+                response = api.post("/api/emails/queue/", {"ids": [email.pk]}, format="json")
+            self.assertEqual(response.json()["queued"], 1)
+            self.assertIn("taken out", api.post("/api/emails/unqueue/", {"ids": [email.pk]}, format="json").json()["detail"])
 
-    def test_ghl_webhook_action_payload(self):
-        """The body GHL's Webhook action sends: contact fields at the top, our keys in customData, no headers."""
-        email = self.handed_over()
-        contact = self.contact_id(email)
-        payload = {"contact_id": contact, "first_name": "Hassam", "email": email.recipient, "tags": "",
-                   "location": {"id": "N5kPOFObjirSmBMBqugi"}, "workflow": {"id": "w", "name": "Send email"},
-                   "triggerData": {}, "contact": {"attributionSource": {}}, "attributionSource": {},
-                   "customData": {"email_subject": "", "email_body": "", "initial_email_type": "Initial A",
-                                  "email_due_at": "", "followup_count": "0", "secret": "wrong"}}
-        self.assertEqual(self.api.post("/api/ghl/email-sent/", payload, format="json").status_code, 401)
-        payload["customData"]["secret"] = SECRET
-        response = self.api.post("/api/ghl/email-sent/", payload, format="json")
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
-        payload["customData"].pop("secret")
-        retried = self.api.post(f"/api/ghl/email-sent/?secret={SECRET}", payload, format="json")
-        self.assertEqual(retried.json()["outcome"], "already recorded")
-        stop = {"contact_id": contact, "customData": {"reason": "replied", "secret": SECRET}}
-        self.assertEqual(self.api.post("/api/ghl/stop-sequence/", stop, format="json").status_code, 200)
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "replied")
 
-    def test_email_sent_webhook_writes_the_next_follow_up(self):
-        email = self.handed_over()
-        contact = self.contact_id(email)
-        self.assertEqual(self.hook("email-sent", {"contact_id": contact}, secret="wrong").status_code, 401)
-        with mock.patch.dict(os.environ, {"GHL_WEBHOOK_SECRET": ""}):
-            self.assertEqual(self.hook("email-sent", {"contact_id": contact}).status_code, 503)
-        self.assertEqual(self.hook("email-sent", {}).status_code, 400)
-        self.assertEqual(self.hook("email-sent", {"contact_id": "nobody"}).status_code, 404)
-        response = self.hook("email-sent", {"contact_id": contact, "followup_count": "0"})
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual((response.json()["next"], response.json()["follow_up"]),
-                         ("follow-up 1", "follow-up 1 written for review"))
+class SendingTests(OutreachCase):
+    def test_sends_due_emails_and_moves_the_lead_on(self):
+        email = self.queued()
+        self.assertEqual(self.send(), 0)
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual((message.to, message.from_email, message.subject), ([email.recipient], "Ali Khan <ali@axioware.tech>",
+                                                                             email.subject))
+        self.assertIn("unsubscribe", message.body)  # the footer
+        self.assertEqual(message.alternatives[0][1], "text/html")
+        self.assertEqual(message.extra_headers["List-Unsubscribe"], "<mailto:ali@axioware.tech?subject=unsubscribe>")
         email.refresh_from_db()
-        self.assertEqual(email.status, "sent")
-        self.assertIsNotNone(email.sent_at)
-        self.assertEqual(Prospect.objects.get(pk=email.prospect_id).outreach_status, "contacted")
-        self.assertEqual(self.ghl.fields(contact), {"count": 1, "type": "Initial A"})  # waiting for follow-up 1
-        follow_up = Email.objects.get(prospect_id=email.prospect_id, sequence_step=2)
-        self.assertEqual((follow_up.status, follow_up.email_prompt), ("in_review", self.follow))
-        again = self.hook("email-sent", {"contact_id": contact, "followup_count": 0})  # GHL retried
-        self.assertEqual(again.json()["outcome"], "already recorded")
-        self.assertEqual(Email.objects.filter(prospect_id=email.prospect_id).count(), 2)  # no second follow-up
-        self.assertEqual(Email.objects.get(pk=email.pk).sent_at, email.sent_at)
+        self.assertEqual((email.status, email.sent_from), ("sent", "ali@axioware.tech"))
+        self.assertEqual(email.message_id, message.extra_headers["Message-ID"])
+        prospect = Prospect.objects.get(pk=email.prospect_id)
+        self.assertEqual((prospect.outreach_status, prospect.stage), ("contacted", PipelineStage.INITIAL_EMAIL))
+        follow_up = Email.objects.get(prospect=prospect, sequence_step=2)  # written for review right away
+        self.assertEqual(follow_up.status, "in_review")
+        self.assertEqual(follow_up.subject, f"Re: {email.subject}")
 
-    def test_a_follow_up_with_a_missing_variable_is_held_back(self):
-        from pipeline.models import EmailPrompt
-
-        email = self.handed_over()
-        EmailPrompt.objects.filter(kind="follow_up").update(body="Hi, about your {{team_size}} people.")
-        response = self.hook("email-sent", {"contact_id": self.contact_id(email), "followup_count": "0"})
-        self.assertEqual(response.status_code, 200)  # the email was sent either way
-        self.assertIn("held back", response.json()["follow_up"])
-        self.assertIn("{{team_size}}", response.json()["follow_up"])
-        self.assertFalse(Email.objects.filter(prospect_id=email.prospect_id, sequence_step=2).exists())
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
-
-    def test_an_email_whose_hand_over_timed_out_is_still_recorded(self):
-        email = self.email()
-        self.ghl.apply_then_fail = True
-        review.approve(email)
-        self.ghl.apply_then_fail = False
-        response = self.hook("email-sent", {"contact_id": self.contact_id(email), "customData": {}})
-        self.assertEqual(response.json()["outcome"], "recorded")
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "sent")
-
-    def test_stop_sequence_webhook(self):
-        first = self.handed_over()
-        contact = self.contact_id(first)
-        self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
-        pending = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)  # written by the webhook
-        response = self.hook("stop-sequence", {"contact_id": contact, "reason": "replied"})
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json()["cancelled"], 1)
-        self.assertEqual((Email.objects.get(pk=first.pk).status, Email.objects.get(pk=pending.pk).status),
-                         ("replied", "rejected"))
-        self.assertEqual(Prospect.objects.get(pk=first.prospect_id).sequence_stop_reason, "replied")
-        self.assertEqual(self.ghl.fields(contact), {"type": "Initial A"})  # nothing left to send
-
-    def test_resume_after_an_automatic_reply(self):
-        first = self.handed_over()
-        contact = self.contact_id(first)
-        self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
-        pending = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)
-        self.hook("stop-sequence", {"contact_id": contact, "reason": "replied"})
-        self.assertEqual(self.hook("resume-sequence", {"contact_id": contact}, secret="wrong").status_code, 401)
-        response = self.hook("resume-sequence", {"contact_id": contact})
-        self.assertEqual(response.status_code, 200, response.content)
-        body = response.json()
-        self.assertEqual((body["outcome"], body["previous_stop_reason"], body["unmarked_replied"],
-                          body["back_in_review"], body["next"]), ("resumed", "replied", 1, 1, "follow-up 1"))
-        self.assertNotIn("follow_up", body)  # the follow-up written before the stop is reused, not written again
-        self.assertEqual((Email.objects.get(pk=first.pk).status, Email.objects.get(pk=pending.pk).status),
-                         ("sent", "in_review"))
-        self.assertIsNone(Email.objects.get(pk=pending.pk).review_note)
-        prospect = Prospect.objects.get(pk=first.prospect_id)
-        self.assertEqual((prospect.sequence_stopped_at, prospect.sequence_stop_reason), (None, None))
-        self.assertEqual(self.ghl.fields(contact), {"count": 1, "type": "Initial A"})  # waiting for follow-up 1
-        review.approve(Email.objects.get(pk=pending.pk))  # and the sequence carries on as before
-        self.assertEqual(Email.objects.get(pk=pending.pk).status, "scheduled")
-        again = self.hook("resume-sequence", {"contact_id": contact})  # e.g. a later move to Follow-up
-        self.assertEqual(again.json()["outcome"], "not stopped; nothing to resume")
-        self.assertEqual(Email.objects.get(pk=pending.pk).status, "scheduled")  # untouched
-
-    def test_resume_writes_the_follow_up_when_there_was_none(self):
-        first = self.handed_over()
-        contact = self.contact_id(first)
-        with mock.patch.object(outreach, "write_next_followup", return_value="later"):
-            self.hook("email-sent", {"contact_id": contact, "followup_count": 0})  # no follow-up written yet
-        self.hook("stop-sequence", {"contact_id": contact, "reason": "replied"})
-        response = self.hook("resume-sequence", {"contact_id": contact})
-        self.assertEqual(response.json()["follow_up"], "follow-up 1 written for review")
-        self.assertEqual(Email.objects.get(prospect_id=first.prospect_id, sequence_step=2).status, "in_review")
-
-    def test_do_not_contact_is_never_resumed(self):
-        first = self.handed_over()
-        contact = self.contact_id(first)
-        self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
-        self.hook("stop-sequence", {"contact_id": contact, "reason": "unsubscribed"})
-        Prospect.objects.filter(pk=first.prospect_id).update(do_not_contact=True)
-        response = self.hook("resume-sequence", {"contact_id": contact})
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("do-not-contact", response.json()["detail"])
-        self.assertIsNotNone(Prospect.objects.get(pk=first.prospect_id).sequence_stopped_at)
-
-    def test_full_sequence_until_exhausted(self):
-        email = self.handed_over()
-        contact = self.contact_id(email)
-        self.hook("email-sent", {"contact_id": contact, "followup_count": 0})
-        follow_up = Email.objects.get(prospect_id=email.prospect_id, sequence_step=2)
+    def test_a_follow_up_goes_in_the_same_thread(self):
+        first = self.queued()
+        self.send()
+        follow_up = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)
+        Email.objects.filter(pk=first.pk).update(sent_at=outreach.now() - timedelta(days=4))
         review.approve(follow_up)
-        self.assertEqual(self.ghl.fields(contact)["count"], 1)
-        self.assertEqual(Email.objects.get(pk=follow_up.pk).status, "scheduled")
-        response = self.hook("email-sent", {"contact_id": contact, "followup_count": 1})
-        self.assertEqual(response.json()["next"], "sequence finished")
-        self.assertNotIn("follow_up", response.json())
-        self.assertEqual(self.ghl.fields(contact), {"type": "Initial A"})  # Follow-up Count empty: exhausted
-        self.assertEqual(Email.objects.get(pk=follow_up.pk).status, "sent")
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            review.queue([follow_up])
+        Email.objects.filter(pk=follow_up.pk).update(scheduled_at=outreach.now())
+        self.send()
+        reply = mail.outbox[-1]
+        first_id = Email.objects.get(pk=first.pk).message_id
+        self.assertEqual((reply.extra_headers["In-Reply-To"], reply.extra_headers["References"]), (first_id, first_id))
+        self.assertEqual(self.stage(first), PipelineStage.FOLLOW_UP)
+        self.assertFalse(Email.objects.filter(prospect_id=first.prospect_id, sequence_step=3).exists())  # last step
+
+    def test_later_emails_wait_for_their_time(self):
+        later = self.queued(minutes_ago=-60)  # due in an hour
+        self.assertEqual(self.send(), 0)
+        self.assertEqual((len(mail.outbox), Email.objects.get(pk=later.pk).status), (0, "queued"))
+        with mock.patch("pipeline.services.sending.time.sleep") as sleep:
+            Email.objects.filter(pk=later.pk).update(scheduled_at=outreach.now() + timedelta(seconds=5))
+
+            def arrive(seconds):  # time passes while the sender sleeps
+                Email.objects.filter(pk=later.pk).update(scheduled_at=outreach.now() - timedelta(seconds=1))
+
+            sleep.side_effect = arrive
+            self.assertEqual(sending.run({"once": False}), 0)
+        self.assertEqual(Email.objects.get(pk=later.pk).status, "sent")
+        sleep.assert_called_once()
+
+    def test_a_failed_send_is_recorded_and_can_be_queued_again(self):
+        email = self.queued()
+        with mock.patch("django.core.mail.backends.locmem.EmailBackend.send_messages",
+                        side_effect=smtplib.SMTPRecipientsRefused({email.recipient: (550, b"no such user")})):
+            self.assertEqual(self.send(), 1)
+        email.refresh_from_db()
+        self.assertEqual(email.status, "failed")
+        self.assertIn("SMTPRecipientsRefused", email.send_error)
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            review.queue([email])
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
+
+    def test_a_refused_login_stops_the_sender_and_keeps_the_email_queued(self):
+        email = self.queued()
+        with mock.patch("django.core.mail.backends.locmem.EmailBackend.send_messages",
+                        side_effect=smtplib.SMTPAuthenticationError(535, b"bad password")):
+            with self.assertRaisesMessage(CommandError, "refused the login"):
+                self.send()
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
+
+    def test_a_half_sent_email_becomes_failed_and_stopped_leads_get_nothing(self):
+        half = self.queued()
+        Email.objects.filter(pk=half.pk).update(status="sending")
+        stopped = self.queued()
+        Prospect.objects.filter(pk=stopped.prospect_id).update(do_not_contact=True)
+        self.send()
+        self.assertIn("check your Sent folder", Email.objects.get(pk=half.pk).send_error)
+        self.assertEqual(Email.objects.get(pk=half.pk).status, "failed")
+        self.assertEqual(Email.objects.get(pk=stopped.pk).status, "failed")
+        self.assertIn("do-not-contact", Email.objects.get(pk=stopped.pk).send_error)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_send_command_is_a_pipeline_run(self):
+        from pipeline import jobs
+
+        self.assertIn("send_emails", jobs.COMMANDS)
+        self.assertEqual(jobs.build_arguments("send_emails", {"once": True}), ["--once"])
 
 
-class ContactTests(OutreachCase):
-    def test_contacts_for_ready_prospects_only(self):
-        self.email().delete()
-        business = make_business(self.campaign, "Unverified clinic")
-        contact = make_contact(business, name="Sara Khan")
-        unverified = Prospect.objects.create(business=business, contact=contact, email="sara@unverified.org",
-                                             email_status="risky", outreach_status="needs_review")
-        result = outreach.sync_contacts()
-        self.assertEqual(result["created"], 1)
-        self.assertIsNone(Prospect.objects.get(pk=unverified.pk).ghl_contact_id)
-        Prospect.objects.filter(pk=unverified.pk).update(outreach_status="ready", approved_by_person=True)
-        self.assertEqual(outreach.sync_contacts()["created"], 1)
-        self.assertTrue(Prospect.objects.get(pk=unverified.pk).ghl_contact_id)
-        self.assertEqual(outreach.sync_contacts(), {"created": 0, "matched": 0, "failed": 0})
+class StageTests(OutreachCase):
+    def test_replied_stops_the_sequence_and_follow_up_resumes_it(self):
+        first = self.queued()
+        self.send()
+        prospect = Prospect.objects.get(pk=first.prospect_id)
+        follow_up = Email.objects.get(prospect=prospect, sequence_step=2)
+        message = stages.move(prospect, PipelineStage.REPLIED, self.user)
+        self.assertIn("its latest email is marked replied", message)
+        self.assertIn("1 unsent email(s) cancelled", message)
+        self.assertEqual((Email.objects.get(pk=first.pk).status, Email.objects.get(pk=follow_up.pk).status),
+                         ("replied", "rejected"))
+        prospect.refresh_from_db()
+        self.assertEqual((prospect.stage, prospect.sequence_stop_reason), (PipelineStage.REPLIED, "replied"))
+        message = stages.move(prospect, PipelineStage.FOLLOW_UP, self.user)  # it was an automatic reply
+        self.assertIn("its sequence is resumed", message)
+        prospect.refresh_from_db()
+        self.assertIsNone(prospect.sequence_stopped_at)
+        self.assertEqual((Email.objects.get(pk=first.pk).status, Email.objects.get(pk=follow_up.pk).status),
+                         ("sent", "in_review"))
+        history = list(StageChange.objects.filter(prospect=prospect).order_by("id").values_list("to_stage", "changed_by"))
+        self.assertEqual(history, [(PipelineStage.READY_TO_SEND, None), (PipelineStage.INITIAL_EMAIL, None),
+                                   (PipelineStage.REPLIED, self.user.pk), (PipelineStage.FOLLOW_UP, self.user.pk)])
 
-    def test_one_sequence_per_email_address(self):
-        from pipeline.services import generation
+    def test_sending_never_moves_a_lead_out_of_a_stage_a_person_chose(self):
+        email = self.queued()
+        prospect = Prospect.objects.get(pk=email.prospect_id)
+        stages.move(prospect, PipelineStage.DEMO_BOOKED, self.user)  # booked before the email went: it is cancelled
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "rejected")
+        self.assertFalse(stages.advance(prospect, PipelineStage.INITIAL_EMAIL))
+        self.assertEqual(Prospect.objects.get(pk=prospect.pk).stage, PipelineStage.DEMO_BOOKED)
 
-        first = self.email()
-        first.delete()
-        other_business = make_business(self.campaign, "Second branch")
-        other_contact = make_contact(other_business, name="Front desk")
-        shared = Prospect.objects.create(business=other_business, contact=other_contact,
-                                         email=first.recipient.upper(), email_status="deliverable",
-                                         outreach_status="ready")
-        ready = [p.pk for p in generation.ready_prospects()]
-        self.assertEqual(ready, [first.prospect_id])  # the address gets one sequence: the oldest prospect's
-        outreach.sync_contacts()
-        self.assertIsNone(Prospect.objects.get(pk=shared.pk).ghl_contact_id)
-        Prospect.objects.filter(pk=first.prospect_id).update(do_not_contact=True)
-        self.assertEqual(list(generation.ready_prospects()), [])  # an opted-out address is out everywhere
-        with self.assertRaisesMessage(outreach.OutreachError, "one email address gets one sequence"):
-            outreach.link_contact(shared, self.contact_id(first))
+    def test_quota_exhausted_after_the_reply_window(self):
+        first = self.queued()
+        self.send()
+        Email.objects.filter(pk=first.pk).update(sent_at=outreach.now() - timedelta(days=8))
+        follow_up = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)
+        Email.objects.filter(pk=follow_up.pk).update(status="sent", sent_at=outreach.now() - timedelta(days=2))
+        self.assertEqual(stages.expire_finished(), 0)  # within the 3-day reply window
+        Email.objects.filter(pk=follow_up.pk).update(sent_at=outreach.now() - timedelta(days=4))
+        self.assertEqual(stages.expire_finished(), 1)
+        self.assertEqual(self.stage(first), PipelineStage.QUOTA_EXHAUSTED)
+        other = self.queued()
+        self.send()
+        Email.objects.filter(pk=other.pk).update(sent_at=outreach.now() - timedelta(days=10))
+        self.assertEqual(stages.expire_finished(), 0)  # its follow-up is still in review: not finished
 
-    def test_ghl_sync_command_hands_over_and_creates_contacts(self):
-        from tests.support import run_command
+    def test_board_page_and_moves(self):
+        ready = self.email()
+        Email.objects.filter(pk=ready.pk).delete()  # a ready prospect with no email yet: New Lead
+        sent = self.queued()
+        self.send()
+        page = self.client.get(reverse("admin:pipeline_board"))
+        columns = {column["value"]: column for column in page.context["columns"]}
+        self.assertIn(Prospect.objects.get(pk=ready.prospect_id), columns["new_lead"]["leads"])
+        self.assertIn(Prospect.objects.get(pk=sent.prospect_id), columns["initial_email"]["leads"])
+        self.assertContains(page, "Demo Booked")
+        response = self.client.post(reverse("admin:pipeline_board_move", args=[sent.prospect_id]),
+                                    {"stage": "won", "next": reverse("admin:pipeline_board")}, follow=True)
+        self.assertContains(response, "Moved to Won")
+        self.assertEqual(self.stage(sent), PipelineStage.WON)
+        filtered = self.client.get(reverse("admin:pipeline_board"), {"q": sent.recipient})
+        self.assertEqual(sum(column["total"] for column in filtered.context["columns"]), 1)
+        sidebar = self.client.get(reverse("admin:index")).content.decode()
+        self.assertIn(reverse("admin:pipeline_board"), sidebar)
+        self.assertIn("Quota Exhausted", sidebar)  # the dashboard's pipeline strip
 
-        self.ghl.fail_with = 500
-        email = self.email()
-        review.approve(email)
-        self.ghl.fail_with = None
-        result = run_command("ghl_sync")
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("Approved emails handed to GoHighLevel: 1", result.stdout)
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "scheduled")
-        with mock.patch.dict(os.environ, {"GHL_API_KEY": ""}):
-            self.assertIn("GoHighLevel is not set up", run_command("ghl_sync").stdout)
+    @override_settings(AUTH_TOKEN="k" * 20)
+    def test_api(self):
+        email = self.queued()
+        self.send()
+        api = APIClient()
+        api.credentials(HTTP_AUTH="k" * 20)
+        response = api.post(f"/api/prospects/{email.prospect_id}/move-stage/", {"stage": "replied"}, format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["prospect"]["pipeline_stage"], "replied")
+        self.assertEqual(api.post(f"/api/prospects/{email.prospect_id}/move-stage/", {"stage": "nowhere"},
+                                  format="json").status_code, 400)
+        board = api.get("/api/pipeline/").json()["stages"]
+        self.assertEqual({row["stage"]: row["leads"] for row in board}["replied"], 1)
 
-    def test_writes_are_never_retried_but_rate_limits_are(self):
-        client = ghl.Client()
-        self.ghl.fail_with = 500
-        with mock.patch("pipeline.services.ghl.time.sleep"), self.assertRaises(ghl.GhlError):
-            client.request("PUT", "/contacts/x", {})
-        self.assertEqual(len(self.puts()), 1)
-        self.ghl.fail_with = 429
-        with mock.patch("pipeline.services.ghl.time.sleep"), self.assertRaises(ghl.GhlError):
-            client.request("PUT", "/contacts/x", {})
-        self.assertEqual(len(self.puts()), 1 + ghl.RETRIES)  # a 429 applied nothing: retried
-
-    def test_missing_custom_fields_are_named(self):
-        client = ghl.Client()
-        ghl._field_cache.clear()
-        with mock.patch.object(ghl.Client, "request", return_value={"customFields": []}):
-            with self.assertRaisesMessage(ghl.GhlError, "contact.email_subject"):
-                client.field_ids()
-
-    def test_tests_never_reach_the_real_ghl(self):
-        with mock.patch.dict(os.environ, {"GHL_BASE_URL": ""}):
-            with self.assertRaisesMessage(ghl.GhlError, "Tests never call the real GoHighLevel"):
-                ghl.Client()
+    def test_mark_replied_moves_the_lead(self):
+        email = self.queued()
+        self.send()
+        review.mark_replied(Email.objects.get(pk=email.pk))
+        self.assertEqual(self.stage(email), PipelineStage.REPLIED)
 
 
 class ReviewQueueTests(OutreachCase):
-    def setUp(self):
-        super().setUp()
-        self.client.force_login(get_user_model().objects.create_superuser("q", "q@example.org", "pw"))
-
     def test_businesses_below_the_minimum_wait_for_a_person(self):
         DiscoveryCampaign.objects.filter(pk=self.campaign.pk).update(min_score=60)
         high = make_business(self.campaign, "High", score=80, website_url="https://high.pk")
@@ -541,70 +451,13 @@ class ReviewQueueTests(OutreachCase):
         self.client.post(url, {"action": "approve_prospects", "_selected_action": [prospect.pk]})
         self.assertEqual(Prospect.objects.get(pk=prospect.pk).outreach_status, "needs_review")  # never undeliverable
 
-    def test_dashboard_warnings(self):
-        email = self.email()
-        review.approve(email)
-        Email.objects.filter(pk=email.pk).update(scheduled_at=outreach.now() - timedelta(days=2))
+    def test_dashboard(self):
+        approved = self.email()
+        review.approve(approved)
         page = self.client.get(reverse("admin:index")).content.decode()
-        self.assertIn("never reported sent", page)
-        failed = self.email()
-        self.ghl.fail_with = 500
-        review.approve(failed)
-        self.ghl.fail_with = None
-        page = self.client.get(reverse("admin:index")).content.decode()
-        self.assertIn("1 approved email(s) are not in GoHighLevel yet", page)
-        with mock.patch.dict(os.environ, {"GHL_API_KEY": "", "GHL_WEBHOOK_SECRET": ""}):
-            page = self.client.get(reverse("admin:index")).content.decode()
-        self.assertIn("GoHighLevel is not set up", page)
-        self.assertIn("GHL_WEBHOOK_SECRET is not set", page)
-
-
-class QueueModeTests(TestCase):
-    def test_runs_wait_for_the_worker_and_stop_requests_go_through_the_database(self):
-        with mock.patch.dict(os.environ, {"RUN_MODE": "queue"}), mock.patch("pipeline.jobs.launch") as launch, \
-                self.captureOnCommitCallbacks(execute=True):
-            run = jobs.start_run("generate_followups", [])
-        launch.assert_not_called()
-        PipelineRun.objects.filter(pk=run.pk).update(status="running", pid=2 ** 22 + 1)
-        with mock.patch.dict(os.environ, {"RUN_MODE": "queue"}):
-            jobs.refresh_stale_runs()  # the pid lives on the worker's machine: left alone
-            self.assertEqual(PipelineRun.objects.get(pk=run.pk).status, "running")
-            self.assertIn("Stop requested", jobs.cancel_run(PipelineRun.objects.get(pk=run.pk)))
-        self.assertTrue(PipelineRun.objects.get(pk=run.pk).cancel_requested)
-
-
-class WorkerTests(TransactionTestCase):
-    def test_worker_runs_queued_runs_and_reports_in(self):
-        from django.core.management import call_command
-
-        run = PipelineRun.objects.create(command="generate_followups", arguments=["--limit", "1"])
-        db = settings.DATABASES["default"]
-        url = f"postgresql://{db['USER']}:{db['PASSWORD']}@{db['HOST']}:{db['PORT']}/{db['NAME']}"
-        blank = {name: "" for name in ("GHL_API_KEY", "GHL_LOCATION_ID", "GROQ_API_KEY", "GROK_API_KEY",
-                                       "OPENAI_API_KEY")}  # the run's process reads .env; empty values win
-        with mock.patch.dict(os.environ, {"DATABASE_URL": url, "DJANGO_DEBUG": "1", **blank}), \
-                mock.patch("pipeline.services.scraper_api.status", return_value=None):
-            call_command("run_worker", "--once", "--poll", "0.1")
-        run.refresh_from_db()
-        self.assertEqual(run.status, "succeeded", run.output)
-        self.assertIn("No follow-ups are due", run.output)
-        self.assertTrue(WorkerHeartbeat.objects.exists())
-
-
-class VercelSettingsTests(TestCase):
-    def test_settings_on_vercel(self):
-        code = ("import os; os.environ['DJANGO_SETTINGS_MODULE']='emailautomation.settings'; import django; "
-                "django.setup(); from django.conf import settings as s; "
-                "print(s.ALLOWED_HOSTS, s.CSRF_TRUSTED_ORIGINS, os.environ['RUN_MODE'], "
-                "s.DATABASES['default']['CONN_MAX_AGE'], s.DATABASES['default']['DISABLE_SERVER_SIDE_CURSORS'], "
-                "s.SESSION_COOKIE_SECURE, s.SECURE_PROXY_SSL_HEADER)")
-        env = {key: value for key, value in os.environ.items() if key != "RUN_MODE"}
-        env.update(VERCEL="1", VERCEL_URL="app-abc.vercel.app", DJANGO_SECRET_KEY="x" * 50, DJANGO_DEBUG="0",
-                   DATABASE_URL="postgresql://u:p@pooler.supabase.com:6543/postgres")
-        output = subprocess.run([sys.executable, "-c", code], cwd=settings.BASE_DIR, env=env, capture_output=True,
-                                text=True, timeout=60)
-        self.assertEqual(output.returncode, 0, output.stderr)
-        printed = output.stdout.strip()
-        self.assertIn("'app-abc.vercel.app'", printed)
-        self.assertIn("'https://app-abc.vercel.app'", printed)
-        self.assertIn(" queue 0 True True ('HTTP_X_FORWARDED_PROTO', 'https')", printed)
+        self.assertIn("1 approved email(s) are not queued", page)
+        failed = self.queued()
+        Email.objects.filter(pk=failed.pk).update(status="failed", send_error="x")
+        self.assertIn("1 email(s) failed to send", self.client.get(reverse("admin:index")).content.decode())
+        with override_settings(EMAIL_HOST=""):
+            self.assertIn("Sending is not set up", self.client.get(reverse("admin:index")).content.decode())

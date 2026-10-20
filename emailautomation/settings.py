@@ -11,7 +11,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 TESTING = len(sys.argv) > 1 and sys.argv[1] == "test"
-ON_VERCEL = bool(os.environ.get("VERCEL"))  # set by Vercel on every deployment
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -35,11 +34,8 @@ def database_from_url(url: str) -> dict:
         "HOST": parts.hostname or "",
         "PORT": str(parts.port or ""),
         "OPTIONS": dict(parse_qsl(parts.query)),
-        # Serverless functions do not live long enough to reuse a connection; Supabase's pooler (port 6543,
-        # transaction mode) does that, and it cannot keep server-side cursors open between transactions.
-        "CONN_MAX_AGE": 0 if ON_VERCEL else 60,
+        "CONN_MAX_AGE": 60,
         "CONN_HEALTH_CHECKS": True,
-        "DISABLE_SERVER_SIDE_CURSORS": parts.port == 6543 or env_bool("DATABASE_POOLER"),
     }
 
 
@@ -55,14 +51,6 @@ if not SECRET_KEY:
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
-if ON_VERCEL:  # the deployment's own addresses, so a fresh deployment works without listing them
-    for name in ("VERCEL_URL", "VERCEL_BRANCH_URL", "VERCEL_PROJECT_PRODUCTION_URL"):
-        host = os.environ.get(name, "").strip()
-        if host and host not in ALLOWED_HOSTS:
-            ALLOWED_HOSTS.append(host)
-            CSRF_TRUSTED_ORIGINS.append(f"https://{host}")
-    os.environ.setdefault("RUN_MODE", "queue")  # no background processes on Vercel: a worker runs pipeline steps
-    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
     "pipeline",  # first, so its admin templates take precedence
@@ -142,9 +130,24 @@ CSRF_COOKIE_HTTPONLY = True
 X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"  # "no-referrer" makes browsers send Origin: null, which fails CSRF
-if env_bool("DJANGO_SECURE_COOKIES") or ON_VERCEL:
+if env_bool("DJANGO_SECURE_COOKIES"):
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+
+# Sending: your own mailbox over SMTP (pipeline/services/sending.py). Empty SMTP_HOST or SENDER_EMAIL: nothing is sent.
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_HOST = os.environ.get("SMTP_HOST", "").strip()
+EMAIL_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
+EMAIL_HOST_USER = os.environ.get("SMTP_USERNAME", "").strip()
+EMAIL_HOST_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "starttls").strip().lower()  # starttls (587), ssl (465) or none
+EMAIL_USE_TLS = SMTP_SECURITY == "starttls"
+EMAIL_USE_SSL = SMTP_SECURITY == "ssl"
+EMAIL_TIMEOUT = 60
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "").strip()
+SENDER_NAME = os.environ.get("SENDER_NAME", "").strip()
+if TESTING:  # never your mailbox: tests use Django's in-memory outbox and set these themselves
+    EMAIL_HOST = EMAIL_HOST_USER = EMAIL_HOST_PASSWORD = SENDER_EMAIL = ""
 
 # Every API request must send this value in its `Auth` header (pipeline/api/security.py). Empty: API disabled.
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()

@@ -1,0 +1,9 @@
+# SearXNG for finding decision makers (SEARXNG_URL=http://127.0.0.1:8888). Only reachable from this machine.
+use_default_settings: true
+server:
+  limiter: false
+  image_proxy: false
+search:
+  formats:
+    - html
+    - json

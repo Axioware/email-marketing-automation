@@ -1,6 +1,6 @@
 # Email Marketing Automation
 
-Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each and lets you review and approve them. Approved emails are scheduled and **GoHighLevel sends them** (see [Sending through GoHighLevel](#sending-through-gohighlevel)); the whole app runs on **Vercel**, every step inside the request that starts it, calling the scraper, Reacher and SearXNG on your own server (see [Deploying on Vercel](#deploying-on-vercel)). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command. Data lives in PostgreSQL (Supabase).
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each from your templates and lets you review and approve them. You queue approved emails in the **Outbox** and the app **sends them from your own mailbox (SMTP)**, each at its time; leads move through a **Pipeline** (New Lead → ... → Won / Lost) that you update by hand on replies. Everything runs **on your machine**: the Django app, the database, SearXNG, Reacher and the scraper container (Docker). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command.
 
 **Using the admin day to day:** see the [user guide](docs/USER_GUIDE.md), also available in the admin under **Guide** (top right).
 
@@ -11,9 +11,10 @@ Finds local businesses, researches and scores them, finds the decision maker and
 ```sh
 cd email-marketing-automation
 python -m venv .venv && source .venv/bin/activate    # skip if .venv already exists
-python -m pip install -r requirements-worker.txt    # everything (requirements.txt alone = the web app, for Vercel)
+python -m pip install -r requirements.txt
 python -m playwright install chromium               # Modules 1 and 2
 cp .env.example .env                                # then fill it in (see below)
+docker compose up -d                                # the database and SearXNG (docker-compose.yml)
 python manage.py migrate                            # creates / updates every table
 python manage.py createsuperuser                    # your admin login
 python manage.py runserver                          # http://127.0.0.1:8000/admin/
@@ -23,12 +24,11 @@ Generate a `DJANGO_SECRET_KEY` for `.env` with `python -c "import secrets; print
 
 **Database created before the move to Django** (with Alembic): run `python manage.py migrate --fake-initial` once instead of `migrate`. It adopts the existing tables without touching their data, converts the three remaining `json` columns to `jsonb`, re-applies the triggers and the open-tracking function, adds Django's own tables, and turns on row level security for every table (so the Supabase REST API cannot read them). The old `alembic_version` table is no longer used and can be dropped.
 
-Also needed:
+Also needed, all on this machine:
 
-- **Docker**: email verification (Module 4) runs Reacher in a container (see "Docker setup" below).
-- **SearXNG** (your own instance, `SEARXNG_URL`): web search for contact discovery (Module 3).
-- **Supabase**: the database; the open-tracking edge function is optional (open tracking is off).
-- **GoHighLevel**: sends the emails (see [Sending through GoHighLevel](#sending-through-gohighlevel)).
+- **Docker**: `docker compose up -d` starts the database (Postgres on `127.0.0.1:5433`; set `LOCAL_DB_PASSWORD` and the same password in `DATABASE_URL`) and SearXNG (`127.0.0.1:8888`, set `SEARXNG_SECRET`; `SEARXNG_URL=http://127.0.0.1:8888`). Email verification (Module 4) starts Reacher itself (see "Docker setup" below); the Google Maps scraper container runs from its own repo (`MAPS_SCRAPER_URL`, default `http://127.0.0.1:8001`).
+- **Your mailbox** for sending: the `SMTP_` settings and `SENDER_EMAIL` in `.env` (see [Sending from your mailbox](#sending-from-your-mailbox-the-outbox)).
+- **Moving data from the old Supabase database** (optional): with the old `DATABASE_URL`, `python manage.py dumpdata --natural-foreign --exclude contenttypes --exclude auth.permission --exclude admin.logentry --exclude sessions -o backup.json`; then switch `DATABASE_URL` to the local one, `python manage.py migrate` and `python manage.py loaddata backup.json`.
 
 ### Docker setup (Reacher, for email verification)
 
@@ -80,13 +80,12 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 
 | Needed for | Keys |
 |---|---|
-| Everything | `DATABASE_URL`, `DJANGO_SECRET_KEY` (`DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS` optional) |
+| Everything | `DATABASE_URL` (the local Postgres), `LOCAL_DB_PASSWORD`, `DJANGO_SECRET_KEY` (`DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS` optional) |
 | The API | `AUTH_TOKEN` (sent in every request's `Auth` header) |
-| Research and email writing | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
+| Website research | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
+| Decision makers | `SEARXNG_URL` (the local SearXNG), `SEARXNG_SECRET` |
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
-| Email sign-off | `SENDER_NAME` (optional; empty: "The Axioware team") |
-| Sending through GoHighLevel | `GHL_API_KEY` (sub-account Private Integration token), `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET` (the workflows send it) |
-| Pipeline runs | `RUN_MODE` (`local`, default; `queue` on Vercel, set automatically there) |
+| Sending | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SENDER_EMAIL`, `SENDER_NAME` (also the sign-off; empty: "The Axioware team") |
 
 ### Docker setup (Google Maps scraper, optional second lead source)
 
@@ -122,8 +121,9 @@ Run the steps in order. Each one reads what the previous one stored, and each sk
 | 3b. Review low scores | Businesses > filter **Needs your review** > **Approve** / **Reject** | - |
 | 5b. Review unverified addresses | Prospects > filter Needs review > **Approve** / **Reject** | - |
 | 6. Write emails | Prospects or Businesses > action **Write emails from templates** | `python manage.py generate_emails [--email-prompt-id N]` |
-| 7. Review | Emails: edit, Approve (= schedule), Reject, Fill in again | - |
-| 8. Send | Approving hands the email to GoHighLevel, which waits until Email Due At and sends it | `python manage.py ghl_sync` (contacts; re-hands emails whose hand-over failed) |
+| 7. Review | Emails: edit, Approve (= a send time), Reject, Fill in again | - |
+| 8. Send | **Outbox**: tick approved emails, **Queue for sending**; each is sent from your mailbox at its time | `python manage.py send_emails` (the sender; queueing starts it) |
+| 8b. Leads | **Pipeline**: move leads on replies, demos, won/lost (stops or resumes their emails) | - |
 | 9. Follow-ups | **Email sequences** (initial template, then days + template per follow-up); the campaign picks one or more (A/B); written for review once the previous email is sent | `python manage.py generate_followups` |
 
 Every command has `--help`. Before running one on real data, try it with `--limit 1 --dry-run`, which shows what it would do and saves nothing:
@@ -152,14 +152,14 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | Endpoint | What |
 |---|---|
 | `/api/campaigns/` | list, create, edit, delete: `lead_source`, `campaign_prompt`, `email_sequences` (ids; several = A/B split), `min_score`, `send_window_start`/`send_window_end`, `send_timezone`; `POST /api/campaigns/{id}/fetch-businesses/` `{"limit": 20, "source": "scraper_api"}` |
-| `/api/settings/` | the global sending settings: `daily_cap`, `gap_fixed_seconds`, `gap_random_min_seconds`, `gap_random_max_seconds` (`GET`, `PATCH`, `PUT`) |
+| `/api/settings/` | the global settings: `daily_cap`, `gap_fixed_seconds`, `gap_random_min_seconds`, `gap_random_max_seconds`, `reply_window_days`, `footer_text` (`GET`, `PATCH`, `PUT`) |
 | `/api/email-sequences/`, `/api/follow-ups/` | email sequences (`name`, `initial_template`, read-only `follow_ups` and `campaigns`) and their follow-up steps (`email_sequence`, `sequence`, `days_after_previous`, `email_prompt` = its template); `POST /api/emails/{id}/mark-replied/` (also on prospects and businesses) stops that prospect's sequence |
 | `/api/campaign-prompts/` | campaign prompts qualify businesses (the research agent's instructions, used as stored; shared by campaigns) |
 | `/api/email-templates/` (also `/api/email-prompts/`), `/api/email-variables/` | email templates (`name`, `kind`: `initial` or `follow_up`, `subject`, `body` with `{{variables}}`; unknown variables are refused with `400`) and the variables they can use |
-| `/api/ghl/email-sent/`, `/api/ghl/stop-sequence/`, `/api/ghl/resume-sequence/` | GoHighLevel webhooks (Custom Data `secret`), see [Sending through GoHighLevel](#sending-through-gohighlevel) |
-| `POST /api/emails/{id}/hand-over/` | hand an approved email whose hand-over failed to GoHighLevel again |
+| `POST /api/emails/queue/` `{"ids": [...]}`, `POST /api/emails/unqueue/` | queue approved (or failed) emails for sending (the sender starts), or take them out of the queue |
+| `GET /api/pipeline/`, `POST /api/prospects/{id}/move-stage/` `{"stage": "replied", "note": ""}` | leads per pipeline stage; move a lead (stopping or resuming its emails, see [The Pipeline](#the-pipeline-leads)) |
 | `/api/businesses/`, `/api/business-sources/`, `/api/website-profiles/` | Modules 1-2 data, with filters (`?city=`, `?website_profile__qualification_score__gte=50`), `?search=` and `?ordering=` |
-| `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`) |
+| `/api/contacts/`, `/api/prospects/` | Modules 3-4 data (e.g. `PATCH` a prospect's `do_not_contact`; filter `?pipeline_stage=`) |
 | `/api/emails/` | list, view, `PATCH` `subject`/`body` (goes back to review), delete |
 | `/api/emails/{id}/approve/`, `reject/` `{"note"}`, `reopen/`, `regenerate/` | review actions; `409` when not allowed in the email's current status |
 | `/api/emails/{id}/preview/`, `/api/emails/bulk/` `{"action": "approve", "ids": [...]}`, `/api/emails/stats/` | preview HTML, bulk review, counts and open rate |
@@ -167,7 +167,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | `/api/runs/` | start a pipeline step, list and follow runs; `GET /api/runs/commands/` lists commands and options; `POST /api/runs/{id}/cancel/` |
 | `/api/stats/` | counts across the whole pipeline |
 
-Start a step (e.g. from a cron job) and follow it:
+Start a step and follow it:
 
 ```sh
 curl -X POST -H "Auth: $AUTH_TOKEN" -H "Content-Type: application/json" \
@@ -176,7 +176,7 @@ curl -X POST -H "Auth: $AUTH_TOKEN" -H "Content-Type: application/json" \
 curl -H "Auth: $AUTH_TOKEN" http://127.0.0.1:8000/api/runs/1/     # status, exit_code, output
 ```
 
-`options` uses the command's option names (`--dry-run` is `"dry_run": true`, repeatable options take a list: `"business_id": [1, 2]`); raw `"arguments": ["--limit", "5"]` works too. Invalid options are refused with `400` before anything starts. A cron job can also run the command directly: `cd /path/to/project && .venv/bin/python manage.py verify_emails --limit 50`.
+`options` uses the command's option names (`--dry-run` is `"dry_run": true`, repeatable options take a list: `"business_id": [1, 2]`); raw `"arguments": ["--limit", "5"]` works too. Invalid options are refused with `400` before anything starts.
 
 ## Create a discovery campaign
 
@@ -360,62 +360,32 @@ Opens are rate limited in the database: at most 10 recorded opens per email per 
 
 Every new email starts in `in_review`. Review them in the admin under **Emails**:
 
-- **List**: counts per status and the open rate at the top (click one to filter), search by business, recipient or subject, and the actions **Approve selected**, **Reject selected** and **Mark replied**.
-- **Email page**: edit the subject and body (the footer is added automatically), see a preview, and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (schedules it, then jumps to the next email in review), **Reject** with an optional note, **Back to review**, and **Fill in again from template** (optionally with another template). A scheduled email shows its send time; editing, rejecting or sending it back to review frees its slot.
+- **List**: counts per status at the top (click one to filter), search by business, recipient or subject, and the actions **Approve selected**, **Queue for sending**, **Take out of the queue**, **Reject selected** and **Mark replied**.
+- **Email page**: edit the subject and body (the footer is added automatically), see a preview, and see what earlier modules found about the business (website findings, qualification reasons). Actions: **Approve** (gives it a send time, then jumps to the next email in review), **Queue for sending** / **Take out of the queue**, **Reject** with an optional note, **Back to review**, and **Fill in again from template** (optionally with another template). Editing, rejecting or sending it back to review frees its time and takes it out of the queue.
 - Editing an approved email sends it back to review. Emails with `PLACEHOLDER` text cannot be approved. Sent emails are read-only and show their opens.
 
-Statuses: `in_review` -> `approved` -> `scheduled` (send time given) -> `sending` (written into the GoHighLevel contact) -> `sent` (GoHighLevel reported it) -> `replied`; plus `rejected`. `failed` and `opened` are kept for older data and open tracking.
+Statuses: `in_review` -> `approved` (send time given) -> `queued` (Outbox) -> `sending` -> `sent` -> `replied`; plus `rejected` and `failed` (the send failed; queue it again). `opened` is kept for open tracking.
 
-## Sending through GoHighLevel
+## Sending from your mailbox (the Outbox)
 
-GoHighLevel waits until each email's due time and sends it from your connected mailbox; this app decides what and when. Nothing in the app runs on a timer.
+The app sends the emails itself, over SMTP from your own mailbox. Nothing runs on a timer: you queue emails, and a background sender sends them at their times.
 
-1. **Contacts.** Every ready prospect (deliverable, or approved by a person) becomes a GHL contact tagged `outreach-app` and `campaign-<name>`: the full pipeline does it as its last step, `ghl_sync` (or the dashboard button) does it any time, and approving an email does it for that prospect. One email address gets one sequence, even if several prospects share it. A GHL workflow turns new tagged contacts into **New Lead** opportunities.
-2. **Approval = hand-over.** Approving an email gives it a send time (stored in `emails.scheduled_at`): the latest planned send of any campaign + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day for all campaigns together (these four, and the email footer, are global: the admin's **Settings** page, or `GET`/`PATCH /api/settings/`); a follow-up never before "previous email sent + its days". The email is written into the contact at once: **Email Subject**, **Email Body** (HTML incl. footer), **Follow-up Count** (0 = initial, n = follow-up n), **Email Due At** (the send time, ISO; GHL's date field keeps the date) and, for an initial email, **Initial Email Type** (the prospect's sequence name, the A/B group). Status: **In GoHighLevel**. The GHL workflow waits until Email Due At and sends.
-3. **Failures.** A write GHL refuses leaves the email **Approved** with the error shown (dashboard: "not in GoHighLevel yet"; **Hand to GoHighLevel** on the email, the Emails action, `ghl_sync`, or `POST /api/emails/{id}/hand-over/`). Writes are never retried automatically (only a 429 rate limit is), and handing over again first reads the contact: if GHL already has the email (a write that timed out after GHL saved it), it is not written again, so it is never sent twice.
-4. **Sent.** The workflow calls `POST /api/ghl/email-sent/`. The app marks the email sent, empties Subject, Body and Due At and sets **Follow-up Count** to the next follow-up's number, or empties it when the sequence is over (the workflow then moves the lead to **Quota Exhausted**), and then fills the next follow-up's template for review (if a variable has no value it is held back; fix it and use **Write follow-ups** on the dashboard). Approving the follow-up hands it over the same way. GHL may retry the webhook; a repeat changes nothing.
-5. **Changes after hand-over.** Editing, rejecting or sending a handed-over email back to review first empties its Subject, Body and Due At in GHL; if GHL cannot be reached nothing changes here and you are told, because GHL could still send it.
-6. **Stop.** On a reply, a bounce, an unsubscribe or a manual stage move the workflow calls `POST /api/ghl/stop-sequence/`: the prospect's sequence ends, emails not sent yet are cancelled and its fields emptied. Each prospect has its own sequence; colleagues at the same business are not affected.
+1. **Approval = a send time.** Approving an email gives it a send time (`emails.scheduled_at`): the latest planned send of any campaign + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day for all campaigns together (global: the admin's **Settings** page, or `/api/settings/`); a follow-up never before "previous email sent + its days". It stays **Approved**; nothing is sent yet.
+2. **Queue (Outbox).** The admin's **Outbox** lists approved, queued and failed emails with their send times (in each campaign's time zone). Tick them and choose **Queue for sending** (also on the email page, or `POST /api/emails/queue/`). An email whose time has already passed gets a fresh slot first, so queueing a backlog never sends a burst. Queueing starts the **sender** (a pipeline run, `send_emails`) unless it is already running.
+3. **The sender** (`pipeline/services/sending.py`) takes the queued email with the earliest time, waits until then (looking again every 30 s, so emails queued meanwhile are picked up), sends it and goes on; it stops when the queue is empty. It only runs while this machine and the app are on: if it was stopped (restart), the Outbox and the dashboard say so and **Start the sender** restarts it; emails whose time passed meanwhile go out one after the other. `python manage.py send_emails` runs it by hand (`--once`: only what is due now).
+4. **Each email** goes as text + HTML (both with the footer from Settings), From `SENDER_NAME <SENDER_EMAIL>`, with a `List-Unsubscribe` header (a reply to you). A follow-up is sent as a reply to the email before it (`In-Reply-To`), so it lands in the same thread. After it is sent: status **Sent**, the prospect is contacted, the lead moves on the Pipeline, and the next follow-up is written for review right away (approve and queue it the same way).
+5. **Failures.** A refused recipient or a server error marks that email **Failed** with the reason (Outbox, dashboard); queue it again to retry. A refused login stops the sender and leaves the email queued. An email the sender was in the middle of when it stopped becomes Failed on the next start: check your Sent folder before queueing it again.
 
-Contact custom fields the app writes (create them in GHL; their keys must be exactly these): `contact.email_subject` (text), `contact.email_body` (large text), `contact.email_due_at` (date), `contact.followup_count` (number), `contact.initial_email_type` (text).
+Settings in `.env`: `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_SECURITY` (`starttls`, `ssl` for port 465, or `none`), `SMTP_USERNAME`, `SMTP_PASSWORD` (Gmail / Google Workspace: an app password), `SENDER_EMAIL`, `SENDER_NAME`. Without `SMTP_HOST` and `SENDER_EMAIL` nothing is sent: queued emails wait and the dashboard says so.
 
-Webhooks: in the workflow's **Webhook** action, Method POST, and these **Custom Data** keys (GHL sends them under `customData`, next to the contact's standard fields; `contact_id` is always at the top). `secret` is the value of `GHL_WEBHOOK_SECRET`; the header `X-Webhook-Secret` or `?secret=` on the URL work too.
+## The Pipeline (leads)
 
-| Endpoint | Body | Answers |
-|---|---|---|
-| `POST /api/ghl/email-sent/` | `secret`, `followup_count` = `{{contact.followup_count}}` | `200` `{"email", "outcome", "next", "follow_up"}`; `401` wrong secret, `404` unknown contact, `409` nothing was handed to GHL, `502` GHL error (safe to retry) |
-| `POST /api/ghl/stop-sequence/` | `secret`, `reason` = `replied` (any reason; `replied...` also marks the last email replied) | `200` `{"prospect", "reason", "cancelled"}` |
-| `POST /api/ghl/resume-sequence/` | `secret` | `200` `{"outcome": "resumed", "previous_stop_reason", "unmarked_replied", "back_in_review", "next", "follow_up"}`, or `"not stopped; nothing to resume"` (safe to call on every move to Follow-up); `409` for a do-not-contact prospect. Undoes a stop made by mistake (an automatic reply): the email marked replied is sent again, the emails the stop cancelled go back to review (approve them again), Follow-up Count is set for the next follow-up, which is written if it does not exist yet |
+The admin's **Pipeline** page shows every lead (a ready prospect) in its stage: New Lead, Ready to Send, Initial Email, Follow-up, Replied, Demo Booked, Demo Done, Won, Lost, Quota Exhausted. Filter by campaign or search; each card has a stage menu and **Move**. Every move is kept with who made it (the prospect's page, **Stage history**). `GET /api/pipeline/` and `POST /api/prospects/{id}/move-stage/` do the same.
 
-The dashboard warns when GHL is not set up, when approved emails are not in GHL yet, when ready prospects are not GHL contacts yet, and when an email is over a day past its send time without the email-sent webhook.
-
-## Containers on your own server (nginx)
-
-The scraper and Reacher run on your VPS behind nginx. Each refuses requests without its key, and nginx only forwards `https://your-domain/scraper/...` and `https://your-domain/reacher/...` to them (both published on `127.0.0.1` only). Files: [deploy/vps/](deploy/vps/).
-
-1. **Scraper**: in its folder, a `.env` with `SCRAPER_API_KEY=<key>`, then `docker compose up -d --build`. Its API now answers only requests with the header `X-API-Key: <key>` (every route, `/docs` included; without the variable it answers nothing).
-2. **Reacher**: copy `deploy/vps/reacher-compose.yml` with a `.env` holding `REACHER_SECRET`, `VERIFY_MAIL_FROM`, `VERIFY_HELO`, then `docker compose -f reacher-compose.yml up -d`. Reacher then needs the header `x-reacher-secret` on every check (it answers `/version` to anyone). The VPS needs outbound port 25; `VERIFY_HELO` should match its reverse DNS.
-3. **nginx**: paste `deploy/vps/nginx-locations.conf` into the site's `server` block and reload. It allows a search 340 s and a check 120 s.
-4. **App** (Vercel's environment variables, and `.env` wherever else the steps run): `MAPS_SCRAPER_URL=https://your-domain/scraper`, `MAPS_SCRAPER_KEY=<scraper key>`, `REACHER_URL=https://your-domain/reacher`, `REACHER_SECRET=<reacher key>`, plus `VERIFY_MAIL_FROM` (the app checks once per run that the sender's domain accepts mail). A remote Reacher must be https with a secret; the app then never manages it through Docker, checks the key before verifying anyone, and stops with "refused the key" when it is wrong.
-
-## Deploying on Vercel
-
-Everything runs on Vercel, **inside the request that starts it**: no worker, no queue, nothing running on another machine. A run (the admin's run form, a dashboard button, or `POST /api/runs/`) executes the command right there; the command calls your server and outside services directly (the scraper and Reacher behind nginx, SearXNG, Jina Reader, the AI, GoHighLevel), saves the results and answers with the finished run. The page waits meanwhile (a Google Maps search or a research takes a minute or more). See pipeline/webruns.py.
-
-- **Time limit:** `vercel.json` allows 300 s per request and a run uses at most 270. Each step starts new work (a search, a business, a contact, an address, an email) only while there is time for it, then says what is left (`Time limit reached: ... start the run again`). Starting it again continues, since finished work is skipped (verification also skips addresses that came back unknown; `--recheck` checks them). **Run whole pipeline** runs its steps in order until the time is up. Typical amounts per run: a Google Maps search of up to 20 places, 2-4 researched businesses, several decision-maker searches, a few minutes of address checks, a dozen or more emails.
-- A run Vercel cut off anyway (it shows "running" for more than 6 minutes) is marked failed; start it again with a smaller `--limit`.
-- Not available on Vercel (they fail at once, saying why): fetching with the **built-in browser** (use the scraper container as the lead source) and **refreshing Maps details**; verification while `REACHER_URL`/`REACHER_SECRET` are not set (a local Docker Reacher cannot run there).
-- Vercel finds Django through `manage.py` and serves `WSGI_APPLICATION` (`emailautomation/wsgi.py`) as one function; static files go to its CDN. `requirements.txt` holds the web app's packages (what Vercel installs); `requirements-worker.txt` adds the browsers for running steps on your own machine.
-- Vercel environment variables: `DATABASE_URL` (Supabase **pooler** URL, port 6543), `DJANGO_SECRET_KEY`, `AUTH_TOKEN`, `GROQ_API_KEY` (or `OPENAI_API_KEY`), `GHL_API_KEY`, `GHL_LOCATION_ID`, `GHL_WEBHOOK_SECRET`, `SENDER_NAME`, `MAPS_SCRAPER_URL`, `MAPS_SCRAPER_KEY`, `SEARXNG_URL` (optional `SEARXNG_KEY`, `JINA_API_KEY`), and for verification `REACHER_URL`, `REACHER_SECRET`, `VERIFY_MAIL_FROM` (see [Containers on your own server](#containers-on-your-own-server-nginx)).
-- On Vercel the app adds the deployment's own hosts to `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`, uses secure cookies, and does not keep database connections open; set `DJANGO_ALLOWED_HOSTS` too for a custom domain.
-- Run `python manage.py migrate` from your machine (not on deploy).
-- Without Vercel (`RUN_MODE=queue` elsewhere), runs wait for `python manage.py run_worker` on a machine with the same `DATABASE_URL`; with `RUN_MODE=local` (default) they start as background processes.
-
-### Placeholders to fill
-
-| What | Where |
-|---|---|
-| Footer image | upload `assets/email-footer.png` to Supabase Storage as `email-assets/footer.png` |
+- **Sending moves leads forward** on its own: first email approved → Ready to Send, sent → Initial Email, a follow-up sent → Follow-up. It never moves a lead out of a stage a person chose (e.g. Replied).
+- **Quota Exhausted**: when a lead's sequence has no step left and its last email went out more than the reply window ago (Settings, `reply_window_days`, default 3) with no reply, it moves there when the Pipeline page or the dashboard is opened.
+- **Your moves stop or resume emails.** Replied, Demo Booked, Demo Done, Won, Lost and Quota Exhausted stop the lead's sequence: emails not sent yet are cancelled (Replied also marks the latest sent email replied). Moving a stopped lead back to Initial Email or Follow-up resumes it (e.g. the "reply" was an automatic one): the replied email counts as sent again, the cancelled emails go back to review, and the next follow-up is written if it does not exist yet. Each prospect has its own sequence; colleagues at the same business are not affected.
+- **Mark replied** on an email (admin or API) moves its lead to Replied.
 
 ## Tests
 
@@ -424,7 +394,7 @@ python manage.py test
 npx deno test supabase/functions/email/handler_test.ts
 ```
 
-Tests never use the `.env` database or real services: they run against a throwaway Postgres container started in Docker (or `TEST_DATABASE_URL` if set), the test runner removes the GoHighLevel and LLM keys from the environment, and the GHL client refuses the real API during tests. Reacher, the scraper container, GoHighLevel and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
+Tests never use the `.env` database or real services: they run against a throwaway Postgres container started in Docker on port 5432 (or `TEST_DATABASE_URL` if set), the test runner removes the SMTP, LLM, scraper and Reacher settings from the environment, and emails go to Django's in-memory outbox. Reacher, the scraper container and the LLM are replaced by local fakes; one test starts the real Reacher image on a spare port, and one starts a real background run.
 
 ## Project layout
 
@@ -432,10 +402,8 @@ Tests never use the `.env` database or real services: they run against a throwaw
 |---|---|
 | `emailautomation/` | Django settings and URLs |
 | `pipeline/models.py` | one model per table |
-| `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` + `ghl.py` (scheduling and GoHighLevel) |
-| `vercel.json` | the Vercel function settings (time limit, files left out) |
-| `deploy/vps/` | Reacher compose file and nginx locations for running the containers on your own server |
-| `pipeline/webruns.py` | on Vercel every run executes inside the request that starts it, with a time limit |
+| `pipeline/services/` | the pipeline steps (Google Maps, scraper container, research agent, stakeholders, Reacher, generation, follow-ups), `outreach.py` (send times, the queue, stopping and resuming), `sending.py` (the SMTP sender), `stages.py` (the lead pipeline) |
+| `docker-compose.yml`, `docker/` | the local database and SearXNG |
 | `pipeline/services/searxng.py` | web search through your SearXNG instance (decision makers) |
 | `pipeline/management/commands/` | one `manage.py` command per step |
 | `pipeline/admin.py`, `pipeline/templates/` | the admin, including the email review page |

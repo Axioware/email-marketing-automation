@@ -15,6 +15,13 @@
     </div>
 
     <div class="module">
+      <h2><a href="{% url 'admin:pipeline_board' %}">Pipeline</a></h2>
+      <div class="pipeline-stage-strip">
+        {% for stage in pipeline %}<a href="{{ stage.url }}"><b>{{ stage.count }}</b><span>{{ stage.label }}</span></a>{% endfor %}
+      </div>
+    </div>
+
+    <div class="module">
       <h2>What to do next</h2>
       {% if steps %}
         <ul class="pipeline-steps">

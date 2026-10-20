@@ -1,0 +1,22 @@
+{% extends "admin/change_list.html" %}
+{% block content_title %}<h1>Outbox</h1>{% endblock %}
+{% block object-tools %}
+<div class="pipeline-card">
+  <p>Approved emails and their send times. Tick the ones to send, choose <b>Queue for sending</b> and click <b>Go</b>:
+    each queued email goes from your mailbox at its time (an email whose time has passed gets a new one first, keeping
+    the gaps and the daily cap). The sender runs in the background while anything is queued and stops when the queue is
+    empty; it only runs while this app's server is on.</p>
+  {% if not sending_configured %}
+    <p class="pipeline-error">Sending is not set up: set {{ missing_settings }} and the other SMTP_ settings in .env.
+      Queued emails wait until it is.</p>
+  {% elif sender %}
+    <p class="pipeline-note">The sender is {{ sender.get_status_display|lower }}: <a href="{{ sender_url }}">run #{{ sender.pk }}</a> ({{ queued_count }} queued).</p>
+  {% elif queued_count %}
+    <form method="post" action="{{ start_url }}">{% csrf_token %}
+      <p class="pipeline-error">{{ queued_count }} email(s) are queued but the sender is not running (the server was
+        restarted?). <input type="submit" class="default" value="Start the sender"></p></form>
+  {% endif %}
+  {% if stuck_count %}<p class="pipeline-error">{{ stuck_count }} email(s) were left half-sent by a sender that stopped; they become Failed when the sender next starts. Check your Sent folder before queueing them again.</p>{% endif %}
+</div>
+{{ block.super }}
+{% endblock %}
