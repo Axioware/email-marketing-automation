@@ -147,6 +147,11 @@ class ResourceTests(ApiCase):
         self.assertEqual(bad.status_code, 400)
         self.assertIn("gap_random_max_seconds", bad.json())
         self.assertEqual(self.api.get("/api/settings/").json()["gap_random_min_seconds"], 180)
+        self.assertIn("unsubscribe", data["footer_text"])
+        footer = self.api.patch("/api/settings/", {"footer_text": "Acme\nReply STOP to opt out."}, format="json")
+        self.assertEqual(footer.json()["footer_text"], "Acme\nReply STOP to opt out.")
+        self.assertEqual(self.api.patch("/api/settings/", {"footer_text": " "}, format="json").status_code, 400)
+        self.assertEqual(self.api.patch("/api/settings/", {"daily_cap": 30}, format="json").status_code, 200)
         campaign = self.api.post("/api/campaigns/", {"name": "C"}, format="json").json()
         self.assertNotIn("daily_cap", campaign)  # global now
 

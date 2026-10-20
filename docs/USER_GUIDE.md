@@ -179,7 +179,7 @@ Both are edited in the admin; nothing is built into the code. Campaigns choose t
 
 - After `|` comes the **fallback**, used when the prospect has no value. A variable **without** a fallback and without a value holds the email back, so nobody gets "Hi ,". Use a fallback on anything that may be missing (names, research fields).
 - A template with a misspelled variable, or `{{previous_subject}}` in an initial email, cannot be saved: the page says what is wrong.
-- The footer (company details and unsubscribe line) is added automatically; do not write it.
+- The footer (company details and unsubscribe line) is added automatically; do not write it. Change it in sidebar > **Settings** > **Email footer**: emails written or edited after that get the new footer, emails already written keep theirs (use **Fill in again from template** to update one).
 - The campaign page warns when it has no campaign prompt, no email sequence, a sequence without an initial-email template, or a follow-up step without a template.
 
 ### Step 7: Review emails
@@ -205,7 +205,7 @@ What you can do:
 Editing:
 
 - Change the **Subject** or **Body**, then click **Save** at the bottom of the page.
-- Write only the message and your sign-off. The footer (company details and unsubscribe line) and the tracking image are added automatically, so do not add them yourself.
+- Write only the message and your sign-off. The footer (company details and unsubscribe line, set on the **Settings** page) is added automatically, so do not add it yourself.
 - Saving an approved email sends it back to **In review**, so every email is approved in its final form.
 - **Next in review** (top of the page) moves through the queue without approving.
 

@@ -271,9 +271,16 @@ class DiscoveryCampaign(models.Model):
             raise ValidationError(errors)
 
 
+# Under every email (CAN-SPAM / GDPR): the sender, a postal address and an easy way to opt out.
+DEFAULT_FOOTER_TEXT = """Axioware - AI-powered software solutions
+Karachi, Pakistan | axioware.tech | business@axioware.tech
+If you would rather not hear from us, reply with "unsubscribe"."""
+
+
 class SendingSettings(models.Model):
-    """How fast emails go out, for all campaigns together (GoHighLevel sends them all from one mailbox). One row,
-    edited on the admin's Settings page (or the API's /api/settings/); read it with SendingSettings.current()."""
+    """How fast emails go out, for all campaigns together (GoHighLevel sends them all from one mailbox), and the footer
+    under every email. One row, edited on the admin's Settings page (or the API's /api/settings/); read it with
+    SendingSettings.current()."""
 
     daily_cap = models.PositiveIntegerField(default=40, help_text="Most emails sent in one day, all campaigns together "
                                                                   "(the day in each campaign's time zone).")
@@ -281,6 +288,10 @@ class SendingSettings(models.Model):
     gap_random_min_seconds = models.PositiveIntegerField(default=180, help_text="Plus a random gap of at least this many "
                                                                                "seconds...")
     gap_random_max_seconds = models.PositiveIntegerField(default=300, help_text="...and at most this many seconds.")
+    footer_text = models.TextField(
+        "footer", default=DEFAULT_FOOTER_TEXT, db_default=DEFAULT_FOOTER_TEXT,
+        help_text="Added under every email: who you are, an address and how to opt out. Plain text; each line stays a "
+                  "line. Applies to emails written or edited from now on.")
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -311,6 +322,9 @@ class SendingSettings(models.Model):
             raise ValidationError({"gap_random_max_seconds": "Must be at least the minimum random gap."})
         if self.daily_cap is not None and self.daily_cap < 1:
             raise ValidationError({"daily_cap": "At least one email a day."})
+        if not (self.footer_text or "").strip():
+            raise ValidationError({"footer_text": "Every email needs a footer: who you are, an address and how to "
+                                                  "opt out."})
 
 
 class Business(models.Model):

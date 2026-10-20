@@ -4,3 +4,6 @@ __pycache__/
 .*
 !.env.example
 !.vercelignore
+
+# Scratch scripts and data (not part of the app)
+temp/

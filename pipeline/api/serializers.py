@@ -315,13 +315,14 @@ class SendingSettingsSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = SendingSettings
-        fields = ["daily_cap", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds", "updated_at"]
+        fields = ["daily_cap", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds", "footer_text",
+                  "updated_at"]
         read_only_fields = ["updated_at"]
 
     def validate(self, attrs):
         settings_row = SendingSettings(**{field: getattr(self.instance, field) for field in
                                           ("daily_cap", "gap_fixed_seconds", "gap_random_min_seconds",
-                                           "gap_random_max_seconds")})
+                                           "gap_random_max_seconds", "footer_text")})
         for field, value in attrs.items():
             setattr(settings_row, field, value)
         try:

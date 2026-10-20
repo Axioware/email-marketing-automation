@@ -24,7 +24,8 @@ from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
 from django.db.models.functions import Lower
 
 from pipeline.management.base import out_of_time, time_limit_note
-from pipeline.models import DiscoveryCampaign, Email, EmailPrompt, EmailSequence, FollowUp, Prospect
+from pipeline.models import (DEFAULT_FOOTER_TEXT, DiscoveryCampaign, Email, EmailPrompt, EmailSequence, FollowUp,
+                             Prospect, SendingSettings)
 from pipeline.services import templates
 
 MAX_WEBSITE_FINDINGS = 12
@@ -32,10 +33,7 @@ MAX_WEBSITE_FINDINGS = 12
 # Added under every email, in text and HTML. Outreach law (e.g. CAN-SPAM, GDPR/PECR) generally requires identifying
 # the sender, a postal address and an easy way to opt out. The footer image (assets/email-footer.png) repeats this
 # visually but is not enough on its own: many clients block images.
-FOOTER_TEXT = """Axioware - AI-powered software solutions
-Karachi, Pakistan | axioware.tech | business@axioware.tech
-If you would rather not hear from us, reply with "unsubscribe"."""
-FOOTER_IS_PLACEHOLDER = False
+FOOTER_TEXT = DEFAULT_FOOTER_TEXT  # the default; the one in use is edited on the Settings page (footer_text())
 FOOTER_LINK = "https://axioware.tech"
 
 REGENERATABLE_STATUSES = ("in_review", "rejected")
@@ -100,9 +98,15 @@ def _paragraphs_html(text: str) -> str:
     return "\n".join(f"<p>{html.escape(p).replace(chr(10), '<br>')}</p>" for p in paragraphs)
 
 
+def footer_text() -> str:
+    """The footer under every email, from the Settings page (the default when it is empty)."""
+    text = (SendingSettings.current().footer_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text or DEFAULT_FOOTER_TEXT
+
+
 def render_text(body: str) -> str:
     """Plain-text version: the body followed by the footer text."""
-    return f"{body.strip()}{FOOTER_SEPARATOR}{FOOTER_TEXT.strip()}"
+    return f"{body.strip()}{FOOTER_SEPARATOR}{footer_text()}"
 
 
 FOOTER_SEPARATOR = "\n\n--\n"
@@ -137,11 +141,11 @@ def render_html(body: str, footer_url: str | None = None) -> str:
         f'width="{FOOTER_WIDTH}" style="display:block;border:0;max-width:100%;height:auto;"></a>\n'
         if footer_url else ""
     )
-    footer_text = _paragraphs_html(FOOTER_TEXT).replace("<p>", '<p style="font-size:12px;color:#666;">')
+    footer = _paragraphs_html(footer_text()).replace("<p>", '<p style="font-size:12px;color:#666;">')
     return (
         "<!doctype html>\n<html><body>\n"
         f"{_paragraphs_html(body)}\n"
-        f'<div class="footer">\n{image}{footer_text}\n</div>\n'
+        f'<div class="footer">\n{image}{footer}\n</div>\n'
         "</body></html>"
     )
 
@@ -400,8 +404,6 @@ def run(options: dict) -> int:
         if chosen is None:
             raise CommandError(f"Template {options['email_prompt_id']} does not exist.")
         print(f"Using template: {chosen}")
-    if FOOTER_IS_PLACEHOLDER:
-        print("Warning: the email footer is still a placeholder (FOOTER_TEXT in pipeline/services/generation.py).")
 
     try:
         queue = load_prospects(options)

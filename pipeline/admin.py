@@ -12,7 +12,7 @@ from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.widgets import RelatedFieldWidgetWrapper
 from django.db import transaction
-from django.db.models import Count, F, Q
+from django.db.models import Count, F, Q, TextField
 from django.http import HttpResponseNotAllowed, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
@@ -1494,7 +1494,14 @@ class SendingSettingsAdmin(admin.ModelAdmin):
                            "fixed gap plus a random gap between the two values (e.g. 120 s + 180-300 s), inside its "
                            "campaign's send window, and at most the daily cap per day for all campaigns together. "
                            "GoHighLevel sends it then. Changes apply to emails approved from now on."}),
+        ("Email footer", {
+            "fields": ["footer_text"],
+            "description": "Added under every email (text and HTML), after your template's sign-off: who you are, an "
+                           "address and how to opt out (outreach law generally requires all three). Do not repeat it "
+                           "in templates. Emails written or edited from now on get the new footer; emails already "
+                           "written keep theirs until filled in again or edited."}),
     ]
+    formfield_overrides = {TextField: {"widget": forms.Textarea(attrs={"rows": 5, "class": "vLargeTextField"})}}
     readonly_fields = ["updated_at"]
 
     def has_add_permission(self, request):

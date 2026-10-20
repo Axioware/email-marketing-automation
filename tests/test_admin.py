@@ -84,7 +84,8 @@ class AdminPagesTests(AdminCase):
         self.assertIn("all campaigns together", page)
         self.assertNotIn("Delete", page)
         saved = self.client.post(url, {"daily_cap": "25", "gap_fixed_seconds": "60", "gap_random_min_seconds": "10",
-                                       "gap_random_max_seconds": "20"}, follow=True)
+                                       "gap_random_max_seconds": "20", "footer_text": "Acme\r\nReply STOP to opt out."},
+                                follow=True)
         self.assertContains(saved, "Settings saved.")
         current = SendingSettings.current()
         self.assertEqual((current.daily_cap, current.gap_fixed_seconds, current.gap_random_max_seconds), (25, 60, 20))
@@ -259,6 +260,28 @@ class EmailReviewTests(AdminCase):
             page = self.client.get(url).content.decode()
             self.assertNotIn("<script>alert(1)</script>", page)
             self.assertIn("&lt;script&gt;", page)
+
+    def test_footer_is_set_on_the_settings_page(self):
+        from pipeline.models import SendingSettings
+
+        old = self.email()
+        url = reverse("admin:pipeline_sendingsettings_change", args=[SendingSettings.current().pk])
+        page = self.client.get(url).content.decode()
+        self.assertIn("Email footer", page)
+        self.assertIn("If you would rather not hear from us", page)  # the default
+        form = {"daily_cap": "40", "gap_fixed_seconds": "120", "gap_random_min_seconds": "180",
+                "gap_random_max_seconds": "300"}
+        self.assertContains(self.client.post(url, {**form, "footer_text": "   "}), "This field is required")
+        self.assertEqual(SendingSettings.current().footer_text, g.DEFAULT_FOOTER_TEXT)  # nothing saved
+        response = self.client.post(url, {**form, "footer_text": "Acme Clinics\r\n1 Main St\r\nReply STOP to opt out."})
+        self.assertEqual(response.status_code, 302)
+        eid = self.email()
+        self.edit(eid, "Subject", "Hi Ali,\r\n\r\nRewritten.")  # written or edited from now on: the new footer
+        row = self.row(eid)
+        self.assertTrue(row["body_text"].endswith("--\nAcme Clinics\n1 Main St\nReply STOP to opt out."))
+        self.assertIn("Acme Clinics<br>1 Main St", row["body_html"])
+        self.assertNotIn("Axioware - AI-powered", row["body_html"])
+        self.assertIn("Axioware - AI-powered", self.row(old)["body_text"])  # already written: unchanged
 
     def test_edit_saves_content_and_keeps_the_tracking_token(self):
         eid = self.email()
