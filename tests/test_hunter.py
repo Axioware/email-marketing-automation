@@ -78,13 +78,16 @@ class FakeHunter:
 
 
 class HunterCase(TestCase):
+    require_score = False  # the AI score gate is tested in test_email_scoring
+
     def setUp(self):
         self.hunter = FakeHunter()
         self.addCleanup(self.hunter.close)
         env = mock.patch.dict(os.environ, {"HUNTER_API_KEY": KEY, "HUNTER_BASE_URL": self.hunter.url})
         env.start()
         self.addCleanup(env.stop)
-        SendingSettings.objects.update_or_create(pk=1, defaults={"contact_provider": "hunter"})
+        SendingSettings.objects.update_or_create(pk=1, defaults={"contact_provider": "hunter",
+                                                                 "email_scoring_enabled": self.require_score})
         no_reacher = mock.patch("pipeline.services.verification.prepare_reacher",
                                 side_effect=AssertionError("Reacher must not be used in Hunter mode"))
         no_reacher.start()

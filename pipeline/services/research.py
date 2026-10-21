@@ -39,7 +39,7 @@ except ImportError:
 
 from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessWebsiteProfile, check_output_fields
-from pipeline.services.llm import complete, make_llm_client, rejected_output
+from pipeline.services.llm import complete, make_llm_client, rejected_output, tune
 from pipeline.services.dbthread import outside_event_loop
 
 MAX_PAGES_PER_BUSINESS = 5
@@ -520,8 +520,7 @@ def validate_agent_response(client: OpenAI, model: str, context: dict, must_scor
                 deadline,
                 timeout=LLM_TIMEOUT,
                 model=model,
-                temperature=0.2,
-                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                **tune(model, temperature=0.2, max_completion_tokens=MAX_COMPLETION_TOKENS),
                 response_format=response_format,
                 messages=[
                     {"role": "system", "content": system_prompt},

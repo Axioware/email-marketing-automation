@@ -744,7 +744,7 @@ class BusinessAdmin(PipelineAdmin):
     ]
     inlines = [BusinessContactInline, ProspectInline, EmailInline, BusinessSourceInline]
     actions = ["approve_businesses", "reject_businesses", "refresh_details", "research_websites", "find_stakeholders",
-               "verify_emails", "generate_emails", "mark_replied"]
+               "verify_emails", "score_emails", "generate_emails", "mark_replied"]
     list_select_related = ["website_profile", "discovery_campaign"]
 
     def get_queryset(self, request):
@@ -875,6 +875,10 @@ class BusinessAdmin(PipelineAdmin):
     @admin.action(description="Verify contact emails (Module 4)")
     def verify_emails(self, request, queryset):
         return run_step("verify_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
+
+    @admin.action(description="Score emails with the AI (Module 4b)")
+    def score_emails(self, request, queryset):
+        return run_step("score_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
 
     @admin.action(description="Write emails from templates (Module 5)")
     def generate_emails(self, request, queryset):
@@ -1060,7 +1064,7 @@ class GenerateEmailsForm(forms.Form):
 
 @admin.register(Prospect)
 class ProspectAdmin(PipelineAdmin):
-    list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "outreach_badge",
+    list_display = ["email", "business", "contact", "status_badge", "verdict_badge", "score_badge", "outreach_badge",
                     "email_sequence", "stage_badge", "do_not_contact", "qualification_score", "email_verified_at",
                     "last_contacted_at"]
     list_filter = ["email_status", "verdict", "outreach_status", "pipeline_stage", "email_sequence",
@@ -1071,12 +1075,13 @@ class ProspectAdmin(PipelineAdmin):
     readonly_fields = ["email_verified_at", "email_verification_provider", "last_contacted_at", "created_at",
                        "updated_at", "emails_link", "verification_details_display", "pipeline_stage",
                        "stage_changed_at", "stage_history", "sequence_stopped_at", "sequence_stop_reason",
-                       "email_sequence"]
+                       "email_sequence", "email_score", "email_score_reason", "email_scored_at"]
     fieldsets = [
         (None, {"fields": ["business", "contact", "email", "do_not_contact"]}),
         ("Verification (Module 4)", {"fields": ["email_status", "verdict", "verification_note",
                                                 "verification_details_display", "email_verification_provider",
                                                 "email_verified_at", "qualification_score"]}),
+        ("AI email score (Score emails)", {"fields": ["email_score", "email_score_reason", "email_scored_at"]}),
         ("Outreach", {"fields": ["outreach_status", "approved_by_person", "email_sequence", "outreach_priority",
                                  "outreach_facts", "research_summary", "last_contacted_at", "emails_link"]}),
         ("Pipeline", {"fields": ["pipeline_stage", "stage_changed_at", "sequence_stopped_at", "sequence_stop_reason",
@@ -1084,8 +1089,20 @@ class ProspectAdmin(PipelineAdmin):
                       "description": "Move the lead on the Pipeline page."}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
-    actions = ["approve_prospects", "reject_prospects", "generate_emails", "regenerate_emails", "mark_replied",
-               "mark_do_not_contact", "clear_do_not_contact"]
+    actions = ["score_emails", "approve_prospects", "reject_prospects", "generate_emails", "regenerate_emails",
+               "mark_replied", "mark_do_not_contact", "clear_do_not_contact"]
+
+    @admin.display(description="AI score", ordering="email_score")
+    def score_badge(self, obj):
+        if obj.email_score is None:
+            return "-"
+        good = obj.email_score >= SendingSettings.current().email_min_score
+        return format_html('<span class="pipeline-badge pipeline-{}" title="{}">{}</span>',
+                           "deliverable" if good else "risky", obj.email_score_reason or "", obj.email_score)
+
+    @admin.action(description="Score emails with the AI (Module 4b)")
+    def score_emails(self, request, queryset):
+        return run_step("score_emails", ["--rescore", *ids_arguments("--prospect-id", queryset.values_list("pk", flat=True))])
 
     @admin.display(description="Stage", ordering="pipeline_stage")
     def stage_badge(self, obj):
@@ -1658,6 +1675,13 @@ class SendingSettingsAdmin(admin.ModelAdmin):
                            "with Reacher (free; needs outbound port 25). Hunter: Find decision makers asks Hunter's "
                            "domain search for the people at the business's domain, and Verify emails checks each "
                            "address with Hunter's verifier (HUNTER_API_KEY in .env; uses Hunter credits)."}),
+        ("Email scoring (Score emails)", {
+            "fields": ["email_scoring_enabled", "email_min_score", "excluded_email_patterns", "email_scoring_prompt"],
+            "description": "After verification: an address matching an excluded pattern is disqualified (never "
+                           "verified or emailed). Score emails then asks the AI to score every other verified "
+                           "address with this prompt (0-100, with a reasoning): a deliverable address at or above the "
+                           "minimum becomes ready to email, lower ones wait in Prospects > Needs review. Changing the "
+                           "prompt: select prospects > Score emails to score them again."}),
         ("Email footer", {
             "fields": ["footer_text"],
             "description": "Added under every email (text and HTML), after your template's sign-off: who you are, an "
@@ -1665,7 +1689,7 @@ class SendingSettingsAdmin(admin.ModelAdmin):
                            "in templates. Emails written or edited from now on get the new footer; emails already "
                            "written keep theirs until filled in again or edited."}),
     ]
-    formfield_overrides = {TextField: {"widget": forms.Textarea(attrs={"rows": 5, "class": "vLargeTextField"})}}
+    formfield_overrides = {TextField: {"widget": forms.Textarea(attrs={"rows": 8, "class": "vLargeTextField"})}}
     readonly_fields = ["updated_at"]
 
     def has_add_permission(self, request):

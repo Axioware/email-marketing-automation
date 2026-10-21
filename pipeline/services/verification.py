@@ -501,7 +501,18 @@ def already_decided(prospect_status: str | None) -> bool:
     return prospect_status in CONCLUSIVE_STATUSES
 
 
-def prospect_values(contact: dict, address: str, outcome: dict, now: datetime, probed: bool = True) -> dict:
+def outreach_for(outcome: dict, require_score: bool) -> str:
+    """The prospect's outreach status from a verification: excluded by a pattern -> rejected; deliverable -> ready,
+    or pending until Score emails scores it (Settings: Require an AI score)."""
+    if outcome.get("reason") == "excluded":
+        return "rejected"
+    if outcome["status"] == "deliverable" and require_score:
+        return "pending"
+    return OUTREACH_STATUS[outcome["status"]]
+
+
+def prospect_values(contact: dict, address: str, outcome: dict, now: datetime, probed: bool = True,
+                    require_score: bool = False) -> dict:
     status = outcome["status"]
     return {
         "business_id": contact["business_id"],
@@ -514,7 +525,7 @@ def prospect_values(contact: dict, address: str, outcome: dict, now: datetime, p
         "email_verification_provider": outcome.get("provider", PROVIDER),
         "email_verified_at": now,
         "qualification_score": contact["qualification_score"],
-        "outreach_status": OUTREACH_STATUS[status],
+        "outreach_status": outreach_for(outcome, require_score),
     }
 
 
@@ -531,7 +542,14 @@ def upsert_prospect(values: dict) -> None:
         for field in fields:
             setattr(prospect, field, values[field])
         if prospect.outreach_status in MANAGED_OUTREACH_STATUSES and not prospect.do_not_contact:
-            prospect.outreach_status = values["outreach_status"]
+            outreach = values["outreach_status"]
+            if outreach == "pending" and prospect.email_score is not None:  # scored before: that score still decides
+                from pipeline.models import SendingSettings
+                from pipeline.services.email_scoring import decide
+
+                prospect.email_status = values["email_status"]
+                outreach = decide(prospect, prospect.email_score, SendingSettings.current().email_min_score)
+            prospect.outreach_status = outreach
             fields.append("outreach_status")
         prospect.save(update_fields=[*fields, "updated_at"])
 
@@ -608,7 +626,12 @@ def run(options: dict) -> int:
     from pipeline.models import SendingSettings
     from pipeline.services import hunter
 
-    use_hunter = SendingSettings.current().contact_provider == SendingSettings.ContactProvider.HUNTER
+    from pipeline.services import email_scoring
+
+    settings_row = SendingSettings.current()
+    use_hunter = settings_row.contact_provider == SendingSettings.ContactProvider.HUNTER
+    require_score = settings_row.email_scoring_enabled
+    excluded = email_scoring.patterns(settings_row.excluded_email_patterns)
     if use_hunter:
         if not hunter.configured():
             raise CommandError("Settings say to verify with Hunter, but HUNTER_API_KEY is not set in .env.")
@@ -667,7 +690,13 @@ def run(options: dict) -> int:
                     skipped += 1
                     continue
                 domain = address.rpartition("@")[2].casefold()
-                if domain in domain_state and not options["probe_all"]:
+                pattern = email_scoring.matching_pattern(address, excluded)
+                if pattern:
+                    outcome = {"status": "unknown", "verdict": "excluded", "reason": "excluded", "summary": None,
+                               "note": email_scoring.exclusion_note(pattern),
+                               "provider": hunter.PROVIDER if use_hunter else PROVIDER}
+                    probed = False
+                elif domain in domain_state and not options["probe_all"]:
                     status, reason, verdict = domain_state[domain]
                     outcome = {"status": status, "verdict": status, "reason": verdict, "summary": None,
                                "note": f"not checked: {reason}",
@@ -706,13 +735,15 @@ def run(options: dict) -> int:
                 summary = outcome["summary"] or {}
                 note = outcome["note"] or ""
                 now = datetime.now(timezone.utc)
-                stored = " -> ready to email" if status == "deliverable" else ""
+                stored = (" -> excluded (pattern)" if outcome.get("reason") == "excluded" else
+                          " -> waiting for an AI score (Score emails)" if status == "deliverable" and require_score
+                          else " -> ready to email" if status == "deliverable" else "")
                 print(f"  [{status}: {outcome['reason']}] <{address}>{' (not checked)' if not probed else ''}{stored} "
                       f"{note}".rstrip())
                 if not dry_run:
                     with transaction.atomic():
                         BusinessContact.objects.filter(pk=contact["id"]).update(**record_check(contact, address, outcome, now))
-                        upsert_prospect(prospect_values(contact, address, outcome, now, probed))
+                        upsert_prospect(prospect_values(contact, address, outcome, now, probed, require_score))
                     known[(contact["id"], address)] = status
                     stored_count += 1
                 else:
@@ -739,7 +770,8 @@ def run(options: dict) -> int:
         saved = "nothing saved (dry run)" if dry_run else f"{stored_count} saved to prospects"
         print(f"Done: {total} address(es) checked ("
               + (", ".join(f"{n} {st}" for st, n in sorted(counts.items())) if counts else "none")
-              + f"); {saved}; {deliverable_count} deliverable (ready to email)"
+              + f"); {saved}; {deliverable_count} deliverable "
+              + ("(waiting for an AI score: run Score emails)" if require_score else "(ready to email)")
               + (f"; {skipped} skipped (already checked)" if skipped else "") + ".")
         needs_review = counts.get("risky", 0) + counts.get("unknown", 0)
         if needs_review:

@@ -26,6 +26,10 @@ def docker_ok() -> bool:
 
 class VerifyCase:
     def setUp(self):
+        from pipeline.models import SendingSettings
+
+        # These test verification itself; the AI score gate after it is tested in test_email_scoring.
+        SendingSettings.objects.update_or_create(pk=1, defaults={"email_scoring_enabled": False})
         self.fake = FakeReacher()
         self.addCleanup(self.fake.close)
         campaign = make_campaign()

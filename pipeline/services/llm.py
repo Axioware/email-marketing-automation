@@ -47,10 +47,37 @@ def rejected_output(error: Exception) -> str | None:
     return output if isinstance(output, str) else ""
 
 
+REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")  # OpenAI reasoning models: default temperature only
+REASONING_HEADROOM = 6000  # tokens a reasoning model may spend thinking before it answers
+
+
+def is_reasoning_model(model: str) -> bool:
+    return model.split("/")[-1].lower().startswith(REASONING_PREFIXES)
+
+
+def tune(model: str, temperature: float, max_completion_tokens: int) -> dict:
+    """Sampling settings the model accepts. OpenAI's reasoning models (gpt-5, o-series) refuse any temperature but
+    the default and count their hidden reasoning against max_completion_tokens, so they get no temperature, low
+    reasoning effort and room to think; other models (e.g. gpt-oss on Groq) get both as asked."""
+    if is_reasoning_model(model):
+        return {"reasoning_effort": "low", "max_completion_tokens": max_completion_tokens + REASONING_HEADROOM}
+    return {"temperature": temperature, "max_completion_tokens": max_completion_tokens}
+
+
 def complete(client: OpenAI, deadline: float | None = None, timeout: float = DEFAULT_TIMEOUT, **request):
     """client.chat.completions.create(**request). With a deadline (the web app on Vercel) nothing runs past it: the
     SDK's own retries (which wait out rate limits for minutes) are off, each call may only use the time left, and a
     rate limit is waited out here only when there is time for it afterwards; otherwise OutOfTime."""
+    try:
+        return _create(client, deadline, timeout, request)
+    except BadRequestError as error:  # a model that refuses a sampling setting: once more without it
+        rejected = getattr(error, "param", None) or (getattr(error, "body", None) or {}).get("param")
+        if rejected not in ("temperature", "reasoning_effort") or rejected not in request:
+            raise
+        return _create(client, deadline, timeout, {k: v for k, v in request.items() if k != rejected})
+
+
+def _create(client: OpenAI, deadline: float | None, timeout: float, request: dict):
     if deadline is None:
         return client.chat.completions.create(timeout=timeout, **request)
     bounded = client.with_options(max_retries=0)

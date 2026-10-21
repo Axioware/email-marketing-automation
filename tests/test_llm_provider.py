@@ -166,3 +166,31 @@ class PromptSizeTests(unittest.TestCase):
 
         size = len(json.dumps(payload)) + len(QUALIFICATION_PROMPT) + len(research_business_websites.answer_format())
         self.assertLess(size / 3.5, 7000)  # tokens, with margin under Groq's 8,000 per minute
+
+
+class ModelSettingsTests(unittest.TestCase):
+    def test_reasoning_models_get_no_temperature_and_room_to_think(self):
+        for model in ("gpt-5-mini", "gpt-5.4-mini", "o4-mini"):
+            self.assertEqual(r.tune(model, 0.2, 2500), {"reasoning_effort": "low", "max_completion_tokens": 8500}, model)
+        for model in ("openai/gpt-oss-120b", "gpt-4.1-mini"):
+            self.assertEqual(r.tune(model, 0.2, 2500), {"temperature": 0.2, "max_completion_tokens": 2500}, model)
+
+    def test_a_refused_setting_is_dropped_once(self):
+        import httpx
+        from openai import BadRequestError
+
+        def refuse(**request):
+            if "temperature" in request:
+                raise BadRequestError("Unsupported value: 'temperature'", body={"param": "temperature"},
+                                      response=httpx.Response(400, request=httpx.Request("POST", "http://x")))
+            return "ok"
+
+        client = mock.Mock()
+        client.chat.completions.create.side_effect = refuse
+        self.assertEqual(r.complete(client, model="m", temperature=0.2, messages=[]), "ok")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        client.chat.completions.create.side_effect = BadRequestError(
+            "bad schema", body={"param": "response_format"},
+            response=httpx.Response(400, request=httpx.Request("POST", "http://x")))
+        with self.assertRaises(BadRequestError):  # anything else is not retried
+            r.complete(client, model="m", temperature=0.2, messages=[])

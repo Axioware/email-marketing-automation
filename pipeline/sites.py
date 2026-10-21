@@ -271,6 +271,11 @@ class PipelineAdminSite(admin.AdminSite):
         if (emails["queued"] and sending.configured() and jobs.active_run("send_emails") is None):
             steps.append((f"{emails['queued']} email(s) are queued but the sender is not running.", "Open the Outbox",
                           changelist("outboxemail", status="queued")))
+        waiting_score = Prospect.objects.filter(outreach_status="pending", email_scored_at__isnull=True,
+                                                do_not_contact=False).exclude(email_status__isnull=True).count()
+        if waiting_score:
+            steps.append((f"{waiting_score} verified address(es) wait for an AI score before they can be emailed.",
+                          "Score emails", run_url("score_emails")))
         if prospect_reviews:
             steps.append((f"{prospect_reviews} prospect address(es) could not be verified: approve or reject them.",
                           "Review prospects", changelist("prospect", outreach_status__exact="needs_review")))

@@ -134,6 +134,8 @@ It reads the business's own team and about pages first, then searches the web th
 
 ### Step 5: Verify emails
 
+> **Then score them (Step 5b).** Addresses matching your **excluded patterns** (Settings > Email scoring, e.g. `info@*`, `business@*`) are dropped without being checked. Verified addresses then wait for an AI score: tick the businesses (or prospects) and choose **Score emails with the AI**, or click **Score emails** on the dashboard. The AI reads each address with its contact and business and gives a score (0-100) and a reason, shown in the **AI score** column on Prospects (hover for the reason). Addresses scoring at least the **minimum email score** become ready to email; the rest wait in **Needs review**, where you can still approve them by hand. Edit the patterns, the AI's instructions and the minimum on the **Settings** page; to score again after changing the instructions, select the prospects and run **Score emails with the AI** again.
+
 1. Sidebar > **Businesses** (or **Contacts**), tick the rows.
 2. Action **Verify contact emails (Module 4)** > **Go** > **Start run**.
 

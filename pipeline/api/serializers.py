@@ -189,6 +189,7 @@ class ProspectSerializer(serializers.ModelSerializer):
         model = Prospect
         fields = "__all__"
         read_only_fields = ["email_sequence", "pipeline_stage", "stage_changed_at", "sequence_stopped_at",
+                            "email_score", "email_score_reason", "email_scored_at",
                             "sequence_stop_reason",
                             "email_verification_provider", "email_verified_at", "verdict", "verification_note",
                             "verification_details", "last_contacted_at", "created_at", "updated_at"]
@@ -326,14 +327,16 @@ class SendingSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = SendingSettings
         fields = ["daily_cap", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds",
-                  "reply_window_days", "contact_provider", "footer_text", "updated_at"]
+                  "reply_window_days", "contact_provider", "excluded_email_patterns", "email_scoring_enabled",
+                  "email_min_score", "email_scoring_prompt", "footer_text", "updated_at"]
         read_only_fields = ["updated_at"]
 
     def validate(self, attrs):
         settings_row = SendingSettings(**{field: getattr(self.instance, field) for field in
                                           ("daily_cap", "gap_fixed_seconds", "gap_random_min_seconds",
                                            "gap_random_max_seconds", "reply_window_days", "contact_provider",
-                                           "footer_text")})
+                                           "excluded_email_patterns", "email_scoring_enabled", "email_min_score",
+                                           "email_scoring_prompt", "footer_text")})
         for field, value in attrs.items():
             setattr(settings_row, field, value)
         try:

@@ -271,6 +271,55 @@ class DiscoveryCampaign(models.Model):
             raise ValidationError(errors)
 
 
+# Generic addresses that are never emailed: matching addresses are disqualified before they are even verified.
+DEFAULT_EXCLUDED_EMAIL_PATTERNS = """info@*
+business@*
+contact@*
+contactus@*
+hello@*
+hi@*
+office@*
+admin@*
+support@*
+help@*
+sales@*
+marketing@*
+reception@*
+frontdesk@*
+appointments@*
+appointment@*
+booking@*
+bookings@*
+enquiries@*
+enquiry@*
+inquiries@*
+inquiry@*
+care@*
+customercare@*
+feedback@*
+careers@*
+jobs@*
+hr@*
+billing@*
+accounts@*
+noreply@*
+no-reply@*
+donotreply@*
+webmaster@*"""
+
+DEFAULT_EMAIL_SCORING_PROMPT = """You check whether an email address is the right one for a cold outreach email to the person who decides at this business (the owner, principal or manager).
+
+You get the address, how it was verified, the contact it belongs to (name, job title, how they were found) and the business (name, category, city, website, rating, why it qualified), plus the business's other addresses.
+
+Score 0-100:
+- 90-100: the address clearly belongs to the decision maker (owner, founder, principal, practice or clinic manager) and verification confirmed it.
+- 70-89: very likely the decision maker's own address.
+- 40-69: uncertain: the role is unclear, the name does not match the address, verification was risky or unknown, or it looks shared.
+- 0-39: the wrong person or a poor address: a junior employee, an unrelated department, another business, or a generic or shared inbox.
+
+Judge only from what you are given; never invent facts. Give a short reasoning a person can check (one or two sentences)."""
+
+
 # Under every email (CAN-SPAM / GDPR): the sender, a postal address and an easy way to opt out.
 DEFAULT_FOOTER_TEXT = """Axioware - AI-powered software solutions
 Karachi, Pakistan | axioware.tech | business@axioware.tech
@@ -297,6 +346,22 @@ class SendingSettings(models.Model):
         default=ContactProvider.BUILTIN, db_default=ContactProvider.BUILTIN,
         help_text="How Find decision makers and Verify emails work. Hunter uses HUNTER_API_KEY and its credits (a "
                   "domain search per business, a verification per address).")
+    excluded_email_patterns = models.TextField(
+        default=DEFAULT_EXCLUDED_EMAIL_PATTERNS, db_default=DEFAULT_EXCLUDED_EMAIL_PATTERNS, blank=True,
+        help_text="One pattern per line; * matches anything (e.g. info@*, *@gmail.com). Matching addresses are "
+                  "disqualified: never verified, never emailed.")
+    email_scoring_enabled = models.BooleanField(
+        "require an AI score", default=True, db_default=True,
+        help_text="On: a verified address waits until Score emails gives it a score, and only a score at or above "
+                  "the minimum makes it ready to email. Off: verified addresses are ready at once.")
+    email_min_score = models.PositiveSmallIntegerField(
+        "minimum email score", default=60, db_default=60,
+        help_text="Addresses scoring at least this (0-100) become ready to email; lower ones wait in Needs review "
+                  "with the AI's reasoning.")
+    email_scoring_prompt = models.TextField(
+        default=DEFAULT_EMAIL_SCORING_PROMPT, db_default=DEFAULT_EMAIL_SCORING_PROMPT,
+        help_text="The AI's instructions for scoring an address. It gets the address, its verification, the contact "
+                  "and the business, and must answer a score (0-100) and a short reasoning.")
     reply_window_days = models.PositiveIntegerField(
         default=3, db_default=3, help_text="Days to wait for a reply after a sequence's last email before the lead moves "
                                            "to Quota Exhausted on the Pipeline page.")
@@ -334,6 +399,10 @@ class SendingSettings(models.Model):
             raise ValidationError({"gap_random_max_seconds": "Must be at least the minimum random gap."})
         if self.daily_cap is not None and self.daily_cap < 1:
             raise ValidationError({"daily_cap": "At least one email a day."})
+        if self.email_min_score is not None and self.email_min_score > 100:
+            raise ValidationError({"email_min_score": "Between 0 and 100."})
+        if self.email_scoring_enabled and not (self.email_scoring_prompt or "").strip():
+            raise ValidationError({"email_scoring_prompt": "Write the AI's instructions, or turn scoring off."})
         if not (self.footer_text or "").strip():
             raise ValidationError({"footer_text": "Every email needs a footer: who you are, an address and how to "
                                                   "opt out."})
@@ -547,10 +616,11 @@ class Prospect(models.Model):
         TEMPORARY_FAILURE = "temporary_failure", "Temporary failure (greylisting)"
         CHECK_FAILED = "check_failed", "Check failed"
         WEBMAIL = "webmail", "Webmail address (cannot be verified)"
+        EXCLUDED = "excluded", "Excluded by a pattern (Settings)"
         UNKNOWN = "unknown", "Unknown"
 
     class OutreachStatus(models.TextChoices):
-        PENDING = "pending", "Pending"
+        PENDING = "pending", "Pending (waiting for an AI score)"
         READY = "ready", "Ready"
         NEEDS_REVIEW = "needs_review", "Needs review"
         REJECTED = "rejected", "Rejected"
@@ -576,6 +646,11 @@ class Prospect(models.Model):
         verbose_name="email sequence",
         help_text="The sequence this prospect gets (A/B group), set when its first email is written; its follow-ups "
                   "come from it.")
+    email_score = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="The AI's score for this address (Score emails): how likely it reaches the "
+                                         "decision maker, 0-100.")
+    email_score_reason = models.TextField(null=True, blank=True, help_text="Why the AI gave that score.")
+    email_scored_at = models.DateTimeField(null=True, blank=True)
     approved_by_person = models.BooleanField(
         default=False, db_default=False, help_text="A person approved emailing this address although verification did not confirm it.")
     pipeline_stage = models.CharField(

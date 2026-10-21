@@ -85,7 +85,9 @@ class AdminPagesTests(AdminCase):
         self.assertNotIn("Delete", page)
         saved = self.client.post(url, {"daily_cap": "25", "gap_fixed_seconds": "60", "gap_random_min_seconds": "10",
                                        "gap_random_max_seconds": "20", "reply_window_days": "5",
-                                       "contact_provider": "builtin",
+                                       "contact_provider": "builtin", "email_scoring_enabled": "on",
+                                       "email_min_score": "60", "email_scoring_prompt": "Score it.",
+                                       "excluded_email_patterns": "info@*",
                                        "footer_text": "Acme\r\nReply STOP to opt out."},
                                 follow=True)
         self.assertContains(saved, "Settings saved.")
@@ -273,7 +275,8 @@ class EmailReviewTests(AdminCase):
         self.assertIn("If you would rather not hear from us", page)  # the default
         form = {"daily_cap": "40", "gap_fixed_seconds": "120", "gap_random_min_seconds": "180",
                 "gap_random_max_seconds": "300", "reply_window_days": "3",
-                "contact_provider": "builtin"}
+                "contact_provider": "builtin", "email_scoring_enabled": "on", "email_min_score": "60",
+                "email_scoring_prompt": "Score it.", "excluded_email_patterns": "info@*"}
         self.assertContains(self.client.post(url, {**form, "footer_text": "   "}), "This field is required")
         self.assertEqual(SendingSettings.current().footer_text, g.DEFAULT_FOOTER_TEXT)  # nothing saved
         response = self.client.post(url, {**form, "footer_text": "Acme Clinics\r\n1 Main St\r\nReply STOP to opt out."})

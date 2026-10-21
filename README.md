@@ -237,6 +237,8 @@ Options: `--business-id ID` (repeatable), `--redo` (reprocess and replace this m
 
 ## Verify contact emails and build prospects (Module 4)
 
+> **Excluded patterns and the AI email score (Module 4b).** On the **Settings** page (Email scoring): **excluded patterns** (one per line, `*` = anything, e.g. `info@*`, `business@*`, `*@gmail.com`) disqualify matching addresses: verification does not check them (no Reacher time, no Hunter credit) and stores them Rejected (verdict `excluded`). With **Require an AI score** on (default), a deliverable address then waits as `pending` until **Score emails** (`python manage.py score_emails`; Prospects or Businesses > action **Score emails with the AI**) sends it to the AI with the contact and the business, using the **scoring prompt** from Settings. The AI answers a score (0-100) and a reasoning (`prospects.email_score`, `email_score_reason`, shown on Prospects): a deliverable address at or above the **minimum email score** becomes `ready`; a lower score, or a risky/unknown address, goes to `needs_review` with the reasoning. Scored addresses are not sent again unless `--rescore` (e.g. after changing the prompt); a pattern added later also disqualifies addresses verified before. Addresses a person approved are left alone. Turn the requirement off and deliverable addresses are ready right after verification, as before.
+
 One command, `python manage.py verify_emails` (admin: select businesses or contacts, action **Verify ... emails**):
 
 1. You run it.
