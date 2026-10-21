@@ -1676,7 +1676,8 @@ class SendingSettingsAdmin(admin.ModelAdmin):
                            "domain search for the people at the business's domain, and Verify emails checks each "
                            "address with Hunter's verifier (HUNTER_API_KEY in .env; uses Hunter credits)."}),
         ("Email scoring (Score emails)", {
-            "fields": ["email_scoring_enabled", "email_min_score", "excluded_email_patterns", "email_scoring_prompt"],
+            "fields": ["email_scoring_enabled", "email_min_score", "email_scoring_model", "excluded_email_patterns",
+                       "email_scoring_prompt"],
             "description": "After verification: an address matching an excluded pattern is disqualified (never "
                            "verified or emailed). Score emails then asks the AI to score every other verified "
                            "address with this prompt (0-100, with a reasoning): a deliverable address at or above the "

@@ -107,6 +107,15 @@ class ScoreEmailsTests(ScoringCase):
         self.assertEqual(sent["contact"]["job_title"], "Owner & Principal Dentist")
         self.assertIn("Done: 1 ready to email, 2 need review", result.stdout)
 
+    def test_scoring_uses_its_own_model_from_settings(self):
+        SendingSettings.objects.filter(pk=1).update(email_scoring_model="gpt-5-nano")
+        result = self.score({"owner": 92, "bilal": 35, "manager": 88})
+        self.assertIn("with openai model gpt-5-nano", result.stdout)
+        self.assertEqual({request["model"] for request in self.ai.requests}, {"gpt-5-nano"})
+        SendingSettings.objects.filter(pk=1).update(email_scoring_model="")
+        self.score({"owner": 92, "bilal": 35, "manager": 88}, "--rescore")
+        self.assertEqual({request["model"] for request in self.ai.requests}, {"gpt-5-mini"})  # research's model
+
     def test_scored_ones_are_not_paid_for_again_unless_rescored(self):
         self.score({"owner": 92, "bilal": 35, "manager": 88})
         self.assertIn("no address waits for a score", self.score({}).stdout)

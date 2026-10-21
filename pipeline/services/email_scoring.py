@@ -171,6 +171,7 @@ def run(options: dict) -> int:
         if llm is None:
             raise CommandError("Set GROQ_API_KEY (or GROK_API_KEY) or OPENAI_API_KEY to score emails.")
         client, model, provider = llm
+        model = settings_row.email_scoring_model.strip() or model  # its own model (Settings), else research's
         minimum = settings_row.email_min_score
         print(f"Scoring {len(queue)} address(es) with {provider} model {model}; ready to email at {minimum}+.")
         counts = {"ready": 0, "needs_review": 0, "failed": 0}

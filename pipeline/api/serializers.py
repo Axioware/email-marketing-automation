@@ -328,7 +328,7 @@ class SendingSettingsSerializer(serializers.ModelSerializer):
         model = SendingSettings
         fields = ["daily_cap", "gap_fixed_seconds", "gap_random_min_seconds", "gap_random_max_seconds",
                   "reply_window_days", "contact_provider", "excluded_email_patterns", "email_scoring_enabled",
-                  "email_min_score", "email_scoring_prompt", "footer_text", "updated_at"]
+                  "email_min_score", "email_scoring_model", "email_scoring_prompt", "footer_text", "updated_at"]
         read_only_fields = ["updated_at"]
 
     def validate(self, attrs):
@@ -336,7 +336,7 @@ class SendingSettingsSerializer(serializers.ModelSerializer):
                                           ("daily_cap", "gap_fixed_seconds", "gap_random_min_seconds",
                                            "gap_random_max_seconds", "reply_window_days", "contact_provider",
                                            "excluded_email_patterns", "email_scoring_enabled", "email_min_score",
-                                           "email_scoring_prompt", "footer_text")})
+                                           "email_scoring_model", "email_scoring_prompt", "footer_text")})
         for field, value in attrs.items():
             setattr(settings_row, field, value)
         try:

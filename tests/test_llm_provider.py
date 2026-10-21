@@ -170,7 +170,7 @@ class PromptSizeTests(unittest.TestCase):
 
 class ModelSettingsTests(unittest.TestCase):
     def test_reasoning_models_get_no_temperature_and_room_to_think(self):
-        for model in ("gpt-5-mini", "gpt-5.4-mini", "o4-mini"):
+        for model in ("gpt-5-mini", "gpt-5.4-mini", "gpt-5.6-luna", "gpt-6-luna", "o4-mini"):
             self.assertEqual(r.tune(model, 0.2, 2500), {"reasoning_effort": "low", "max_completion_tokens": 8500}, model)
         for model in ("openai/gpt-oss-120b", "gpt-4.1-mini"):
             self.assertEqual(r.tune(model, 0.2, 2500), {"temperature": 0.2, "max_completion_tokens": 2500}, model)

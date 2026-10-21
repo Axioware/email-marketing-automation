@@ -358,6 +358,10 @@ class SendingSettings(models.Model):
         "minimum email score", default=60, db_default=60,
         help_text="Addresses scoring at least this (0-100) become ready to email; lower ones wait in Needs review "
                   "with the AI's reasoning.")
+    email_scoring_model = models.CharField(
+        "AI model for email scoring", max_length=100, blank=True, default="", db_default="",
+        help_text="The model Score emails uses, e.g. gpt-5-nano (a model of the provider in .env: OpenAI, or Groq "
+                  "when its key is set). Empty: the same model as website research.")
     email_scoring_prompt = models.TextField(
         default=DEFAULT_EMAIL_SCORING_PROMPT, db_default=DEFAULT_EMAIL_SCORING_PROMPT,
         help_text="The AI's instructions for scoring an address. It gets the address, its verification, the contact "

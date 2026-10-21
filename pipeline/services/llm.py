@@ -47,7 +47,7 @@ def rejected_output(error: Exception) -> str | None:
     return output if isinstance(output, str) else ""
 
 
-REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")  # OpenAI reasoning models: default temperature only
+REASONING_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")  # OpenAI reasoning models: default temperature only
 REASONING_HEADROOM = 6000  # tokens a reasoning model may spend thinking before it answers
 
 
