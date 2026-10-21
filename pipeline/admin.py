@@ -1651,6 +1651,13 @@ class SendingSettingsAdmin(admin.ModelAdmin):
                            "Queued emails are sent from your mailbox then (Outbox). Changes apply to emails approved "
                            "from now on. After a sequence's last email, a lead with no reply moves to Quota Exhausted "
                            "once the reply window has passed."}),
+        ("Finding and verifying contacts", {
+            "fields": ["contact_provider"],
+            "description": "Websites + web search, verified by Reacher: Find decision makers reads the business's "
+                           "website and searches the web (SearXNG), guesses addresses, and Verify emails checks them "
+                           "with Reacher (free; needs outbound port 25). Hunter: Find decision makers asks Hunter's "
+                           "domain search for the people at the business's domain, and Verify emails checks each "
+                           "address with Hunter's verifier (HUNTER_API_KEY in .env; uses Hunter credits)."}),
         ("Email footer", {
             "fields": ["footer_text"],
             "description": "Added under every email (text and HTML), after your template's sign-off: who you are, an "

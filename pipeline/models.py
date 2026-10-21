@@ -288,6 +288,15 @@ class SendingSettings(models.Model):
     gap_random_min_seconds = models.PositiveIntegerField(default=180, help_text="Plus a random gap of at least this many "
                                                                                "seconds...")
     gap_random_max_seconds = models.PositiveIntegerField(default=300, help_text="...and at most this many seconds.")
+    class ContactProvider(models.TextChoices):
+        BUILTIN = "builtin", "Websites + web search, verified by Reacher"
+        HUNTER = "hunter", "Hunter (domain search and email verifier)"
+
+    contact_provider = models.CharField(
+        "find and verify contacts with", max_length=16, choices=ContactProvider.choices,
+        default=ContactProvider.BUILTIN, db_default=ContactProvider.BUILTIN,
+        help_text="How Find decision makers and Verify emails work. Hunter uses HUNTER_API_KEY and its credits (a "
+                  "domain search per business, a verification per address).")
     reply_window_days = models.PositiveIntegerField(
         default=3, db_default=3, help_text="Days to wait for a reply after a sequence's last email before the lead moves "
                                            "to Quota Exhausted on the Pipeline page.")
@@ -537,6 +546,7 @@ class Prospect(models.Model):
         BLOCKED = "blocked", "Mail server refused the check"
         TEMPORARY_FAILURE = "temporary_failure", "Temporary failure (greylisting)"
         CHECK_FAILED = "check_failed", "Check failed"
+        WEBMAIL = "webmail", "Webmail address (cannot be verified)"
         UNKNOWN = "unknown", "Unknown"
 
     class OutreachStatus(models.TextChoices):
@@ -554,7 +564,8 @@ class Prospect(models.Model):
     verdict = models.CharField(max_length=32, choices=Verdict.choices, null=True, blank=True, db_index=True,
                                help_text="Why verification gave this status, e.g. catch_all or mailbox_not_found.")
     verification_note = models.TextField(null=True, blank=True)
-    verification_details = models.JSONField(null=True, blank=True, help_text="Reacher's findings for this address.")
+    verification_details = models.JSONField(null=True, blank=True,
+                                            help_text="The verifier's findings for this address (Reacher or Hunter).")
     email_verification_provider = models.CharField(max_length=64, null=True, blank=True)
     email_verified_at = models.DateTimeField(null=True, blank=True)
     qualification_score = models.IntegerField(null=True, blank=True)

@@ -511,7 +511,7 @@ def prospect_values(contact: dict, address: str, outcome: dict, now: datetime, p
         "verdict": outcome.get("reason") or "unknown",
         "verification_note": outcome.get("note") or None,
         "verification_details": {**(outcome.get("summary") or {}), "probed": probed},
-        "email_verification_provider": PROVIDER,
+        "email_verification_provider": outcome.get("provider", PROVIDER),
         "email_verified_at": now,
         "qualification_score": contact["qualification_score"],
         "outreach_status": OUTREACH_STATUS[status],
@@ -605,9 +605,22 @@ def run(options: dict) -> int:
         raise CommandError("--delay and --max-candidates cannot be negative and --reacher-timeout must be > 0")
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
-    client = prepare_reacher(options)
-    if client is None:
-        return 1
+    from pipeline.models import SendingSettings
+    from pipeline.services import hunter
+
+    use_hunter = SendingSettings.current().contact_provider == SendingSettings.ContactProvider.HUNTER
+    if use_hunter:
+        if not hunter.configured():
+            raise CommandError("Settings say to verify with Hunter, but HUNTER_API_KEY is not set in .env.")
+        client = None
+        if not options["max_candidates"]:
+            options = {**options, "max_candidates": 1}  # each check costs a Hunter credit
+        print(f"Verifying with Hunter (one credit per address; up to {options['max_candidates']} address(es) per "
+              "contact, --max-candidates to change). No email is sent.")
+    else:
+        client = prepare_reacher(options)
+        if client is None:
+            return 1
 
     dry_run = options["dry_run"]
     try:
@@ -618,9 +631,14 @@ def run(options: dict) -> int:
             return 0
 
         print(f"Checking candidate emails for {len(queue)} contact(s).")
+        hunter_done = set()  # Hunter answered these already: asking again costs a credit for the same answer
+        if use_hunter and not options["recheck"]:
+            hunter_done = set(Prospect.objects.filter(contact_id__in=[c["id"] for c in queue],
+                                                      email_verification_provider=hunter.PROVIDER)
+                              .exclude(verdict="check_failed").values_list("contact_id", "email"))
         last_call: dict[str, float] = {}
         domain_state: dict[str, tuple[str, str, str]] = {}
-        if not (options["recheck"] or options["probe_all"]):
+        if not (options["recheck"] or options["probe_all"] or use_hunter):  # Hunter can still say valid there
             known_catch_all = known_catch_all_domains()
             domain_state.update({domain: CATCH_ALL_FROM_EARLIER for domain in known_catch_all})
             if known_catch_all:
@@ -644,16 +662,29 @@ def run(options: dict) -> int:
                     out_of_time, left = True, len(queue) - position
                     break
                 prospect_status = known.get((contact["id"], address))
-                if not options["recheck"] and (already_decided(prospect_status) or
-                                               (options.get("deadline") is not None and prospect_status == "unknown")):
+                if not options["recheck"] and (already_decided(prospect_status) or (contact["id"], address) in hunter_done
+                                               or (options.get("deadline") is not None and prospect_status == "unknown")):
                     skipped += 1
                     continue
                 domain = address.rpartition("@")[2].casefold()
                 if domain in domain_state and not options["probe_all"]:
                     status, reason, verdict = domain_state[domain]
                     outcome = {"status": status, "verdict": status, "reason": verdict, "summary": None,
-                               "note": f"not checked: {reason}"}
+                               "note": f"not checked: {reason}",
+                               "provider": hunter.PROVIDER if use_hunter else PROVIDER}
                     probed = False
+                elif use_hunter:
+                    try:
+                        outcome = hunter.outcome(address, hunter.verify(address))
+                    except hunter.HunterStopped as error:
+                        print(f"{error}. Stopping; results so far are saved.")
+                        aborted = True
+                        break
+                    except hunter.HunterError as error:
+                        outcome = {"address": address, "status": "unknown", "verdict": "unknown",
+                                   "reason": "check_failed", "summary": {}, "note": str(error), "retryable": True,
+                                   "provider": hunter.PROVIDER}
+                    probed = True  # no domain shortcut: on a catch-all domain Hunter can still say valid
                 else:
                     try:
                         outcome = check_address(address, client, options["delay"], last_call)

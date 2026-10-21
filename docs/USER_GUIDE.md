@@ -123,6 +123,8 @@ Businesses you select are researched even if they were researched before (the ne
 
 ### Step 4: Find decision makers
 
+> **Using Hunter instead?** Sidebar > **Settings** > **Find and verify contacts with** > **Hunter**. Then this step asks Hunter for the people at each business's website domain and keeps the best roles (owner first), and Step 5 checks their addresses with Hunter. It needs `HUNTER_API_KEY` in `.env` and uses Hunter credits: one search per business, one check per address. Everything else (prospects, review, writing emails) works the same.
+
 1. Sidebar > **Businesses**, tick the businesses (only qualified ones are processed: a score of at least their campaign's minimum, or approved by you; rejected ones never).
 2. Action **Find decision makers (Module 3)** > **Go** > **Start run**.
 

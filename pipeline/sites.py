@@ -300,9 +300,16 @@ class PipelineAdminSite(admin.AdminSite):
         if make_llm_client() is None:
             warnings.append("No AI key: set GROQ_API_KEY or OPENAI_API_KEY (needed to research websites; emails are "
                             "written from templates).")
-        if not os.environ.get("VERIFY_HELO"):
+        from pipeline.models import SendingSettings
+        from pipeline.services import hunter
+
+        uses_hunter = SendingSettings.current().contact_provider == SendingSettings.ContactProvider.HUNTER
+        if uses_hunter and not hunter.configured():
+            warnings.append("Settings say to find and verify contacts with Hunter, but HUNTER_API_KEY is not set in "
+                            ".env.")
+        elif not uses_hunter and not os.environ.get("VERIFY_HELO"):
             warnings.append("VERIFY_HELO is not set in .env, so email verification cannot run.")
-        if not os.environ.get("SEARXNG_URL"):
+        if not uses_hunter and not os.environ.get("SEARXNG_URL"):
             warnings.append("SEARXNG_URL is not set: finding decision makers only reads the businesses' websites, "
                             "with no web search.")
         if not sending.configured():

@@ -19,8 +19,8 @@ from django.db import DatabaseError, transaction
 from django.db.models import F, Q
 
 from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
-from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile
-from pipeline.services import qualify, searxng
+from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile, SendingSettings
+from pipeline.services import hunter, qualify, searxng
 from pipeline.services.research import JINA_TIMEOUT, JinaReader, ResearchError, is_public_http_url
 
 DEFAULT_ROLES_FILE = Path(settings.BASE_DIR) / "config" / "target_roles_dental.json"
@@ -35,7 +35,9 @@ MAX_SEARCH_RESULTS = 10  # results read per search, best first
 BUSINESS_RESERVE_SECONDS = 60
 PAGE_RESERVE_SECONDS = 40
 SEARCH_RESERVE_SECONDS = 25
-OWN_EMAIL_SOURCES = ("website", "search", "inferred", "pattern")  # rows this module may replace
+OWN_EMAIL_SOURCES = ("website", "search", "inferred", "pattern", "hunter")  # rows this module may replace
+HUNTER_EMAILS_PER_SEARCH = 10  # Hunter charges a credit per 10 emails a domain search returns
+SENIORITY_ORDER = {"executive": 0, "senior": 1}
 
 HONORIFICS = {"dr", "mr", "mrs", "ms", "miss", "prof", "sir", "mx", "eng", "engr"}
 CREDENTIALS = {
@@ -902,6 +904,108 @@ def collect_site_evidence(business: dict, evidence: Evidence, roles: RoleConfig)
         evidence.add_linkedin(link.get("url", "") for link in page.get("links") or [])
 
 
+# ---------------------------------------------------------------- Hunter (Settings: find contacts with Hunter)
+
+
+def hunter_contacts(business: dict, data: dict, roles: RoleConfig) -> list[dict]:
+    """The people Hunter's domain search found, as contact rows: target roles first (the roles file's order), then
+    other people by seniority and Hunter's confidence; generic addresses (info@...) only when no person was found.
+    Excluded roles (receptionist, assistant...) are left out."""
+    people = []
+    for item in data.get("emails") or []:
+        address = (item.get("value") or "").strip()
+        if "@" not in address:
+            continue
+        first, last = (item.get("first_name") or "").strip(), (item.get("last_name") or "").strip()
+        name = " ".join(part for part in (first, last) if part)
+        position = " ".join((item.get("position") or "").split())
+        role = roles.classify(position) if position else None
+        if role and role["kind"] == "excluded":
+            continue
+        generic = item.get("type") == "generic" or not name
+        if role:
+            kind, rank = role["kind"], role["rank"]
+        elif generic:
+            kind, rank = "generic", 200
+        else:
+            kind, rank = "other", 100 + SENIORITY_ORDER.get(item.get("seniority"), 2)
+        confidence = round(min(max(item.get("confidence") or 0, 0), 100) / 100, 3)
+        sources = [source.get("uri") for source in item.get("sources") or [] if source.get("uri")]
+        people.append({
+            "business_id": business["id"],
+            "name": name or address,
+            "first_name": first or None,
+            "last_name": last or None,
+            "job_title": position or (role["role_name"] if role else ("General address" if generic else None)),
+            "role_type": role["role_type"] if role else ("generic" if generic else "other"),
+            "email": address,
+            "email_source": "hunter",
+            "email_status": "unverified",
+            "linkedin_url": item.get("linkedin") or None,
+            "source_urls": sources[:10],
+            "confidence": confidence,
+            "candidate_emails": [],
+            "_rank": (rank, -confidence),
+            "_kind": kind,
+            "_why": (f"found by Hunter's domain search ({round(confidence * 100)}% confidence, "
+                     f"{len(sources)} public source(s))"),
+        })
+    people.sort(key=lambda row: row["_rank"])
+    personal = [row for row in people if row["_kind"] != "generic"]
+    chosen = (personal or people)[:MAX_CONTACTS_PER_BUSINESS]
+    for index, row in enumerate(chosen):
+        row["is_primary"] = index == 0
+        label = {"target": "highest-ranked role found", "fallback": "no target role, best fallback role",
+                 "other": "no matching role, most senior person", "generic": "no person, a general address"}[row["_kind"]]
+        row["discovery_reasoning"] = (f"{'Primary' if index == 0 else 'Secondary'} contact ({label}): {row['_why']}."
+                                      )[:4000]
+        for private in ("_rank", "_kind", "_why"):
+            del row[private]
+    return chosen
+
+
+def run_hunter(options: dict, queue: list[dict], roles: RoleConfig) -> int:
+    """Find decision makers with Hunter's domain search (one search per business)."""
+    print(f"Finding decision makers with Hunter for {len(queue)} business(es) (one domain search each; uses Hunter "
+          "credits).")
+    stored = empty = deferred = 0
+    for position, business in enumerate(queue):
+        if out_of_time(options, BUSINESS_RESERVE_SECONDS):
+            time_limit_note(len(queue) - position, "business(es)")
+            break
+        domains = collect_domains(business)
+        print(f"Business {business['id']}: {business['name']}", flush=True)
+        target = f"domain {domains[0]}" if domains else f"company \"{search_name(business['name'])}\""
+        try:
+            data = hunter.domain_search(domain=domains[0] if domains else None,
+                                        company=None if domains else search_name(business["name"]),
+                                        limit=HUNTER_EMAILS_PER_SEARCH)
+        except hunter.HunterStopped as error:
+            print(f"  {error}. Stopping; businesses done so far are saved.")
+            return 1
+        except hunter.HunterError as error:
+            deferred += 1
+            print(f"  Hunter search for {target} failed ({error}); leaving this business for a later run.")
+            continue
+        rows = hunter_contacts(business, data, roles)
+        print(f"  Hunter ({target}): {len(data.get('emails') or [])} email(s)"
+              + (f", pattern {data['pattern']}" if data.get("pattern") else "") + ".")
+        for row in rows:
+            marker = "*" if row["is_primary"] else " "
+            print(f"  {marker} {row['name']} | {row['job_title']} | {row['email']} (hunter) | conf {row['confidence']}")
+        if not rows:
+            print("  No decision maker found.")
+        if options["dry_run"]:
+            continue
+        save_contacts(business["id"], rows)
+        if rows:
+            stored += 1
+        else:
+            empty += 1
+    print(f"Done: {stored} with contacts, {empty} with none found, {deferred} deferred.")
+    return 1 if deferred else 0
+
+
 def add_arguments(parser) -> None:
     parser.add_argument("--min-score", type=int,
                         help="Minimum qualification score (default: each campaign's minimum score). Businesses a "
@@ -930,8 +1034,11 @@ def run(options: dict) -> int:
     except (OSError, ValueError, KeyError) as error:
         raise CommandError(f"Cannot read the roles file {options['roles_file']}: {error}") from error
 
+    use_hunter = SendingSettings.current().contact_provider == SendingSettings.ContactProvider.HUNTER
+    if use_hunter and not hunter.configured():
+        raise CommandError("Settings say to find contacts with Hunter, but HUNTER_API_KEY is not set in .env.")
     search = not options["no_search"] and options["max_searches"] > 0
-    if search and not searxng.configured():
+    if search and not use_hunter and not searxng.configured():
         print("SEARXNG_URL is not set, so there is no web search; only the website is used.")
         search = False
     reader = JinaReader(max_wait=20 if options.get("deadline") is not None else None)
@@ -941,6 +1048,8 @@ def run(options: dict) -> int:
             print("No qualified businesses need contact discovery (use --redo to reprocess finished ones).")
             return 0
 
+        if use_hunter:
+            return run_hunter(options, queue, roles)
         threshold = options["min_score"] if options["min_score"] is not None else "the campaign's minimum"
         print(f"Discovering contacts for {len(queue)} businesses (score >= {threshold}, or approved by a person).")
         stored = empty = deferred = searches_used = 0
