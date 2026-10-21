@@ -145,6 +145,8 @@ def queue(emails) -> str:
 
     result = outreach.queue(emails)
     message = f"{result['queued']} email(s) queued."
+    if result["already"]:
+        message += f" {result['already']} were already queued."
     if result["skipped"]:
         message += " Skipped: " + "; ".join(f"#{pk} ({why})" for pk, why in result["skipped"][:10])
         message += "." if len(result["skipped"]) <= 10 else f" and {len(result['skipped']) - 10} more."

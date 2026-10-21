@@ -4,9 +4,9 @@
    gap, inside the campaign's send window and the daily cap (Settings); a follow-up never before "previous email sent
    + its days". The time is stored on the email (`emails.scheduled_at`); the email stays Approved.
 2. Queue (`queue`, the Outbox page): a person picks approved emails and queues them; only queued emails are sent. An
-   email whose time already passed gets a fresh slot first, so a late queue never sends a burst. Queueing starts the
-   sender (a background run) if it is not running; it sends each queued email at its time and stops when the queue
-   is empty. Nothing runs on a timer.
+   email whose time has already passed is sent right away. Queueing emails that are still queued (e.g. after the app
+   crashed) only makes sure the sender runs. Queueing starts the sender (a background run) if it is not running; it
+   sends each queued email at its time and stops when the queue is empty. Nothing runs on a timer.
 3. Sent (`record_sent`): the email is marked sent, the lead moves on the pipeline (Initial Email / Follow-up) and the
    next follow-up is written for review right away; approving and queueing it sends it the same way.
 4. Stop (`stop_prospect`): moving a lead to Replied, Demo Booked, Demo Done, Won, Lost or Quota Exhausted (Pipeline
@@ -138,11 +138,14 @@ def can_be_sent(email: Email) -> str | None:
 
 
 def queue(emails) -> dict:
-    """Queue approved (or failed) emails for sending, in send-time order. An email whose time has passed gets a fresh
-    slot first. Returns {"queued": n, "skipped": [(email id, reason), ...]}."""
-    result = {"queued": 0, "skipped": []}
+    """Queue approved (or failed) emails for sending, in send-time order; one whose time has passed is sent right away.
+    Returns {"queued": n, "already": n (still queued, e.g. after a crash), "skipped": [(email id, reason), ...]}."""
+    result = {"queued": 0, "already": 0, "skipped": []}
     for email in (Email.objects.filter(pk__in=[e.pk for e in emails])
                   .select_related("prospect", "business__discovery_campaign").order_by("scheduled_at", "id")):
+        if email.status in WAITING:
+            result["already"] += 1
+            continue
         if email.status not in QUEUEABLE:
             result["skipped"].append((email.pk, f"it is {email.get_status_display().lower()}"))
             continue
@@ -151,7 +154,7 @@ def queue(emails) -> dict:
             result["skipped"].append((email.pk, reason))
             continue
         try:
-            if email.scheduled_at is None or email.scheduled_at < now():
+            if email.scheduled_at is None:
                 schedule(email, statuses=QUEUEABLE)
         except OutreachError as error:
             result["skipped"].append((email.pk, str(error)))

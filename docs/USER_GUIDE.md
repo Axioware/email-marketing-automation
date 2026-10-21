@@ -225,11 +225,11 @@ Emails go from **your own mailbox**, at the time the app gives each one. Nothing
 
 What else to know:
 
-- **Queued late?** An email whose time has already passed gets a new time when you queue it, so a backlog never goes out all at once.
+- **Queued late?** An email whose time has already passed goes out right away when you queue it.
 - **Changed your mind?** **Take out of the queue** keeps it approved with the same time. Editing it, rejecting it or sending it back to review also takes it out of the queue.
 - **After it is sent**, it becomes **Sent**, the lead moves to Initial Email or Follow-up on the Pipeline, and the next follow-up is written for your review.
 - **A send failed?** The Outbox shows it as **Failed** with the reason. Fix the problem and queue it again.
-- **The computer was off or restarted?** The Outbox says "queued but the sender is not running": click **Start the sender**. Emails whose time passed go out one after another.
+- **The app crashed or the computer was off?** The emails not sent yet are still Queued. Tick them and **Queue for sending** again (or click **Start the sender**): the ones whose time passed go out right away, one after another. If the crash hit in the middle of an email, that one is marked **Failed: check your Sent folder**; queue it again only if it is not in Gmail's Sent folder.
 - **Set up once:** your mailbox's SMTP details in `.env` (see [Settings](#9-settings)). Until then queued emails just wait, and the dashboard says so.
 
 Statuses: In review → Approved → **Queued** → **Sent** (→ Replied), or **Failed**.

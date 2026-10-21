@@ -153,19 +153,53 @@ class QueueTests(OutreachCase):
             self.assertIn("The sender is running", review.queue([third]))
         launch.assert_not_called()  # one sender at a time
 
-    def test_a_passed_time_gets_a_fresh_slot_and_unqueue_keeps_it(self):
+    def test_a_passed_time_is_kept_and_unqueue_keeps_it_too(self):
         email = self.email()
         review.approve(email)
-        Email.objects.filter(pk=email.pk).update(scheduled_at=outreach.now() - timedelta(days=2))
+        overdue = outreach.now() - timedelta(hours=2)
+        Email.objects.filter(pk=email.pk).update(scheduled_at=overdue)
         with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
             review.queue([email])
         email.refresh_from_db()
-        self.assertEqual(email.status, "queued")
-        self.assertGreater(email.scheduled_at, outreach.now() - timedelta(minutes=1))  # no burst of old emails
-        slot = email.scheduled_at
+        self.assertEqual((email.status, email.scheduled_at), ("queued", overdue))  # due: it goes right away
         self.assertIn("1 email(s) taken out", review.unqueue([email]))
         email.refresh_from_db()
-        self.assertEqual((email.status, email.scheduled_at), ("approved", slot))
+        self.assertEqual((email.status, email.scheduled_at), ("approved", overdue))
+
+    def test_after_a_crash_queueing_the_rest_again_sends_them_right_away(self):
+        """20 queued, 5 sent, the app crashed (one mid-send), then the rest are queued again: the overdue ones go
+        straight out, the half-sent one is left for a person to check."""
+        SendingSettings.objects.update_or_create(pk=1, defaults={"daily_cap": 40})
+        emails = []
+        for _ in range(20):
+            email = self.email()
+            review.approve(email)
+            emails.append(Email.objects.get(pk=email.pk))
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            self.assertIn("20 email(s) queued", review.queue(emails))
+        start = outreach.now() - timedelta(hours=3)
+        for minute, email in enumerate(emails):  # the times the crash made them miss
+            Email.objects.filter(pk=email.pk).update(scheduled_at=start + timedelta(minutes=minute))
+        with mock.patch("pipeline.services.outreach.next_queued", side_effect=list(
+                Email.objects.filter(pk__in=[e.pk for e in emails[:5]]).order_by("scheduled_at")) + [None]):
+            self.send()  # the first 5 went out before the crash
+        Email.objects.filter(pk=emails[5].pk).update(status="sending")  # the crash hit mid-send
+        PipelineRun.objects.all().delete()  # its run died with the app
+        self.assertEqual(Email.objects.filter(status="sent").count(), 5)
+        self.assertEqual(Email.objects.filter(status="queued").count(), 14)
+
+        rest = list(Email.objects.filter(pk__in=[e.pk for e in emails[5:]]))
+        with mock.patch("pipeline.jobs.launch") as launch, self.captureOnCommitCallbacks(execute=True):
+            message = review.queue(rest)
+        self.assertIn("0 email(s) queued. 15 were already queued.", message)
+        self.assertIn("The sender started", message)
+        launch.assert_called_once()
+        self.assertEqual(self.send(), 0)  # the sender: everything overdue goes now
+        self.assertEqual(Email.objects.filter(status="sent").count(), 19)
+        half_sent = Email.objects.get(pk=emails[5].pk)
+        self.assertEqual(half_sent.status, "failed")
+        self.assertIn("check your Sent folder", half_sent.send_error)
+        self.assertEqual(len(mail.outbox), 19)
 
     def test_what_cannot_be_queued_is_skipped_with_the_reason(self):
         in_review, stopped = self.email(), self.email()

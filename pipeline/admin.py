@@ -1567,9 +1567,9 @@ class OutboxAdmin(PipelineAdmin):
         from zoneinfo import ZoneInfo
 
         local = obj.scheduled_at.astimezone(ZoneInfo(zone))
-        late = obj.status in ("approved", "failed") and obj.scheduled_at < timezone.now()
+        late = obj.status in ("approved", "queued", "failed") and obj.scheduled_at < timezone.now()
         return format_html('{}<br><small>{}{}</small>', local.strftime("%Y-%m-%d %H:%M"), zone,
-                           " - time passed; queueing gives it a new time" if late else "")
+                           " - time passed: sent as soon as it is queued and the sender runs" if late else "")
 
     @admin.display(description="Status", ordering="status")
     def status_badge(self, obj):
