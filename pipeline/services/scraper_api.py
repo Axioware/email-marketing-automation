@@ -3,7 +3,7 @@
 The container is a FastAPI service (port 8001 by default; MAPS_SCRAPER_URL in .env, e.g. https://your-vps/scraper
 behind nginx) that runs its own headless Chromium. Every request sends `X-API-Key: MAPS_SCRAPER_KEY` (the container's
 SCRAPER_API_KEY). `GET /scrape-get?query=...&max_places=...&lang=...&concurrency=...` searches Google Maps, opens every place
-and answers with a JSON list once it is done (it gives up after 5 minutes); `GET /` answers when it is up. Each place:
+and answers with a JSON list once it is done (it gives up after 30 minutes); `GET /` answers when it is up. Each place:
 name, place_id, coordinates, address, rating, reviews_count, categories, website, phone (digits with the country code),
 hours, link. They are turned into the same records the built-in browser produces, so de-duplication, saving and every
 later step work the same whichever source found the business.
@@ -20,8 +20,8 @@ from pipeline.services import maps
 
 DEFAULT_URL = "http://127.0.0.1:8001"
 SOURCE_NAME = "google_maps_scraper"  # businesses.source / business_sources.source for what the container found
-REQUEST_TIMEOUT = 330  # seconds; the container stops a search after 300
-MAX_PLACES_PER_SEARCH = 40  # one search must finish inside the container's 5 minutes
+REQUEST_TIMEOUT = 1830  # seconds; the container stops a search after 30 minutes (its SEARCH_TIMEOUT, 1800)
+MAX_PLACES_PER_SEARCH = 240  # one search must finish inside the container's 30 minutes
 DEFAULT_CONCURRENCY = 5  # the container's own default; 1-20, higher is faster but more likely to be blocked
 DEFAULT_LANG = "en"
 WEB_PLACES_PER_SEARCH = 20  # with a deadline: a search this size fits in the web app's time limit
@@ -68,7 +68,7 @@ def search(query: str, max_places: int, url: str | None = None, lang: str = DEFA
         places = _get(f"{base_url(url)}/scrape-get?{params}", timeout)
     except HTTPError as error:
         if error.code == 504:
-            raise TimeoutError(f"the container gave up after 5 minutes; fetch fewer businesses per run "
+            raise TimeoutError(f"the container gave up after 30 minutes; fetch fewer businesses per run "
                                f"(it was asked for {max_places})") from error
         detail = ""
         try:

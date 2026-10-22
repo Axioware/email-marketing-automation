@@ -368,7 +368,7 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | An email is **Failed** in the Outbox | Read the reason next to it, fix it, then queue it again |
 | "queued but the sender is not running" | The app was restarted: click **Start the sender** in the Outbox |
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |
-| Fetch: "the container gave up after 5 minutes" | Lower `--limit`, or raise `--concurrency` a little |
+| Fetch: "the container gave up after 30 minutes" | Lower `--limit`, or raise `--concurrency` a little |
 | Find decision makers: "Search failed: SearXNG ... is not reachable" | Run `docker compose up -d` and check `SEARXNG_URL`; the business is retried next run |
 | Write emails: "No prospects need an email" | Every ready prospect already has one; use `--regenerate` to fill those in review again |
 | Write emails: "held back ... no value for {{x}}" | The template needs a value this prospect does not have: give the variable a fallback (`{{x|...}}`) or fill in the data, then run again |

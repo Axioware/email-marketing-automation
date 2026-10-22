@@ -143,7 +143,7 @@ class FetchTests(ScraperCase):
         self.container = slow
         result = self.fetch("--limit", 5)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("Skipped this search: the container gave up after 5 minutes", result.stdout)
+        self.assertIn("Skipped this search: the container gave up after 30 minutes", result.stdout)
 
         broken = FakeContainer(status=500)
         self.addCleanup(broken.close)
