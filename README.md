@@ -166,6 +166,7 @@ Everything in the admin is also in the API at `/api/`. Interactive docs (Swagger
 | `/api/email-opens/` | recorded opens |
 | `/api/runs/` | start a pipeline step, list and follow runs; `GET /api/runs/commands/` lists commands and options; `POST /api/runs/{id}/cancel/` |
 | `/api/stats/` | counts across the whole pipeline |
+| `/api/usage/`, `/api/usage/summary/` | AI tokens and Hunter credits per call (action, provider, model, business, prospect, run); `?from=YYYY-MM-DD&to=YYYY-MM-DD`, `?action=`, `?provider=`, `?business=`; the summary totals them per action and model |
 
 Start a step and follow it:
 

@@ -841,3 +841,42 @@ class PipelineRun(models.Model):
         import shlex
 
         return " ".join(["python manage.py", self.command, *(shlex.quote(str(a)) for a in self.arguments)])
+
+
+class UsageRecord(models.Model):
+    """One billable call: an AI request (its tokens) or a Hunter request (its credits), with what it was for."""
+
+    class Action(models.TextChoices):
+        RESEARCH = "research", "Website research (qualification)"
+        EMAIL_SCORING = "email_scoring", "Email scoring"
+        DECISION_MAKERS = "decision_makers", "Find decision makers (Hunter)"
+        VERIFICATION = "verification", "Email verification (Hunter)"
+        OTHER = "other", "Other"
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    provider = models.CharField(max_length=16, db_index=True, help_text="openai, groq or hunter.")
+    action = models.CharField(max_length=32, choices=Action.choices, default=Action.OTHER, db_index=True)
+    model = models.CharField(max_length=100, help_text="The AI model, or the Hunter endpoint.")
+    business = models.ForeignKey(Business, on_delete=models.SET_NULL, null=True, blank=True,
+                                 related_name="usage_records")
+    prospect = models.ForeignKey(Prospect, on_delete=models.SET_NULL, null=True, blank=True,
+                                 related_name="usage_records")
+    run = models.ForeignKey(PipelineRun, on_delete=models.SET_NULL, null=True, blank=True,
+                            related_name="usage_records")
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0, help_text="Including reasoning tokens.")
+    reasoning_tokens = models.PositiveIntegerField(default=0)
+    hunter_credits = models.DecimalField(max_digits=8, decimal_places=2, default=0,
+                                         help_text="Estimated: a domain search 1 per 10 emails returned, a "
+                                                   "verification 0.5.")
+    detail = models.CharField(max_length=255, blank=True, default="", help_text="E.g. the address or domain.")
+
+    class Meta:
+        db_table = "usage_records"
+        ordering = ["-created_at", "-id"]
+        verbose_name = "usage record"
+        verbose_name_plural = "usage (AI tokens and Hunter credits)"
+
+    def __str__(self):
+        return f"{self.get_action_display()} - {self.model}"
+

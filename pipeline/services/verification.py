@@ -624,7 +624,7 @@ def run(options: dict) -> int:
     if options["limit"] is not None and options["limit"] < 1:
         raise CommandError("--limit must be a positive integer")
     from pipeline.models import SendingSettings
-    from pipeline.services import hunter
+    from pipeline.services import hunter, usage
 
     from pipeline.services import email_scoring
 
@@ -704,7 +704,8 @@ def run(options: dict) -> int:
                     probed = False
                 elif use_hunter:
                     try:
-                        outcome = hunter.outcome(address, hunter.verify(address))
+                        with usage.track(action="verification", business_id=contact["business_id"]):
+                            outcome = hunter.outcome(address, hunter.verify(address))
                     except hunter.HunterStopped as error:
                         print(f"{error}. Stopping; results so far are saved.")
                         aborted = True

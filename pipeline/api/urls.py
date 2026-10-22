@@ -18,6 +18,7 @@ router.register("prospects", views.ProspectViewSet)
 router.register("emails", views.EmailViewSet)
 router.register("email-opens", views.EmailOpenEventViewSet)
 router.register("runs", views.PipelineRunViewSet)
+router.register("usage", views.UsageViewSet)
 
 urlpatterns = [
     path("", include(router.urls)),

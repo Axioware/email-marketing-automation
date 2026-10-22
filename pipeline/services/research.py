@@ -39,6 +39,7 @@ except ImportError:
 
 from pipeline.management.base import PARTIAL, OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessWebsiteProfile, check_output_fields
+from pipeline.services import usage
 from pipeline.services.llm import complete, make_llm_client, rejected_output, tune
 from pipeline.services.dbthread import outside_event_loop
 
@@ -968,8 +969,9 @@ def run(options: dict) -> int:
               + (f" (continuing after {len(saved)} page(s) read before)" if saved else ""), flush=True)
         try:
             save_page = lambda pages, emails, links: save_progress(profile_id, pages, emails, links)
-            result = research_business(client, model, business, jina_reader, on_page=save_page, deadline=deadline,
-                                       saved_pages=saved)
+            with usage.track(action="research", business_id=business["id"]):
+                result = research_business(client, model, business, jina_reader, on_page=save_page,
+                                           deadline=deadline, saved_pages=saved)
             finalize_profile(profile_id, result)
             completed += 1
             score = result.get("qualification_score")

@@ -39,6 +39,7 @@ from pipeline.models import (
     PipelineRun,
     Prospect,
     SendingSettings,
+    UsageRecord,
     default_output_fields,
 )
 from pipeline.services import generation, qualify
@@ -1627,6 +1628,89 @@ class OutboxAdmin(PipelineAdmin):
             except review.ReviewError:
                 pass
         self.message_user(request, f"{done} email(s) back in review.")
+
+
+# ---------------------------------------------------------------- usage (AI tokens and Hunter credits)
+
+
+def parse_day(value: str):
+    from datetime import date
+
+    try:
+        return date.fromisoformat((value or "").strip())
+    except ValueError:
+        return None
+
+
+@admin.register(UsageRecord)
+class UsageRecordAdmin(PipelineAdmin):
+    """Every AI request (tokens) and Hunter request (credits), with what it was for. The from/to dates limit the list
+    and the totals above it."""
+
+    list_display = ["created_at", "action", "provider", "model", "business_link", "prospect_link", "input_tokens",
+                    "output_tokens", "reasoning_tokens", "total_tokens", "hunter_credits", "run_link", "detail"]
+    list_filter = ["action", "provider", "model"]
+    search_fields = ["business__name", "prospect__email", "detail", "model"]
+    list_select_related = ["business", "prospect", "run"]
+    change_list_template = "admin/pipeline/usagerecord/change_list.html"
+    list_per_page = 100
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.db.models import Sum
+
+        params = request.GET.copy()
+        start, end = parse_day(params.pop("from", [""])[0]), parse_day(params.pop("to", [""])[0])
+        request.GET = params  # the admin refuses parameters it does not know
+        request.usage_range = (start, end)
+        response = super().changelist_view(request, extra_context)
+        if not hasattr(response, "context_data") or "cl" not in response.context_data:
+            return response
+        queryset = response.context_data["cl"].queryset
+        sums = dict(input=Sum("input_tokens"), output=Sum("output_tokens"), reasoning=Sum("reasoning_tokens"),
+                    credits=Sum("hunter_credits"), calls=Count("id"))
+        response.context_data.update({
+            "range_from": start.isoformat() if start else "",
+            "range_to": end.isoformat() if end else "",
+            "totals": queryset.aggregate(**sums),
+            "by_action_model": queryset.values("action", "provider", "model").annotate(**sums)
+                                       .order_by("action", "provider", "model"),
+            "action_labels": dict(UsageRecord.Action.choices),
+        })
+        return response
+
+    def get_queryset(self, request):
+        from datetime import datetime, time, timedelta
+
+        queryset = super().get_queryset(request)
+        start, end = getattr(request, "usage_range", (None, None))
+        zone = timezone.get_current_timezone()
+        if start:
+            queryset = queryset.filter(created_at__gte=datetime.combine(start, time.min, tzinfo=zone))
+        if end:
+            queryset = queryset.filter(created_at__lt=datetime.combine(end + timedelta(days=1), time.min, tzinfo=zone))
+        return queryset
+
+    @admin.display(description="Total tokens")
+    def total_tokens(self, obj):
+        return obj.input_tokens + obj.output_tokens if obj.provider != "hunter" else "-"
+
+    @admin.display(description="Business", ordering="business__name")
+    def business_link(self, obj):
+        return admin_link(obj.business) if obj.business else "-"
+
+    @admin.display(description="Prospect")
+    def prospect_link(self, obj):
+        return admin_link(obj.prospect) if obj.prospect else "-"
+
+    @admin.display(description="Run")
+    def run_link(self, obj):
+        return admin_link(obj.run, f"#{obj.run_id}") if obj.run_id else "-"
 
 
 # ---------------------------------------------------------------- pipeline runs

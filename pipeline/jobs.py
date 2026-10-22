@@ -26,6 +26,7 @@ from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
 from pipeline.models import PipelineRun
+from pipeline.services import usage
 from pipeline.services.dbthread import outside_event_loop
 
 COMMANDS = {
@@ -310,7 +311,8 @@ def execute_run(run_id: int) -> int:
         with redirect_stdout(output), redirect_stderr(output):
             print(f"$ {run.command_line}", flush=True)
             try:
-                call_command(run.command, *run.arguments)
+                with usage.track(run_id=run_id):  # AI tokens and Hunter credits are recorded against this run
+                    call_command(run.command, *run.arguments)
             except CommandError as error:
                 print(f"Error: {error}")
                 status, code = PipelineRun.Status.FAILED, error.returncode or 1

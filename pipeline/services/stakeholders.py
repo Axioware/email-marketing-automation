@@ -20,7 +20,7 @@ from django.db.models import F, Q
 
 from pipeline.management.base import PARTIAL, OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile, SendingSettings
-from pipeline.services import hunter, qualify, searxng
+from pipeline.services import hunter, qualify, searxng, usage
 from pipeline.services.research import JINA_TIMEOUT, JinaReader, ResearchError, is_public_http_url
 
 DEFAULT_ROLES_FILE = Path(settings.BASE_DIR) / "config" / "target_roles_dental.json"
@@ -977,9 +977,10 @@ def run_hunter(options: dict, queue: list[dict], roles: RoleConfig) -> int:
         print(f"Business {business['id']}: {business['name']}", flush=True)
         target = f"domain {domains[0]}" if domains else f"company \"{search_name(business['name'])}\""
         try:
-            data = hunter.domain_search(domain=domains[0] if domains else None,
-                                        company=None if domains else search_name(business["name"]),
-                                        limit=HUNTER_EMAILS_PER_SEARCH)
+            with usage.track(action="decision_makers", business_id=business["id"]):
+                data = hunter.domain_search(domain=domains[0] if domains else None,
+                                            company=None if domains else search_name(business["name"]),
+                                            limit=HUNTER_EMAILS_PER_SEARCH)
         except hunter.HunterStopped as error:
             print(f"  {error}. Stopping; businesses done so far are saved.")
             return 1

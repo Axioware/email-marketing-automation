@@ -1,0 +1,36 @@
+{% extends "admin/change_list.html" %}
+{% load humanize %}
+{% block content_title %}<h1>Usage: AI tokens and Hunter credits</h1>{% endblock %}
+{% block object-tools %}
+<div class="pipeline-card">
+  <form method="get" class="pipeline-board-filter">
+    {% for key, value in request.GET.items %}{% if key != "from" and key != "to" and key != "p" %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endif %}{% endfor %}
+    <label>From <input type="date" name="from" value="{{ range_from }}"></label>
+    <label>To <input type="date" name="to" value="{{ range_to }}"></label>
+    <input type="submit" value="Apply">
+    {% if range_from or range_to %}<a href="?">Clear dates</a>{% endif %}
+    <span class="help">Totals below cover the dates and filters chosen (action, provider, model on the right; search by business).</span>
+  </form>
+  <p>
+    <b>{{ totals.calls|default:0|intcomma }}</b> call(s) ·
+    AI tokens: <b>{{ totals.input|default:0|intcomma }}</b> in, <b>{{ totals.output|default:0|intcomma }}</b> out
+    (<b>{{ totals.reasoning|default:0|intcomma }}</b> of them reasoning) ·
+    Hunter credits: <b>{{ totals.credits|default:0 }}</b>
+    <span class="help">(estimate: a domain search 1 credit per 10 emails it returns, a verification 0.5)</span>
+  </p>
+  {% if by_action_model %}
+  <table>
+    <thead><tr><th>Action</th><th>Provider</th><th>Model / endpoint</th><th>Calls</th><th>Tokens in</th><th>Tokens out</th><th>Reasoning</th><th>Hunter credits</th></tr></thead>
+    <tbody>{% for row in by_action_model %}
+      <tr>
+        <td>{% for value, label in action_labels.items %}{% if value == row.action %}{{ label }}{% endif %}{% endfor %}</td>
+        <td>{{ row.provider }}</td><td>{{ row.model }}</td><td>{{ row.calls|intcomma }}</td>
+        <td>{{ row.input|default:0|intcomma }}</td><td>{{ row.output|default:0|intcomma }}</td>
+        <td>{{ row.reasoning|default:0|intcomma }}</td><td>{{ row.credits|default:0 }}</td>
+      </tr>
+    {% endfor %}</tbody>
+  </table>
+  {% endif %}
+</div>
+{{ block.super }}
+{% endblock %}

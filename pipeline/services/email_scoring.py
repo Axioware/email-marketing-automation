@@ -22,6 +22,7 @@ from openai import APIError
 
 from pipeline.management.base import PARTIAL, OutOfTime, out_of_time, time_limit_note
 from pipeline.models import Prospect, SendingSettings
+from pipeline.services import usage
 from pipeline.services.llm import complete, make_llm_client, rejected_output, tune
 
 MAX_COMPLETION_TOKENS = 400
@@ -180,8 +181,9 @@ def run(options: dict) -> int:
                 time_limit_note(len(queue) - position, "address(es)")
                 break
             try:
-                answer = score_address(client, model, settings_row.email_scoring_prompt, prospect,
-                                       options.get("deadline"))
+                with usage.track(action="email_scoring", business_id=prospect.business_id, prospect_id=prospect.pk):
+                    answer = score_address(client, model, settings_row.email_scoring_prompt, prospect,
+                                           options.get("deadline"))
             except OutOfTime as error:
                 print(f"  Stopped: {error}. The rest are scored on the next run.")
                 break

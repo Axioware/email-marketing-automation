@@ -306,6 +306,15 @@ Useful arguments:
 | `--regenerate` | Write emails | Fill in again emails that are in review or rejected |
 | `--campaign-id N` | Write due follow-ups | Only that campaign's follow-ups |
 
+## 5b. Usage: AI tokens and Hunter credits
+
+Sidebar > **Usage** lists every paid call the app made: each AI request (tokens in, out and reasoning) and each Hunter request (credits), with **what it was for** (Website research, Email scoring, Find decision makers with Hunter, Email verification with Hunter), the **business** and **prospect**, the **run** it belonged to and the model or Hunter endpoint.
+
+- Pick a **From** and **To** date and click **Apply**; filter by action, provider or model on the right; search by business name.
+- The box at the top totals whatever is shown: calls, tokens in and out, Hunter credits, and a line per action and model.
+- Hunter credits are estimated the way Hunter charges them: a domain search 1 credit per 10 emails it returns, a verification 0.5. Your Hunter dashboard has the exact figure.
+- Reacher verification and the scraper container are free, so they do not appear here.
+
 ## 6. Managing prospects
 
 - **Do not contact:** on the Prospects list, tick them and choose **Mark do not contact**. They will never be emailed, and verification never changes them back. Use this when someone replies "unsubscribe". **Clear do not contact** undoes it.

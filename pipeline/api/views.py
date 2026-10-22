@@ -30,6 +30,7 @@ from pipeline.models import (
     PipelineRun,
     Prospect,
     SendingSettings,
+    UsageRecord,
 )
 
 
@@ -335,6 +336,46 @@ class EmailVariablesView(APIView):
 
         return Response([{"name": name, "description": description}
                          for name, description in templates.known_variables().items()])
+
+
+class UsageViewSet(viewsets.ReadOnlyModelViewSet):
+    """AI tokens and Hunter credits per call. Filters: ?from=YYYY-MM-DD&to=YYYY-MM-DD (inclusive), ?action=,
+    ?provider=, ?model=, ?business=, ?prospect=, ?run=. GET usage/summary/ gives the totals per action and model."""
+
+    queryset = UsageRecord.objects.all()
+    serializer_class = s.UsageRecordSerializer
+    filterset_fields = ["action", "provider", "model", "business", "prospect", "run"]
+    search_fields = ["business__name", "detail"]
+    ordering_fields = ["created_at", "input_tokens", "output_tokens", "hunter_credits"]
+
+    def get_queryset(self):
+        from datetime import date, datetime, time, timedelta
+
+        from django.utils import timezone as tz
+
+        queryset = super().get_queryset()
+        zone = tz.get_current_timezone()
+        for name, lookup, shift in (("from", "created_at__gte", 0), ("to", "created_at__lt", 1)):
+            value = self.request.query_params.get(name)
+            if value:
+                try:
+                    day = date.fromisoformat(value)
+                except ValueError:
+                    continue
+                queryset = queryset.filter(**{lookup: datetime.combine(day + timedelta(days=shift), time.min, tzinfo=zone)})
+        return queryset
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        from django.db.models import Sum
+
+        queryset = self.filter_queryset(self.get_queryset())
+        sums = dict(input_tokens=Sum("input_tokens"), output_tokens=Sum("output_tokens"),
+                    reasoning_tokens=Sum("reasoning_tokens"), hunter_credits=Sum("hunter_credits"), calls=Count("id"))
+        return Response({"totals": queryset.aggregate(**sums),
+                         "by_action_and_model": list(queryset.values("action", "provider", "model").annotate(**sums)
+                                                     .order_by("action", "model"))})
 
 
 class PipelineView(APIView):

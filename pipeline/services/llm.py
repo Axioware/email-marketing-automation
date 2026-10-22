@@ -68,13 +68,17 @@ def complete(client: OpenAI, deadline: float | None = None, timeout: float = DEF
     """client.chat.completions.create(**request). With a deadline (the web app on Vercel) nothing runs past it: the
     SDK's own retries (which wait out rate limits for minutes) are off, each call may only use the time left, and a
     rate limit is waited out here only when there is time for it afterwards; otherwise OutOfTime."""
+    from pipeline.services import usage
+
     try:
-        return _create(client, deadline, timeout, request)
+        response = _create(client, deadline, timeout, request)
     except BadRequestError as error:  # a model that refuses a sampling setting: once more without it
         rejected = getattr(error, "param", None) or (getattr(error, "body", None) or {}).get("param")
         if rejected not in ("temperature", "reasoning_effort") or rejected not in request:
             raise
-        return _create(client, deadline, timeout, {k: v for k, v in request.items() if k != rejected})
+        response = _create(client, deadline, timeout, {k: v for k, v in request.items() if k != rejected})
+    usage.record_ai(client, request.get("model", ""), response)  # tokens, for the Usage page
+    return response
 
 
 def _create(client: OpenAI, deadline: float | None, timeout: float, request: dict):

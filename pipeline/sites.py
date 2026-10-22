@@ -19,8 +19,8 @@ BOARD_CARDS_PER_STAGE = 200
 
 # Sidebar order: the pipeline's own order, then the supporting tables. "pipelineboard" is the Pipeline page.
 MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "emailsequence", "business", "businesswebsiteprofile",
-               "businesscontact", "prospect", "email", "outboxemail", "pipelineboard", "pipelinerun", "sendingsettings",
-               "businesssource"]
+               "businesscontact", "prospect", "email", "outboxemail", "pipelineboard", "pipelinerun", "usagerecord",
+               "sendingsettings", "businesssource"]
 
 
 def changelist(model_name: str, **filters) -> str:

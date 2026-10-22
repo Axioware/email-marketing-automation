@@ -17,6 +17,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from pipeline.services import usage
+
 DEFAULT_BASE_URL = "https://api.hunter.io/v2"
 TIMEOUT = 40  # seconds; Hunter answers a verification within about 20 s or says it is still working (202)
 VERIFY_RETRIES = 3  # a 202 (verification still running) is asked again this many times
@@ -105,7 +107,9 @@ def domain_search(domain: str | None = None, company: str | None = None, limit: 
     if not domain and not company:
         raise HunterError("no domain or company name to search for")
     _, body = _get("domain-search", {"domain": domain, "company": None if domain else company, "limit": limit})
-    return body.get("data") or {}
+    data = body.get("data") or {}
+    usage.record_hunter_search(domain or company, len(data.get("emails") or []))
+    return data
 
 
 def verify(address: str, retries: int = VERIFY_RETRIES, wait: float = VERIFY_RETRY_WAIT) -> dict:
@@ -114,9 +118,11 @@ def verify(address: str, retries: int = VERIFY_RETRIES, wait: float = VERIFY_RET
     for attempt in range(retries + 1):
         code, body = _get("email-verifier", {"email": address})
         if code != 202:
+            usage.record_hunter_verification(address)
             return body.get("data") or {}
         if attempt < retries:
             time.sleep(wait)
+    usage.record_hunter_verification(address, finished=False)
     return {"status": None}
 
 

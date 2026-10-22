@@ -18,6 +18,7 @@ from pipeline.models import (
     PipelineStage,
     Prospect,
     SendingSettings,
+    UsageRecord,
     check_output_fields,
 )
 
@@ -249,6 +250,13 @@ class RejectSerializer(serializers.Serializer):
 class BulkReviewSerializer(serializers.Serializer):
     action = serializers.ChoiceField(choices=["approve", "reject"])
     ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=1000)
+
+
+class UsageRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UsageRecord
+        fields = ["id", "created_at", "action", "provider", "model", "business", "prospect", "run", "input_tokens",
+                  "output_tokens", "reasoning_tokens", "hunter_credits", "detail"]
 
 
 class IdsSerializer(serializers.Serializer):
