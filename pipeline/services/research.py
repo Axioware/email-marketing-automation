@@ -37,7 +37,7 @@ try:  # better text extraction when Jina Reader is not used (requirements-worker
 except ImportError:
     trafilatura = None
 
-from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
+from pipeline.management.base import PARTIAL, OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessWebsiteProfile, check_output_fields
 from pipeline.services.llm import complete, make_llm_client, rejected_output, tune
 from pipeline.services.dbthread import outside_event_loop
@@ -380,13 +380,25 @@ def is_public_http_url(url: str) -> bool:
         try:
             addresses = {ipaddress.ip_address(hostname)}
         except ValueError:
-            addresses = {
-                ipaddress.ip_address(result[4][0])
-                for result in socket.getaddrinfo(hostname, parsed.port or 80)
-            }
+            addresses = {ipaddress.ip_address(result[4][0]) for result in lookup_host(hostname, parsed.port or 80)}
         return bool(addresses) and all(address.is_global for address in addresses)
     except (OSError, ValueError):
         return False
+
+
+DNS_ATTEMPTS = 3  # a lookup the network's DNS fails "temporarily" is asked again, not taken as "no such site"
+
+
+def lookup_host(hostname: str, port: int) -> list:
+    """socket.getaddrinfo, retried when the DNS server fails temporarily (EAI_AGAIN)."""
+    for attempt in range(DNS_ATTEMPTS):
+        try:
+            return socket.getaddrinfo(hostname, port)
+        except socket.gaierror as error:
+            if error.errno != socket.EAI_AGAIN or attempt == DNS_ATTEMPTS - 1:
+                raise
+            time.sleep(1 + attempt)
+    return []
 
 
 def is_same_site(url: str, homepage_url: str) -> bool:
@@ -974,4 +986,4 @@ def run(options: dict) -> int:
             print(f"Business {business['id']} failed ({type(error).__name__}): {error}")
     print(f"Research complete: {completed} completed, {failed - len(unprompted)} failed"
           + (f", {len(unprompted)} skipped (no campaign prompt)." if unprompted else "."))
-    return 1 if failed else 0
+    return PARTIAL if failed else 0

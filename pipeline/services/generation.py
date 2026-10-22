@@ -24,7 +24,7 @@ from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Count, Exists, F, FilteredRelation, OuterRef, Q
 from django.db.models.functions import Lower
 
-from pipeline.management.base import out_of_time, time_limit_note
+from pipeline.management.base import PARTIAL, out_of_time, time_limit_note
 from pipeline.models import (DEFAULT_FOOTER_TEXT, DiscoveryCampaign, Email, EmailPrompt, EmailSequence, FollowUp,
                              Prospect, SendingSettings)
 from pipeline.services import templates
@@ -446,7 +446,7 @@ def run(options: dict) -> int:
         verb = "filled (dry run, not saved)" if options["dry_run"] else "saved for review"
         print(f"Done: {created} email(s) {verb}" + (f", {held} held back (a variable with no value)" if held else "")
               + (f", {skipped} skipped (no template)" if skipped else "") + ".")
-        return 1 if held or skipped else 0
+        return PARTIAL if held or skipped else 0
     except DatabaseError as error:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")
         print("Check DATABASE_URL and run `python manage.py migrate` first.")

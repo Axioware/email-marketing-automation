@@ -17,6 +17,7 @@ from django.conf import settings
 from django.core.mail import EmailMultiAlternatives, get_connection
 from django.core.management.base import CommandError
 
+from pipeline.management.base import PARTIAL
 from pipeline.models import Email
 from pipeline.services import outreach
 
@@ -138,4 +139,4 @@ def run(options: dict) -> int:
     left = Email.objects.filter(status="queued").count()
     print(f"Done: {sent} sent, {failed} failed" + (f", {left} still queued (later times; run again or queue more to "
                                                     "start the sender)." if left else ", the queue is empty."))
-    return 1 if failed else 0
+    return PARTIAL if failed else 0

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from django.core.management.base import CommandError
 from django.db import DatabaseError
 
-from pipeline.management.base import out_of_time, time_limit_note
+from pipeline.management.base import PARTIAL, out_of_time, time_limit_note
 from pipeline.models import Email, EmailPrompt, FollowUp, Prospect
 from pipeline.services import generation, templates
 
@@ -137,7 +137,7 @@ def run(options: dict) -> int:
                 print(f"  {label}: {detail}")
         verb = "written (dry run, not saved)" if options["dry_run"] else "saved for review"
         print(f"Done: {saved} follow-up(s) {verb}, {skipped} skipped, {held} held back.")
-        return 1 if held or skipped else 0
+        return PARTIAL if held or skipped else 0
     except DatabaseError as error:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")
         return 1

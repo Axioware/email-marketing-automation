@@ -211,8 +211,9 @@ class GenerateEmailsEndToEndTests(GenerateCase, TestCase):
         self.b[2].save(update_fields=["city"])
         self.template.body = "Hi {{first_name|there}}, a note for {{city}}."
         self.template.save()
-        result = self.run_cli(expect=1)
+        result = self.run_cli(expect=0)  # some held back: the run still succeeds, saying so
         self.assertIn("1 email(s) saved for review, 1 held back", result.stdout)
+        self.assertIn("Finished with some errors", result.stdout)
         self.assertIn("held back", result.stdout)
         self.assertIn("no value for {{city}}", result.stdout)
         self.assertEqual([r["business_id"] for r in self.emails()], [self.b[1].pk])

@@ -128,7 +128,7 @@ class GenerationTests(PromptCase):
     def test_campaign_without_initial_prompts_is_skipped(self):
         prospect = self.ready_prospect(make_campaign(initial_prompts=[]))
         result = self.generate()
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 0)  # skipped and said so; the run itself succeeded
         self.assertIn(f"Prospect {prospect.pk} <{prospect.email}> skipped: its campaign has no email sequence",
                       result.stdout)
         self.assertIn("1 skipped (no template)", result.stdout)

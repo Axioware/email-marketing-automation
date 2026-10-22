@@ -18,7 +18,7 @@ from django.core.management.base import CommandError
 from django.db import DatabaseError, transaction
 from django.db.models import F, Q
 
-from pipeline.management.base import OutOfTime, call_timeout, out_of_time, time_limit_note
+from pipeline.management.base import PARTIAL, OutOfTime, call_timeout, out_of_time, time_limit_note
 from pipeline.models import Business, BusinessContact, BusinessWebsiteProfile, SendingSettings
 from pipeline.services import hunter, qualify, searxng
 from pipeline.services.research import JINA_TIMEOUT, JinaReader, ResearchError, is_public_http_url
@@ -1003,7 +1003,7 @@ def run_hunter(options: dict, queue: list[dict], roles: RoleConfig) -> int:
         else:
             empty += 1
     print(f"Done: {stored} with contacts, {empty} with none found, {deferred} deferred.")
-    return 1 if deferred else 0
+    return PARTIAL if deferred else 0
 
 
 def add_arguments(parser) -> None:

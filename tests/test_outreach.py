@@ -323,7 +323,7 @@ class SendingTests(OutreachCase):
         email = self.queued()
         with mock.patch("django.core.mail.backends.locmem.EmailBackend.send_messages",
                         side_effect=smtplib.SMTPRecipientsRefused({email.recipient: (550, b"no such user")})):
-            self.assertEqual(self.send(), 1)
+            self.assertEqual(self.send(), 2)  # partial: one email failed, the run itself succeeds
         email.refresh_from_db()
         self.assertEqual(email.status, "failed")
         self.assertIn("SMTPRecipientsRefused", email.send_error)

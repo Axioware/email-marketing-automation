@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from unittest import mock
 
-from django.test import TestCase, TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from pipeline.models import Business, BusinessContact, BusinessSource, BusinessWebsiteProfile, DiscoveryCampaign
 from pipeline.services import maps, research, stakeholders
@@ -107,7 +107,8 @@ class ResearchTests(TestCase):
         with mock.patch.object(research, "make_llm_client", return_value=(object(), "m", "test")), \
                 mock.patch.object(research, "research_business", fake):
             result = run_command("research_websites", "--local-only")
-            self.assertEqual(result.returncode, 1)  # a business was skipped
+            self.assertEqual(result.returncode, 0)  # a business was skipped: noted, the run still succeeds
+            self.assertIn("Finished with some errors", result.stdout)
             self.assertIn(f"Business {bare.pk} (B) skipped: its campaign has no campaign prompt", result.stdout)
             self.assertEqual([b["id"] for b in researched], [prompted.pk])
             self.assertEqual(researched[0]["qualification_prompt"], QUALIFICATION_PROMPT)
@@ -553,3 +554,17 @@ class MapsDetailsTests(TestCase):
     def test_fetched_businesses_get_city_and_state(self):
         details = {"name": "X", "address": "Shop 2, Lahore, Punjab 54000, Pakistan"}
         self.assertEqual(maps.parse_address(details["address"])["state"], "Punjab")
+
+
+class DnsRetryTests(SimpleTestCase):
+    def test_a_temporary_dns_failure_is_retried_not_taken_as_no_website(self):
+        import socket
+
+        from pipeline.services import research
+
+        answers = [socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+                   [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]]
+        with mock.patch("socket.getaddrinfo", side_effect=answers), mock.patch("time.sleep"):
+            self.assertTrue(research.is_public_http_url("https://clinic.example.com/"))
+        with mock.patch("socket.getaddrinfo", side_effect=socket.gaierror(socket.EAI_NONAME, "Name or service not known")):
+            self.assertFalse(research.is_public_http_url("https://no-such-site.example/"))  # a real "no such site"

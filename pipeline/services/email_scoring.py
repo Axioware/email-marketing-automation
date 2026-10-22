@@ -20,7 +20,7 @@ from django.core.management.base import CommandError
 from django.db import DatabaseError
 from openai import APIError
 
-from pipeline.management.base import OutOfTime, out_of_time, time_limit_note
+from pipeline.management.base import PARTIAL, OutOfTime, out_of_time, time_limit_note
 from pipeline.models import Prospect, SendingSettings
 from pipeline.services.llm import complete, make_llm_client, rejected_output, tune
 
@@ -201,7 +201,7 @@ def run(options: dict) -> int:
         print(f"Done: {counts['ready']} ready to email, {counts['needs_review']} need review, "
               f"{excluded_count} excluded by a pattern, {counts['failed']} not scored"
               + (" (dry run, nothing saved)." if options["dry_run"] else "."))
-        return 1 if counts["failed"] else 0
+        return PARTIAL if counts["failed"] else 0
     except DatabaseError as error:
         print(f"Database operation failed ({type(error).__name__}): {str(error).splitlines()[0]}")
         return 1

@@ -42,6 +42,7 @@ def require_worker_libraries() -> None:
                            "pip install -r requirements-worker.txt.")
 
 from pipeline.models import Business, BusinessSource, DiscoveryCampaign
+from pipeline.management.base import PARTIAL
 from pipeline.services.console import interactive, wait_for_person
 from pipeline.services.dbthread import outside_event_loop
 
@@ -913,4 +914,4 @@ def run_refresh(options: dict) -> int:
             print(browser_hint(error))
         return 1
     print(f"Done: {updated} business(es) updated, {failed} could not be read.")
-    return 1 if failed else 0
+    return PARTIAL if failed else 0

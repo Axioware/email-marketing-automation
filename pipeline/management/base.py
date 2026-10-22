@@ -3,6 +3,10 @@ import time
 
 from django.core.management.base import BaseCommand, CommandError
 
+# A step's return code when it did its work but some items failed (a website that did not load, an email held back):
+# the run still counts as succeeded; the output lists the failures. Any other non-zero code is a failed run.
+PARTIAL = 2
+
 
 class ServiceCommand(BaseCommand):
     """A management command that runs one pipeline service module (its `add_arguments` and `run`).
@@ -20,6 +24,9 @@ class ServiceCommand(BaseCommand):
 
     def handle(self, *args, **options):
         code = self.service.run(options)
+        if code == PARTIAL:
+            print("Finished with some errors (see the output above); the rest was done.")
+            code = 0
         sys.stdout.flush()
         if code:
             raise CommandError("Finished with errors (see the output above).", returncode=code)
