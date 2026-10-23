@@ -1,6 +1,6 @@
 # User guide
 
-This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. You queue approved emails in the **Outbox** and the app sends them from **your own mailbox**, each at its time. Leads move through a **Pipeline** you update when people reply. The app runs on your computer; the data is kept in Supabase.
+This tool finds local businesses, works out who runs each one and their email address, writes a personal cold email (and follow-ups) for each person, and lets you review and approve every email. You queue approved emails in the **Outbox** and the app sends them from **your own mailboxes**, each at its time. Leads move through a **Pipeline** you update when people reply. The app runs on your computer; the data is kept in Supabase.
 
 You do everything from the **admin** in your browser. Nothing is ever sent without your approval.
 
@@ -222,7 +222,7 @@ To approve or reject many emails at once: on the Emails list tick them, choose *
 
 Emails go from **your own mailbox**, at the time the app gives each one. Nothing is sent until you queue it.
 
-1. **Approve** an email (Step 7): it gets a send time. That time comes after the latest planned email of any campaign, plus the gap (Settings; default 2 minutes plus a random 3-5 minutes). It is only inside its campaign's send window, and the daily cap (default 40) applies to all campaigns together, since one mailbox sends them all. A follow-up never goes before its days after the previous email.
+1. **Approve** an email (Step 7): it gets a **mailbox** and a send time. The daily cap and the gap on the Settings page (default 40 a day; 2 minutes plus a random 3-5 minutes) apply to **each mailbox**. The email takes the first mailbox in your order that still has room that day; once it is full the next mailbox takes over, and when all of them are full it waits for the next day. A follow-up goes from the same mailbox as the email before it when that one has room. The send time is always inside the campaign's send window, and a follow-up never goes before its days after the previous email.
 2. Sidebar > **Outbox**. It lists approved, queued and failed emails with their send times (in each campaign's time zone).
 3. **Tick the ones to send**, choose **Queue for sending** in the Action menu and click **Go**. (One email: **Queue for sending** on its page.)
 4. The **sender** starts in the background (it shows under Pipeline runs). It waits until each queued email's time, sends it, and stops when nothing is queued any more.
@@ -234,7 +234,7 @@ What else to know:
 - **After it is sent**, it becomes **Sent**, the lead moves to Initial Email or Follow-up on the Pipeline, and the next follow-up is written for your review.
 - **A send failed?** The Outbox shows it as **Failed** with the reason. Fix the problem and queue it again.
 - **The app crashed or the computer was off?** The emails not sent yet are still Queued. Tick them and **Queue for sending** again (or click **Start the sender**): the ones whose time passed go out right away, one after another. If the crash hit in the middle of an email, that one is marked **Failed: check your Sent folder**; queue it again only if it is not in Gmail's Sent folder.
-- **Set up once:** your mailbox's SMTP details in `.env` (see [Settings](#9-settings)). Until then queued emails just wait, and the dashboard says so.
+- **Set up once:** sidebar > **Mailboxes** > **Add**: a name, the from address and name, the SMTP server, port and security (Gmail: `smtp.gmail.com`, 587, STARTTLS), the username and password (Gmail: an app password), and its **order**. Add as many as you like. Tick one and choose **Test the login** to check it (nothing is sent). The list shows how many emails each has planned today against the cap. Until there is an active mailbox, queued emails just wait, and the dashboard says so.
 
 Statuses: In review → Approved → **Queued** → **Sent** (→ Replied), or **Failed**.
 
@@ -361,8 +361,8 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | `GROQ_API_KEY` or `OPENAI_API_KEY` | Research (step 3) |
 | `SEARXNG_URL` | Web search for decision makers (step 4); the local SearXNG |
 | `VERIFY_MAIL_FROM`, `VERIFY_HELO` | Verifying emails (step 5) |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD` | Sending (step 8): your mailbox's SMTP server and login (Gmail / Google Workspace: an app password) |
-| `SENDER_EMAIL`, `SENDER_NAME` | Sending: the From address and name; the name is also the sign-off (empty: "The Axioware team") |
+| `MAILBOX_ENCRYPTION_KEY` | Sending (step 8): encrypts the mailbox passwords stored in the database; use the same key on every computer. The mailboxes themselves are added under **Mailboxes** |
+| `SENDER_NAME` | The `{{sender_name}}` sign-off in templates (empty: "The Axioware team"); the From name comes from the mailbox |
 | `MAPS_SCRAPER_URL` | Optional: where the scraper container answers (default `http://127.0.0.1:8001`) |
 
 ## 10. Troubleshooting
@@ -373,7 +373,8 @@ Settings live in the `.env` file in the project folder. After changing it, resta
 | A run failed | Open it under **Pipeline runs**; the last lines of the output say why |
 | Verify: every result is "unknown", or "port 25 is probably blocked" | Your network blocks the port used to check mailboxes; try another network |
 | Verify: "Cannot reach Reacher" | Is Docker running? The app starts Reacher itself; check `REACHER_URL` |
-| Sending: "The mail server refused the login" | Check `SMTP_USERNAME` / `SMTP_PASSWORD` (Gmail needs an app password); the email stays queued, then click **Start the sender** in the Outbox |
+| Sending: "These mailboxes refused the login" | Fix that mailbox's password under **Mailboxes** (Gmail needs an app password) and use **Test the login**; its emails stayed queued, so click **Start the sender** in the Outbox |
+| "Cannot read a stored password with this MAILBOX_ENCRYPTION_KEY" | This computer's `.env` has a different key from the one the passwords were saved with: copy the key from the other computer |
 | An email is **Failed** in the Outbox | Read the reason next to it, fix it, then queue it again |
 | "queued but the sender is not running" | The app was restarted: click **Start the sender** in the Outbox |
 | Fetch: "The scraper container ... is not reachable" | Start it (`docker compose up -d` in its folder) or fix `MAPS_SCRAPER_URL`; or use the built-in browser |

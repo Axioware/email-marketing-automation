@@ -19,6 +19,7 @@ from pipeline.models import (
     DiscoveryCampaign,
     Email,
     FollowUp,
+    Mailbox,
     PipelineRun,
     PipelineStage,
     Prospect,
@@ -26,19 +27,17 @@ from pipeline.models import (
     StageChange,
 )
 from pipeline.services import outreach, sending, stages, stakeholders
-from tests.support import make_business, make_campaign, make_email, make_email_prompt, review_env
+from tests.support import (TEST_MAILBOX_KEY, make_business, make_campaign, make_email, make_email_prompt,
+                           make_mailbox, review_env)
 
 KARACHI = ZoneInfo("Asia/Karachi")
-SMTP = {"EMAIL_HOST": "smtp.test", "SENDER_EMAIL": "ali@axioware.tech", "SENDER_NAME": "Ali Khan",
-        "EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend"}
-
-
-@override_settings(**SMTP)
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
 class OutreachCase(TestCase):
     def setUp(self):
-        env = mock.patch.dict(os.environ, review_env())
+        env = mock.patch.dict(os.environ, {**review_env(), "MAILBOX_ENCRYPTION_KEY": TEST_MAILBOX_KEY})
         env.start()
         self.addCleanup(env.stop)
+        self.mailbox = make_mailbox()
         self.initial = make_email_prompt("Initial A", "INITIAL A")
         self.follow = make_email_prompt("Follow 1", "FOLLOW 1", kind="follow_up")
         self.campaign = make_campaign(name="Clinics", initial_prompts=[self.initial])  # default Settings: 120 s + 180-300 s, 40 a day
@@ -210,16 +209,20 @@ class QueueTests(OutreachCase):
         self.assertIn(f"#{in_review.pk} (it is in review)", message)
         self.assertEqual(PipelineRun.objects.count(), 0)
 
-    @override_settings(EMAIL_HOST="")
-    def test_without_smtp_settings_emails_wait_in_the_queue(self):
+    def test_without_a_mailbox_emails_can_be_approved_but_not_queued(self):
+        Mailbox.objects.all().delete()
         email = self.email()
-        review.approve(email)
-        message = review.queue([email])
-        self.assertIn("Sending is not set up (SMTP_HOST in .env)", message)
-        self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
+        review.approve(email)  # gets a time, no mailbox yet
+        self.assertEqual(Email.objects.get(pk=email.pk).status, "approved")
+        message = review.queue([Email.objects.get(pk=email.pk)])
+        self.assertIn("no active mailbox to send from", message)
         self.assertFalse(PipelineRun.objects.exists())
-        with self.assertRaisesMessage(CommandError, "Sending is not set up"):
+        with self.assertRaisesMessage(CommandError, "an active mailbox (Settings > Mailboxes)"):
             self.send()
+        make_mailbox("Later")
+        with mock.patch("pipeline.jobs.launch"), self.captureOnCommitCallbacks(execute=True):
+            review.queue([Email.objects.get(pk=email.pk)])
+        self.assertEqual(Email.objects.get(pk=email.pk).mailbox.name, "Later")  # given one when queued
 
     def test_editing_or_rejecting_takes_it_out_of_the_queue(self):
         email = self.queued()
@@ -331,13 +334,24 @@ class SendingTests(OutreachCase):
             review.queue([email])
         self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
 
-    def test_a_refused_login_stops_the_sender_and_keeps_the_email_queued(self):
+    def test_a_refused_login_keeps_its_emails_queued_and_the_other_mailboxes_go_on(self):
         email = self.queued()
-        with mock.patch("django.core.mail.backends.locmem.EmailBackend.send_messages",
-                        side_effect=smtplib.SMTPAuthenticationError(535, b"bad password")):
-            with self.assertRaisesMessage(CommandError, "refused the login"):
+        backup = make_mailbox("Backup", "rauf@getaxioware.com", priority=2)
+        other = self.queued()
+        Email.objects.filter(pk=other.pk).update(mailbox=backup)
+        real_send = sending.send_one
+
+        def refuse_main(email, mailbox, connection):
+            if mailbox.pk == self.mailbox.pk:
+                raise smtplib.SMTPAuthenticationError(535, b"bad password")
+            return real_send(email, mailbox, connection)
+
+        with mock.patch("pipeline.services.sending.send_one", side_effect=refuse_main):
+            with self.assertRaisesMessage(CommandError, "refused the login, so their emails are still queued: Main"):
                 self.send()
         self.assertEqual(Email.objects.get(pk=email.pk).status, "queued")
+        self.assertEqual(Email.objects.get(pk=other.pk).status, "sent")  # the backup mailbox went on
+        self.assertIn("Login refused", Mailbox.objects.get(pk=self.mailbox.pk).last_error)
 
     def test_a_half_sent_email_becomes_failed_and_stopped_leads_get_nothing(self):
         half = self.queued()
@@ -356,6 +370,98 @@ class SendingTests(OutreachCase):
 
         self.assertIn("send_emails", jobs.COMMANDS)
         self.assertEqual(jobs.build_arguments("send_emails", {"once": True}), ["--once"])
+
+
+class MailboxTests(OutreachCase):
+    def setUp(self):
+        super().setUp()
+        self.backup = make_mailbox("Backup", "rauf@getaxioware.com", "Rauf", priority=2)
+        SendingSettings.objects.update_or_create(pk=1, defaults={"daily_cap": 2, "gap_fixed_seconds": 60,
+                                                                 "gap_random_min_seconds": 0,
+                                                                 "gap_random_max_seconds": 0})
+
+    def approve_many(self, count):
+        emails = []
+        for _ in range(count):
+            email = self.email()
+            review.approve(email)
+            emails.append(Email.objects.get(pk=email.pk))
+        return emails
+
+    def test_the_first_mailbox_fills_up_then_the_next_then_they_wait(self):
+        emails = self.approve_many(5)  # cap 2 per mailbox per day
+        boxes = [email.mailbox.name for email in emails]
+        self.assertEqual(boxes[:4], ["Main", "Main", "Backup", "Backup"])
+        zone = ZoneInfo(self.campaign.send_timezone)
+        days = [email.scheduled_at.astimezone(zone).date() for email in emails]
+        self.assertEqual(len(set(days[:4])), 1)  # the four fit today, two per mailbox
+        self.assertEqual(days[4], days[0] + timedelta(days=1))  # both full: the fifth waits for tomorrow
+        self.assertEqual(boxes[4], "Main")  # tomorrow starts with the first mailbox again
+        gap = (emails[1].scheduled_at - emails[0].scheduled_at).total_seconds()
+        self.assertGreaterEqual(gap, 60)  # the gap applies within a mailbox
+
+    def test_inactive_mailboxes_are_skipped_and_order_counts(self):
+        Mailbox.objects.filter(pk=self.mailbox.pk).update(priority=5)
+        self.assertEqual(self.approve_many(1)[0].mailbox, self.backup)
+        Mailbox.objects.filter(pk=self.backup.pk).update(is_active=False)
+        self.assertEqual(self.approve_many(1)[0].mailbox, self.mailbox)
+
+    def test_a_follow_up_goes_from_the_same_mailbox_when_it_has_room(self):
+        Mailbox.objects.filter(pk=self.mailbox.pk).update(priority=9)  # the backup is first in order
+        first = self.queued()
+        self.assertEqual(Email.objects.get(pk=first.pk).mailbox, self.backup)
+        Email.objects.filter(pk=first.pk).update(mailbox=self.mailbox)  # it went from Main
+        self.send()
+        follow_up = Email.objects.get(prospect_id=first.prospect_id, sequence_step=2)
+        Email.objects.filter(pk=first.pk).update(sent_at=outreach.now() - timedelta(days=4))
+        review.approve(follow_up)
+        self.assertEqual(Email.objects.get(pk=follow_up.pk).mailbox, self.mailbox)  # same sender, same thread
+
+    def test_each_email_goes_from_its_own_mailbox(self):
+        main_email, backup_email = self.queued(), self.queued()
+        Email.objects.filter(pk=backup_email.pk).update(mailbox=self.backup)
+        self.send()
+        senders = {message.to[0]: message.from_email for message in mail.outbox}
+        self.assertEqual(senders[main_email.recipient], "Ali Khan <ali@axioware.tech>")
+        self.assertEqual(senders[backup_email.recipient], "Rauf <rauf@getaxioware.com>")
+        self.assertEqual(Email.objects.get(pk=backup_email.pk).sent_from, "rauf@getaxioware.com")
+        self.assertIsNotNone(Mailbox.objects.get(pk=self.backup.pk).last_used_at)
+
+    def test_passwords_are_stored_encrypted(self):
+        row = Mailbox.objects.get(pk=self.mailbox.pk)
+        self.assertNotIn("pw", row.password_encrypted)
+        self.assertEqual(row.get_password(), "pw")
+        from pipeline.services import secrets_box
+
+        with mock.patch.dict(os.environ, {"MAILBOX_ENCRYPTION_KEY": "x" * 10}):
+            with self.assertRaisesMessage(secrets_box.SecretsError, "not a valid key"):
+                row.get_password()
+        other_key = "Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eHF1dXg="
+        with mock.patch.dict(os.environ, {"MAILBOX_ENCRYPTION_KEY": other_key}):
+            with self.assertRaisesMessage(secrets_box.SecretsError, "use the same key on every machine"):
+                row.get_password()
+
+    def test_admin_page(self):
+        url = reverse("admin:pipeline_mailbox_add")
+        form = {"name": "Third", "from_email": "x@y.com", "from_name": "X", "host": "smtp.y.com", "port": "465",
+                "security": "ssl", "username": "x@y.com", "password": "", "priority": "3", "is_active": "on"}
+        self.assertContains(self.client.post(url, form), "Required for a new mailbox")
+        self.assertEqual(self.client.post(url, {**form, "password": "secret"}).status_code, 302)
+        third = Mailbox.objects.get(name="Third")
+        self.assertEqual(third.get_password(), "secret")
+        change = reverse("admin:pipeline_mailbox_change", args=[third.pk])
+        self.assertNotContains(self.client.get(change), "secret")  # never shown again
+        self.client.post(change, {**form, "password": "", "port": "587"})
+        third.refresh_from_db()
+        self.assertEqual((third.port, third.get_password()), (587, "secret"))  # empty keeps the saved password
+        with mock.patch("pipeline.services.sending.test_login", return_value=None):
+            response = self.client.post(reverse("admin:pipeline_mailbox_changelist"),
+                                        {"action": "test_login", "_selected_action": [third.pk]}, follow=True)
+        self.assertContains(response, "login works")
+        listing = self.client.get(reverse("admin:pipeline_mailbox_changelist"))
+        self.assertContains(listing, "0 / 2")  # planned today / the cap from Settings
+        outbox = self.client.get(reverse("admin:pipeline_outboxemail_changelist"))
+        self.assertEqual(outbox.status_code, 200)
 
 
 class StageTests(OutreachCase):
@@ -493,5 +599,5 @@ class ReviewQueueTests(OutreachCase):
         failed = self.queued()
         Email.objects.filter(pk=failed.pk).update(status="failed", send_error="x")
         self.assertIn("1 email(s) failed to send", self.client.get(reverse("admin:index")).content.decode())
-        with override_settings(EMAIL_HOST=""):
-            self.assertIn("Sending is not set up", self.client.get(reverse("admin:index")).content.decode())
+        Mailbox.objects.update(is_active=False)
+        self.assertIn("Sending is not set up: add an active mailbox", self.client.get(reverse("admin:index")).content.decode())

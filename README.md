@@ -1,6 +1,6 @@
 # Email Marketing Automation
 
-Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each from your templates and lets you review and approve them. You queue approved emails in the **Outbox** and the app **sends them from your own mailbox (SMTP)**, each at its time; leads move through a **Pipeline** (New Lead → ... → Won / Lost) that you update by hand on replies. Everything runs **on your machine** (the Django app, SearXNG, Reacher and the scraper container in Docker); the data lives in **Supabase** (PostgreSQL). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command.
+Finds local businesses, researches and scores them, finds the decision maker and a working email, writes a personalised email (and follow-ups) for each from your templates and lets you review and approve them. You queue approved emails in the **Outbox** and the app **sends them from your own mailboxes (SMTP)**, each at its time; leads move through a **Pipeline** (New Lead → ... → Won / Lost) that you update by hand on replies. Everything runs **on your machine** (the Django app, SearXNG, Reacher and the scraper container in Docker); the data lives in **Supabase** (PostgreSQL). It is a Django project: everything is in the **Django admin** and a **REST API**, and every step is also a `manage.py` command.
 
 **Using the admin day to day:** see the [user guide](docs/USER_GUIDE.md), also available in the admin under **Guide** (top right).
 
@@ -28,7 +28,7 @@ Also needed:
 
 - **Supabase**: the database (`DATABASE_URL`; the pooler URL if your network has no IPv6). Run `python manage.py migrate` against it after pulling new code.
 - **Docker**: `docker compose up -d` starts SearXNG (`SEARXNG_URL=http://127.0.0.1:8888`, reachable from this machine only). Email verification (Module 4) starts Reacher itself (see "Docker setup" below); the Google Maps scraper container runs from its own repo (`MAPS_SCRAPER_URL`, default `http://127.0.0.1:8001`).
-- **Your mailbox** for sending: the `SMTP_` settings and `SENDER_EMAIL` in `.env` (see [Sending from your mailbox](#sending-from-your-mailbox-the-outbox)).
+- **Your mailboxes** for sending: add them in the admin under **Mailboxes**, and set `MAILBOX_ENCRYPTION_KEY` in `.env` (the same on every machine) so their passwords can be stored encrypted (see [Sending from your mailbox](#sending-from-your-mailbox-the-outbox)).
 
 ### Docker setup (Reacher, for email verification)
 
@@ -85,7 +85,7 @@ If you change `VERIFY_MAIL_FROM` or `VERIFY_HELO`, the next run recreates the co
 | Website research | `GROQ_API_KEY` (or `GROK_API_KEY`), otherwise `OPENAI_API_KEY` |
 | Decision makers | `SEARXNG_URL` (the local SearXNG) |
 | Email verification | `VERIFY_MAIL_FROM`, `VERIFY_HELO` |
-| Sending | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SENDER_EMAIL`, `SENDER_NAME` (also the sign-off; empty: "The Axioware team") |
+| Sending | `MAILBOX_ENCRYPTION_KEY` (encrypts the mailbox passwords; the mailboxes themselves are in the admin), `SENDER_NAME` (the sign-off; empty: "The Axioware team") |
 
 ### Docker setup (Google Maps scraper, optional second lead source)
 
@@ -373,15 +373,17 @@ Statuses: `in_review` -> `approved` (send time given) -> `queued` (Outbox) -> `s
 
 ## Sending from your mailbox (the Outbox)
 
-The app sends the emails itself, over SMTP from your own mailbox. Nothing runs on a timer: you queue emails, and a background sender sends them at their times.
+The app sends the emails itself, over SMTP from your own mailboxes. Nothing runs on a timer: you queue emails, and a background sender sends them at their times.
 
-1. **Approval = a send time.** Approving an email gives it a send time (`emails.scheduled_at`): the latest planned send of any campaign + `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`, inside the campaign's send window, at most `daily_cap` a day for all campaigns together (global: the admin's **Settings** page, or `/api/settings/`); a follow-up never before "previous email sent + its days". It stays **Approved**; nothing is sent yet.
+**Mailboxes** (admin: **Mailboxes**, table `mailboxes`): one row per SMTP account: name, from address and name, server, port, security (`starttls`, `ssl` for port 465, or `none`), username, password (Gmail / Google Workspace: an app password), **order** and **active**. Passwords are stored encrypted (Fernet) with `MAILBOX_ENCRYPTION_KEY` from `.env`; every machine running the app needs the same key. **Test the login** (an action on the list) connects and logs in without sending anything. The list shows each mailbox's planned emails today against the cap, and its last problem.
+
+1. **Approval = a mailbox and a send time.** The limits on the **Settings** page (`daily_cap`, `gap_fixed_seconds` + a random `gap_random_min_seconds`..`gap_random_max_seconds`) apply **to each mailbox separately**. An approved email takes the **first active mailbox in order that still has room** on the earliest day it can go, at that mailbox's next slot (its latest send + the gaps, inside the campaign's send window); when the first mailbox is full for the day the next one is used, and when **every mailbox is full** the email waits for the next day (`emails.mailbox`, `emails.scheduled_at`). A follow-up prefers the mailbox the lead's previous email went from (same sender, same thread) when it has room, and never goes before "previous email sent + its days". It stays **Approved**; nothing is sent yet. Without any mailbox an email still gets a time; queueing it needs one (it is given a mailbox then).
 2. **Queue (Outbox).** The admin's **Outbox** lists approved, queued and failed emails with their send times (in each campaign's time zone). Tick them and choose **Queue for sending** (also on the email page, or `POST /api/emails/queue/`). An email whose time has already passed is sent right away. Queueing emails that are still queued (e.g. after the app crashed) only makes sure the sender runs. Queueing starts the **sender** (a pipeline run, `send_emails`) unless it is already running.
 3. **The sender** (`pipeline/services/sending.py`) takes the queued email with the earliest time, waits until then (looking again every 30 s, so emails queued meanwhile are picked up), sends it and goes on; it stops when the queue is empty. It only runs while this machine and the app are on: if it was stopped (crash, restart), the Outbox and the dashboard say so; queue the remaining emails again (or **Start the sender**) and the ones whose time passed go out right away, one after the other. `python manage.py send_emails` runs it by hand (`--once`: only what is due now).
-4. **Each email** goes as text + HTML (both with the footer from Settings), From `SENDER_NAME <SENDER_EMAIL>`, with a `List-Unsubscribe` header (a reply to you). A follow-up is sent as a reply to the email before it (`In-Reply-To`), so it lands in the same thread. After it is sent: status **Sent**, the prospect is contacted, the lead moves on the Pipeline, and the next follow-up is written for review right away (approve and queue it the same way).
-5. **Failures.** A refused recipient or a server error marks that email **Failed** with the reason (Outbox, dashboard); queue it again to retry. A refused login stops the sender and leaves the email queued. An email the sender was in the middle of when it stopped becomes Failed on the next start: check your Sent folder before queueing it again.
+4. **Each email** goes as text + HTML (both with the footer from Settings), from its mailbox (`From name <from address>`), with a `List-Unsubscribe` header (a reply to that address). A follow-up is sent as a reply to the email before it (`In-Reply-To`), so it lands in the same thread. After it is sent: status **Sent**, the prospect is contacted, the lead moves on the Pipeline, and the next follow-up is written for review right away (approve and queue it the same way).
+5. **Failures.** A refused recipient or a server error marks that email **Failed** with the reason (Outbox, dashboard); queue it again to retry. A mailbox that refuses its login gets the error noted on it; its emails stay queued and the other mailboxes go on (the run then ends as failed, naming the mailbox: fix its password and click **Start the sender**). A mailbox removed or turned off before its email went: that email becomes Failed; queue it again and it is given another mailbox. An email the sender was in the middle of when it stopped becomes Failed on the next start: check your Sent folder before queueing it again.
 
-Settings in `.env`: `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_SECURITY` (`starttls`, `ssl` for port 465, or `none`), `SMTP_USERNAME`, `SMTP_PASSWORD` (Gmail / Google Workspace: an app password), `SENDER_EMAIL`, `SENDER_NAME`. Without `SMTP_HOST` and `SENDER_EMAIL` nothing is sent: queued emails wait and the dashboard says so.
+Without an active mailbox (or without `MAILBOX_ENCRYPTION_KEY`) nothing is sent: queued emails wait and the dashboard says so. `SENDER_NAME` in `.env` is only the `{{sender_name}}` sign-off in templates; the From name comes from the mailbox.
 
 ## The Pipeline (leads)
 

@@ -142,3 +142,19 @@ def review_env(llm=None) -> dict:
 
 # Extra fields the campaign form needs (none since follow-ups moved to email sequences).
 CAMPAIGN_INLINE = {}
+
+
+TEST_MAILBOX_KEY = "pbPjVY8u9gmRZ5PiJn7f0Jx0cHqYwvTt9cHOmGKe3Lw="  # a Fernet key for tests only
+
+
+def make_mailbox(name="Main", from_email="ali@axioware.tech", from_name="Ali Khan", priority=1, password="pw",
+                 **fields):
+    """A mailbox (SMTP account) with an encrypted password; needs MAILBOX_ENCRYPTION_KEY=TEST_MAILBOX_KEY set."""
+    from pipeline.models import Mailbox
+
+    mailbox = Mailbox(name=name, from_email=from_email, from_name=from_name, host="smtp.test", port=587,
+                      username=from_email, priority=priority, **fields)
+    mailbox.set_password(password)
+    mailbox.save()
+    return mailbox
+

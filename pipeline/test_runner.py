@@ -27,7 +27,7 @@ def free_port() -> int:
 # before any test runs (tests that need one set a fake value themselves).
 EXTERNAL_SERVICE_ENV = ("GROQ_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
                         "MAPS_SCRAPER_URL", "MAPS_SCRAPER_KEY", "REACHER_URL", "REACHER_SECRET",
-                        "SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "SENDER_EMAIL", "HUNTER_API_KEY",
+                        "MAILBOX_ENCRYPTION_KEY", "HUNTER_API_KEY",
                         "HUNTER_BASE_URL")
 
 

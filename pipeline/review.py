@@ -154,7 +154,7 @@ def queue(emails) -> str:
         from pipeline.services import sending
 
         if not sending.configured():
-            return message + f" Sending is not set up ({sending.missing_settings()} in .env), so they wait in the queue."
+            return message + f" Sending is not set up (add {sending.missing_settings()}), so they wait in the queue."
         run, started = jobs.ensure_sender()
         message += f" The sender {'started' if started else 'is running'} (run #{run.pk}); each email goes at its time."
     return message

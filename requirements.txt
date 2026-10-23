@@ -16,3 +16,4 @@ playwright>=1.40
 trafilatura>=1.12
 lxml_html_clean>=0.4
 selenium>=4.20
+cryptography>=42

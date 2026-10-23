@@ -1,8 +1,12 @@
 """Scheduling, queueing and recording the emails this machine sends (pipeline/services/sending.py sends them).
 
-1. Approval = a send time (`schedule`): after the latest send time of any campaign plus a fixed gap plus a random
-   gap, inside the campaign's send window and the daily cap (Settings); a follow-up never before "previous email sent
-   + its days". The time is stored on the email (`emails.scheduled_at`); the email stays Approved.
+1. Approval = a mailbox and a send time (`schedule`). The limits on the Settings page (daily cap, fixed + random gap)
+   apply to each mailbox separately (Settings > Mailboxes). The email takes the first active mailbox in order that
+   still has room on the earliest day it can go, at that mailbox's next slot (after its latest send plus the gaps,
+   inside the campaign's send window); when the first mailbox is full for the day the next one is used, and when
+   every mailbox is full the email waits for the next day. A follow-up prefers the mailbox the lead's previous email
+   went from (same sender, same thread) when it has room, and never goes before "previous email sent + its days".
+   The time and mailbox are stored on the email (`scheduled_at`, `mailbox`); the email stays Approved.
 2. Queue (`queue`, the Outbox page): a person picks approved emails and queues them; only queued emails are sent. An
    email whose time has already passed is sent right away. Queueing emails that are still queued (e.g. after the app
    crashed) only makes sure the sender runs. Queueing starts the sender (a background run) if it is not running; it
@@ -20,7 +24,7 @@ from zoneinfo import ZoneInfo
 from django.db import transaction
 from django.db.models import Max
 
-from pipeline.models import DiscoveryCampaign, Email, FollowUp, Prospect, SendingSettings
+from pipeline.models import DiscoveryCampaign, Email, FollowUp, Mailbox, Prospect, SendingSettings
 from pipeline.services import generation
 
 HOLDS_SLOT = ("approved", "queued", "sending", "sent", "opened", "replied")  # with scheduled_at set
@@ -50,20 +54,29 @@ def local_day_bounds(campaign: DiscoveryCampaign, day: date) -> tuple[datetime, 
     return datetime.combine(day, day_time.min, tzinfo=tz), datetime.combine(day + timedelta(days=1), day_time.min, tzinfo=tz)
 
 
-def slot_holders():
-    """Emails holding a send time, in every campaign: they all go out from one mailbox."""
-    return Email.objects.filter(status__in=HOLDS_SLOT, scheduled_at__isnull=False)
+def active_mailboxes() -> list[Mailbox]:
+    return list(Mailbox.objects.filter(is_active=True).order_by("priority", "id"))
+
+
+def slot_holders(mailbox: Mailbox | None = None):
+    """Emails holding a send time (every campaign), from one mailbox when given."""
+    holders = Email.objects.filter(status__in=HOLDS_SLOT, scheduled_at__isnull=False)
+    return holders.filter(mailbox=mailbox) if mailbox is not None else holders
 
 
 def next_slot(campaign: DiscoveryCampaign, earliest: datetime, rng: random.Random | None = None,
-              sending: SendingSettings | None = None, exclude_id: int | None = None) -> datetime:
+              sending: SendingSettings | None = None, exclude_id: int | None = None,
+              mailbox: Mailbox | None = None) -> datetime:
     """The send time for an email of the campaign: at least `earliest`, at least the fixed plus a random gap after the
-    latest send time of any campaign, inside the campaign's send window, on a day when fewer than the daily cap (all
-    campaigns together, the day in the campaign's time zone) are planned. The gaps and the cap are the global
-    Settings. Call it inside a transaction that locked the settings row, so two approvals never take the same slot."""
+    latest send time of the mailbox (of every email, without one), inside the campaign's send window, on a day when
+    fewer than the daily cap are planned from it (the day in the campaign's time zone). The gaps and the cap are the
+    Settings, per mailbox. Call it inside a transaction that locked the settings row, so two approvals never take the
+    same slot."""
     rng = rng or random
     sending = sending or SendingSettings.current()
-    holders = slot_holders().exclude(pk=exclude_id) if exclude_id else slot_holders()
+    holders = slot_holders(mailbox)
+    if exclude_id:
+        holders = holders.exclude(pk=exclude_id)
     latest = holders.aggregate(latest=Max("scheduled_at"))["latest"]
     candidate = earliest
     if latest is not None:
@@ -100,16 +113,34 @@ def earliest_send(email: Email) -> datetime:
     return max(now(), previous.sent_at + timedelta(days=step.days_after_previous if step else 0))
 
 
+def choose_slot(email: Email, campaign: DiscoveryCampaign, earliest: datetime,
+                sending: SendingSettings) -> tuple[Mailbox | None, datetime]:
+    """The mailbox and send time for an email: the first mailbox in order (the lead's previous mailbox first, for a
+    follow-up) whose next slot falls on the earliest day any mailbox can send; a full mailbox (daily cap reached) is
+    skipped for the next one, and when all are full the earliest next-day slot wins. Without any mailbox yet the
+    email gets a time only; queueing it then needs a mailbox."""
+    boxes = active_mailboxes()
+    if not boxes:
+        return None, next_slot(campaign, earliest, sending=sending, exclude_id=email.pk)
+    previous = (Email.objects.filter(prospect_id=email.prospect_id, sequence_step=email.sequence_step - 1)
+                .values_list("mailbox_id", flat=True).first())
+    boxes.sort(key=lambda box: box.pk != previous)  # stable: keeps the order otherwise
+    options = [(box, next_slot(campaign, earliest, sending=sending, exclude_id=email.pk, mailbox=box)) for box in boxes]
+    zone = ZoneInfo(campaign.send_timezone)
+    first_day = min(slot.astimezone(zone).date() for _, slot in options)
+    return next((box, slot) for box, slot in options if slot.astimezone(zone).date() == first_day)
+
+
 def schedule(email: Email, statuses: tuple[str, ...] = ("approved",)) -> datetime:
-    """Give the email its send time (a fresh one if it had one). Returns the time."""
+    """Give the email its mailbox and send time (fresh ones if it had them). Returns the time."""
     SendingSettings.current()  # the row exists before it is locked
     with transaction.atomic():
         sending = SendingSettings.objects.select_for_update().get(pk=1)  # one at a time, all campaigns
         campaign = DiscoveryCampaign.objects.get(pk=email.business.discovery_campaign_id)
-        slot = next_slot(campaign, earliest_send(email), sending=sending, exclude_id=email.pk)
-        if not Email.objects.filter(pk=email.pk, status__in=statuses).update(scheduled_at=slot):
+        mailbox, slot = choose_slot(email, campaign, earliest_send(email), sending)
+        if not Email.objects.filter(pk=email.pk, status__in=statuses).update(scheduled_at=slot, mailbox=mailbox):
             raise OutreachError("Only approved emails can be scheduled.")
-    email.scheduled_at = slot
+    email.scheduled_at, email.mailbox = slot, mailbox
     return slot
 
 
@@ -142,7 +173,7 @@ def queue(emails) -> dict:
     Returns {"queued": n, "already": n (still queued, e.g. after a crash), "skipped": [(email id, reason), ...]}."""
     result = {"queued": 0, "already": 0, "skipped": []}
     for email in (Email.objects.filter(pk__in=[e.pk for e in emails])
-                  .select_related("prospect", "business__discovery_campaign").order_by("scheduled_at", "id")):
+                  .select_related("prospect", "business__discovery_campaign", "mailbox").order_by("scheduled_at", "id")):
         if email.status in WAITING:
             result["already"] += 1
             continue
@@ -150,12 +181,14 @@ def queue(emails) -> dict:
             result["skipped"].append((email.pk, f"it is {email.get_status_display().lower()}"))
             continue
         reason = can_be_sent(email)
+        if not reason and (email.mailbox_id is None or not email.mailbox.is_active) and not active_mailboxes():
+            reason = "there is no active mailbox to send from (Settings > Mailboxes)"
         if reason:
             result["skipped"].append((email.pk, reason))
             continue
         try:
-            if email.scheduled_at is None:
-                schedule(email, statuses=QUEUEABLE)
+            if email.scheduled_at is None or email.mailbox_id is None or not email.mailbox.is_active:
+                schedule(email, statuses=QUEUEABLE)  # no time yet, or its mailbox was removed or turned off
         except OutreachError as error:
             result["skipped"].append((email.pk, str(error)))
             continue
@@ -170,8 +203,10 @@ def unqueue(emails) -> int:
     return Email.objects.filter(pk__in=[e.pk for e in emails], status="queued").update(status="approved", queued_at=None)
 
 
-def next_queued():
-    return Email.objects.filter(status="queued").order_by("scheduled_at", "id").first()
+def next_queued(skip_mailboxes=()):
+    """The queued email to send next (earliest time), leaving out mailboxes that cannot send in this run."""
+    return (Email.objects.filter(status="queued").exclude(mailbox_id__in=list(skip_mailboxes))
+            .order_by("scheduled_at", "id").first())
 
 
 def stuck_emails():

@@ -20,7 +20,7 @@ BOARD_CARDS_PER_STAGE = 200
 # Sidebar order: the pipeline's own order, then the supporting tables. "pipelineboard" is the Pipeline page.
 MODEL_ORDER = ["discoverycampaign", "campaignprompt", "emailprompt", "emailsequence", "business", "businesswebsiteprofile",
                "businesscontact", "prospect", "email", "outboxemail", "pipelineboard", "pipelinerun", "usagerecord",
-               "sendingsettings", "businesssource"]
+               "sendingsettings", "mailbox", "businesssource"]
 
 
 def changelist(model_name: str, **filters) -> str:
@@ -318,8 +318,8 @@ class PipelineAdminSite(admin.AdminSite):
             warnings.append("SEARXNG_URL is not set: finding decision makers only reads the businesses' websites, "
                             "with no web search.")
         if not sending.configured():
-            warnings.append(f"Sending is not set up: set {sending.missing_settings()} and the other SMTP_ settings in "
-                            ".env; queued emails wait until then.")
+            warnings.append(f"Sending is not set up: add {sending.missing_settings()}; queued emails wait until "
+                            "then.")
         stuck = outreach.stuck_emails().count()
         if stuck:
             warnings.append(f"{stuck} email(s) were left half-sent by a sender that stopped: check your Sent folder "

@@ -137,20 +137,10 @@ if env_bool("DJANGO_SECURE_COOKIES"):
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
 
-# Sending: your own mailbox over SMTP (pipeline/services/sending.py). Empty SMTP_HOST or SENDER_EMAIL: nothing is sent.
+# Sending: the mailboxes (SMTP accounts) are kept in the database (Settings > Mailboxes; pipeline/services/sending.py),
+# their passwords encrypted with MAILBOX_ENCRYPTION_KEY. Tests use Django's in-memory outbox instead.
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-EMAIL_HOST = os.environ.get("SMTP_HOST", "").strip()
-EMAIL_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
-EMAIL_HOST_USER = os.environ.get("SMTP_USERNAME", "").strip()
-EMAIL_HOST_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "starttls").strip().lower()  # starttls (587), ssl (465) or none
-EMAIL_USE_TLS = SMTP_SECURITY == "starttls"
-EMAIL_USE_SSL = SMTP_SECURITY == "ssl"
 EMAIL_TIMEOUT = 60
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "").strip()
-SENDER_NAME = os.environ.get("SENDER_NAME", "").strip()
-if TESTING:  # never your mailbox: tests use Django's in-memory outbox and set these themselves
-    EMAIL_HOST = EMAIL_HOST_USER = EMAIL_HOST_PASSWORD = SENDER_EMAIL = ""
 
 # Every API request must send this value in its `Auth` header (pipeline/api/security.py). Empty: API disabled.
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()

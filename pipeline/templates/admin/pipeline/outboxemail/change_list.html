@@ -7,8 +7,7 @@
     the background while anything is queued and stops when the queue is empty; it only runs while this app's server is
     on. After a crash or restart, queue the remaining emails again (or click Start the sender) to carry on.</p>
   {% if not sending_configured %}
-    <p class="pipeline-error">Sending is not set up: set {{ missing_settings }} and the other SMTP_ settings in .env.
-      Queued emails wait until it is.</p>
+    <p class="pipeline-error">Sending is not set up: add {{ missing_settings }}. Queued emails wait until it is.</p>
   {% elif sender %}
     <p class="pipeline-note">The sender is {{ sender.get_status_display|lower }}: <a href="{{ sender_url }}">run #{{ sender.pk }}</a> ({{ queued_count }} queued).</p>
   {% elif queued_count %}

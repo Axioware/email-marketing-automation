@@ -29,6 +29,7 @@ from pipeline.models import (
     EmailPrompt,
     EmailSequence,
     FollowUp,
+    Mailbox,
     OutboxEmail,
     PipelineStage,
     BusinessContact,
@@ -1294,7 +1295,7 @@ class EmailAdmin(PipelineAdmin):
     change_list_template = "admin/pipeline/email/change_list.html"
     details = ["status_badge", "recipient", "business_link", "contact_link", "prospect_link", "written_by", "email_prompt",
                "generated_at", "reviewed_at", "review_note", "edited_at"]
-    delivery = ["scheduled_at", "queued_at", "sent_at", "sent_from", "message_id", "send_error"]
+    delivery = ["mailbox", "scheduled_at", "queued_at", "sent_at", "sent_from", "message_id", "send_error"]
 
     def has_add_permission(self, request):
         return False  # emails are written by generate_emails
@@ -1519,12 +1520,12 @@ class OutboxAdmin(PipelineAdmin):
     """Approved emails with their send times: tick them and queue them; queued ones are sent from your mailbox at
     their times (pipeline/services/sending.py)."""
 
-    list_display = ["send_time", "status_badge", "recipient", "business", "campaign", "step", "subject_link",
-                    "problem"]
+    list_display = ["send_time", "status_badge", "recipient", "mailbox", "business", "campaign", "step",
+                    "subject_link", "problem"]
     list_display_links = None
-    list_filter = [OutboxStatusFilter, "business__discovery_campaign", "sequence_step"]
+    list_filter = [OutboxStatusFilter, "mailbox", "business__discovery_campaign", "sequence_step"]
     search_fields = ["business__name", "recipient", "subject"]
-    list_select_related = ["business__discovery_campaign"]
+    list_select_related = ["business__discovery_campaign", "mailbox"]
     ordering = ["scheduled_at", "id"]
     actions = ["queue_selected", "unqueue_selected", "back_to_review"]
     change_list_template = "admin/pipeline/outboxemail/change_list.html"
@@ -1628,6 +1629,82 @@ class OutboxAdmin(PipelineAdmin):
             except review.ReviewError:
                 pass
         self.message_user(request, f"{done} email(s) back in review.")
+
+
+# ---------------------------------------------------------------- mailboxes
+
+
+class MailboxForm(forms.ModelForm):
+    password = forms.CharField(
+        required=False, widget=forms.PasswordInput(render_value=False),
+        help_text="Stored encrypted (MAILBOX_ENCRYPTION_KEY in .env). Leave empty to keep the saved one. Gmail / Google "
+                  "Workspace: an app password, not your login password.")
+
+    class Meta:
+        model = Mailbox
+        fields = ["name", "from_email", "from_name", "host", "port", "security", "username", "password", "priority",
+                  "is_active"]
+
+    def clean(self):
+        from pipeline.services import secrets_box
+
+        cleaned = super().clean()
+        if not self.instance.password_encrypted and not cleaned.get("password"):
+            self.add_error("password", "Required for a new mailbox.")
+        if cleaned.get("password") and not secrets_box.configured():
+            self.add_error("password", f"Set {secrets_box.ENV_NAME} in .env first, so the password can be stored "
+                                       "encrypted (see the README).")
+        return cleaned
+
+    def save(self, commit=True):
+        mailbox = super().save(commit=False)
+        if self.cleaned_data.get("password"):
+            mailbox.set_password(self.cleaned_data["password"])
+        if commit:
+            mailbox.save()
+        return mailbox
+
+
+@admin.register(Mailbox)
+class MailboxAdmin(PipelineAdmin):
+    """The SMTP accounts emails go out from. The daily cap and gaps on the Settings page apply to each of them."""
+
+    form = MailboxForm
+    list_display = ["name", "from_email", "host", "priority", "is_active", "today", "last_used_at", "problem"]
+    list_editable = ["priority", "is_active"]
+    readonly_fields = ["last_error", "last_used_at", "created_at", "updated_at"]
+    fieldsets = [
+        (None, {"fields": ["name", "from_email", "from_name", "priority", "is_active"],
+                "description": "Emails use the first active mailbox (lowest order) that still has room on the day, "
+                               "then the next; when all are full they wait for the next day. The daily cap and the "
+                               "gaps on the Settings page apply to each mailbox."}),
+        ("SMTP server", {"fields": ["host", "port", "security", "username", "password"]}),
+        ("Status", {"fields": ["last_error", "last_used_at", "created_at", "updated_at"]}),
+    ]
+    actions = ["test_login"]
+
+    @admin.display(description="Planned today / cap")
+    def today(self, obj):
+        from datetime import datetime, time as day_time, timedelta
+
+        start = datetime.combine(timezone.localdate(), day_time.min, tzinfo=timezone.get_current_timezone())
+        planned = obj.emails.filter(status__in=("approved", "queued", "sending", "sent", "opened", "replied"),
+                                    scheduled_at__gte=start, scheduled_at__lt=start + timedelta(days=1)).count()
+        return f"{planned} / {SendingSettings.current().daily_cap}"
+
+    @admin.display(description="Problem")
+    def problem(self, obj):
+        return Truncator(obj.last_error).chars(80) if obj.last_error else "-"
+
+    @admin.action(description="Test the login (connects and logs in; sends nothing)")
+    def test_login(self, request, queryset):
+        from pipeline.services import sending
+
+        for mailbox in queryset:
+            problem = sending.test_login(mailbox)
+            Mailbox.objects.filter(pk=mailbox.pk).update(last_error=f"Login test failed: {problem}" if problem else None)
+            self.message_user(request, f"{mailbox}: " + (f"login failed ({problem})" if problem else "login works."),
+                              messages.ERROR if problem else messages.SUCCESS)
 
 
 # ---------------------------------------------------------------- usage (AI tokens and Hunter credits)
@@ -1749,8 +1826,9 @@ class SendingSettingsAdmin(admin.ModelAdmin):
             "description": "Each approved email gets a send time: the latest planned send of any campaign plus the "
                            "fixed gap plus a random gap between the two values (e.g. 120 s + 180-300 s), inside its "
                            "campaign's send window, and at most the daily cap per day for all campaigns together. "
-                           "Queued emails are sent from your mailbox then (Outbox). Changes apply to emails approved "
-                           "from now on. After a sequence's last email, a lead with no reply moves to Quota Exhausted "
+                           "Each mailbox (Mailboxes) has its own daily cap and gaps: these numbers apply to every "
+                           "one of them; when the first is full the next is used. Queued emails are sent then "
+                           "(Outbox). Changes apply to emails approved from now on. After a sequence's last email, a lead with no reply moves to Quota Exhausted "
                            "once the reply window has passed."}),
         ("Finding and verifying contacts", {
             "fields": ["contact_provider"],

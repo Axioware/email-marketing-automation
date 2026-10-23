@@ -412,6 +412,55 @@ class SendingSettings(models.Model):
                                                   "opt out."})
 
 
+class Mailbox(models.Model):
+    """One SMTP account emails are sent from (Settings > Mailboxes). The sending limits on the Settings page (daily cap,
+    gaps) apply to each mailbox separately; emails use the first active mailbox in order that still has room that
+    day, then the next; when every mailbox is full they wait for the next day. The password is stored encrypted
+    (MAILBOX_ENCRYPTION_KEY in .env)."""
+
+    class Security(models.TextChoices):
+        STARTTLS = "starttls", "STARTTLS (usually port 587)"
+        SSL = "ssl", "SSL/TLS (usually port 465)"
+        NONE = "none", "None"
+
+    name = models.CharField(max_length=100, unique=True, help_text="Your label for it, e.g. Rauf Gmail.")
+    from_email = models.CharField("from address", max_length=320, help_text="The address emails are sent from.")
+    from_name = models.CharField("from name", max_length=200, blank=True, default="",
+                                 help_text="Shown as the sender, e.g. Abdul Rauf.")
+    host = models.CharField("SMTP server", max_length=255, help_text="E.g. smtp.gmail.com or smtp.hostinger.com.")
+    port = models.PositiveIntegerField(default=587)
+    security = models.CharField(max_length=16, choices=Security.choices, default=Security.STARTTLS)
+    username = models.CharField(max_length=320, help_text="Usually the full email address.")
+    password_encrypted = models.TextField(blank=True, default="", editable=False)
+    is_active = models.BooleanField("active", default=True, help_text="Inactive mailboxes send nothing.")
+    priority = models.PositiveIntegerField(
+        "order", default=1, help_text="Emails use the first mailbox (lowest number) that has room left today, then the "
+                                      "next.")
+    last_error = models.TextField(null=True, blank=True, help_text="The last sending or connection problem.")
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "mailboxes"
+        ordering = ["priority", "id"]
+        verbose_name = "mailbox"
+        verbose_name_plural = "mailboxes"
+
+    def __str__(self):
+        return f"{self.name} <{self.from_email}>"
+
+    def set_password(self, raw: str) -> None:
+        from pipeline.services import secrets_box
+
+        self.password_encrypted = secrets_box.encrypt(raw) if raw else ""
+
+    def get_password(self) -> str:
+        from pipeline.services import secrets_box
+
+        return secrets_box.decrypt(self.password_encrypted) if self.password_encrypted else ""
+
+
 class Business(models.Model):
     """Module 1: a business found on Google Maps."""
 
@@ -747,6 +796,8 @@ class Email(models.Model):
                                         help_text="When it goes out: the slot given when it was approved. Queued "
                                                   "emails are sent then (Outbox).")
     queued_at = models.DateTimeField(null=True, blank=True, help_text="When it was queued for sending (Outbox).")
+    mailbox = models.ForeignKey(Mailbox, on_delete=models.SET_NULL, null=True, blank=True, related_name="emails",
+                                help_text="The mailbox it goes (or went) from, given with its send time.")
     sent_at = models.DateTimeField(null=True, blank=True)
     sent_from = models.CharField(max_length=320, null=True, blank=True)
     message_id = models.CharField(max_length=255, null=True, blank=True)
