@@ -217,7 +217,7 @@ class DiscoveryCampaign(models.Model):
         help_text="The email flows (initial email and follow-ups). With several, prospects are split equally between "
                   "them (A/B test) and each keeps its sequence to the end.")
     min_score = models.PositiveSmallIntegerField(
-        default=50, db_default=50, help_text="Businesses scoring at least this go on to finding decision makers; lower ones wait "
+        default=40, db_default=40, help_text="Businesses scoring at least this go on to finding decision makers; lower ones wait "
                               "for a person to approve or reject them.")
     send_window_start = models.TimeField(null=True, blank=True, help_text="Send only between these times (campaign "
                                                                           "time zone); empty: any time of day.")

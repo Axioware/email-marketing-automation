@@ -72,7 +72,7 @@ It runs steps 2 to 6 one after another for that campaign's businesses: find busi
    - **Target locations**: cities or areas, separated by commas, e.g. `Lahore, DHA, Gulberg`.
    - **Search terms**: what you would type into Google Maps, separated by commas, e.g. `dental clinic, dentist`.
    - **Lead source** (under Leads): how businesses are found on Google Maps: **Built-in browser** (default) or **Scraper container**. You can still pick the other one for a single fetch.
-   - **Minimum score** (under Leads, default 50): businesses scoring at least this go straight on to finding decision makers; the rest wait for you to approve or reject them.
+   - **Minimum score** (under Leads, default 40): businesses scoring at least this go straight on to finding decision makers; the rest wait for you to approve or reject them.
    - **Campaign prompt** (under Prompts): what makes a good prospect; the AI scores each business's website against it. Pick one, or click **+** to write a new one. Several campaigns can share one. Without one, the campaign's businesses are not researched.
    - **Email sequences**: tick one or more. A sequence is a whole email flow (first email, then its follow-ups). With several, prospects are split equally between them (an A/B test) and each person stays in their sequence to the end. See [Email sequences](#email-sequences-and-follow-ups).
    - **Sending** (optional): a **send window** (e.g. 09:00 to 18:00) with its time zone. The gap between two sends and the **daily cap** are the same for every campaign: sidebar > **Settings** (defaults: 2 minutes fixed plus a random 3-5 minutes, 40 emails a day). See [Sending](#step-8-sending-through-gohighlevel).

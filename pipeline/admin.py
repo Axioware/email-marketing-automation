@@ -6,6 +6,7 @@ Generated emails are reviewed on their own page: edit, preview, approve, reject 
 """
 import json
 import shlex
+import uuid
 from urllib.parse import urlencode, urlsplit
 
 from django import forms
@@ -133,9 +134,13 @@ def generate_url(scope: str | None = None, ids=(), regenerate: bool = False) -> 
     return reverse("admin:pipeline_prospect_generate") + (f"?{urlencode(query)}" if query else "")
 
 
-def run_step(command: str, arguments: list):
+def run_step(command: str, arguments: list, request):
     """Admin action helper: open the run form pre-filled, so the run is reviewed and confirmed before it starts."""
-    return HttpResponseRedirect(run_form_url(command, arguments))
+    # Keep large bulk selections in the user's server-side session, not in a redirect URL.
+    token = uuid.uuid4().hex
+    request.session[f"pipeline_run_selection_{token}"] = {"command": command, "arguments": arguments}
+    url = reverse("admin:pipeline_pipelinerun_add") + "?" + urlencode({"selection": token})
+    return HttpResponseRedirect(url)
 
 
 class PipelineAdmin(admin.ModelAdmin):
@@ -306,7 +311,7 @@ class DiscoveryCampaignAdmin(PipelineAdmin):
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one campaign.", messages.WARNING)
             return None
-        return run_step("run_pipeline", ["--campaign-id", str(queryset.first().pk), "--fetch-limit", "20"])
+        return run_step("run_pipeline", ["--campaign-id", str(queryset.first().pk), "--fetch-limit", "20"], request)
 
     def fetch_one(self, request, queryset, source=None):
         if queryset.count() != 1:
@@ -863,24 +868,24 @@ class BusinessAdmin(PipelineAdmin):
 
     @admin.action(description="Refresh Google Maps details (category, reviews, city)")
     def refresh_details(self, request, queryset):
-        return run_step("refresh_businesses", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
+        return run_step("refresh_businesses", ids_arguments("--business-id", queryset.values_list("pk", flat=True)), request)
 
     @admin.action(description="Research websites (Module 2)")
     def research_websites(self, request, queryset):
         # Selected explicitly, so research them even if they were researched before.
-        return run_step("research_websites", ["--redo", *ids_arguments("--business-id", queryset.values_list("pk", flat=True))])
+        return run_step("research_websites", ["--redo", *ids_arguments("--business-id", queryset.values_list("pk", flat=True))], request)
 
     @admin.action(description="Find decision makers (Module 3)")
     def find_stakeholders(self, request, queryset):
-        return run_step("find_stakeholders", ["--redo", *ids_arguments("--business-id", queryset.values_list("pk", flat=True))])
+        return run_step("find_stakeholders", ["--redo", *ids_arguments("--business-id", queryset.values_list("pk", flat=True))], request)
 
     @admin.action(description="Verify contact emails (Module 4)")
     def verify_emails(self, request, queryset):
-        return run_step("verify_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
+        return run_step("verify_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)), request)
 
     @admin.action(description="Score emails with the AI (Module 4b)")
     def score_emails(self, request, queryset):
-        return run_step("score_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)))
+        return run_step("score_emails", ids_arguments("--business-id", queryset.values_list("pk", flat=True)), request)
 
     @admin.action(description="Write emails from templates (Module 5)")
     def generate_emails(self, request, queryset):
@@ -974,12 +979,12 @@ class BusinessWebsiteProfileAdmin(PipelineAdmin):
     @admin.action(description="Research again (Module 2)")
     def research_again(self, request, queryset):
         return run_step("research_websites", ["--redo", *ids_arguments(
-            "--business-id", queryset.values_list("business_id", flat=True))])
+            "--business-id", queryset.values_list("business_id", flat=True))], request)
 
     @admin.action(description="Find decision makers again (Module 3)")
     def rediscover_contacts(self, request, queryset):
         return run_step("find_stakeholders", ["--redo", "--min-score", "0", *ids_arguments(
-            "--business-id", queryset.values_list("business_id", flat=True))])
+            "--business-id", queryset.values_list("business_id", flat=True))], request)
 
 
 # ---------------------------------------------------------------- Module 3: contacts
@@ -1040,7 +1045,7 @@ class BusinessContactAdmin(PipelineAdmin):
 
     @admin.action(description="Verify these contacts' emails (Module 4)")
     def verify_emails(self, request, queryset):
-        return run_step("verify_emails", ["--recheck", *ids_arguments("--contact-id", queryset.values_list("pk", flat=True))])
+        return run_step("verify_emails", ["--recheck", *ids_arguments("--contact-id", queryset.values_list("pk", flat=True))], request)
 
 
 # ---------------------------------------------------------------- Module 4: prospects
@@ -1104,7 +1109,7 @@ class ProspectAdmin(PipelineAdmin):
 
     @admin.action(description="Score emails with the AI (Module 4b)")
     def score_emails(self, request, queryset):
-        return run_step("score_emails", ["--rescore", *ids_arguments("--prospect-id", queryset.values_list("pk", flat=True))])
+        return run_step("score_emails", ["--rescore", *ids_arguments("--prospect-id", queryset.values_list("pk", flat=True))], request)
 
     @admin.display(description="Stage", ordering="pipeline_stage")
     def stage_badge(self, obj):
@@ -1889,6 +1894,11 @@ class PipelineRunAdmin(PipelineAdmin):
         return [] if obj is None else self.readonly
 
     def get_changeform_initial_data(self, request):
+        token = request.GET.get("selection")
+        if token:
+            selection = request.session.get(f"pipeline_run_selection_{token}", {})
+            return {"command": selection.get("command", ""),
+                    "arguments_text": shlex.join(str(arg) for arg in selection.get("arguments", []))}
         return {"command": request.GET.get("command", ""), "arguments_text": request.GET.get("arguments", "")}
 
     def save_model(self, request, obj, form, change):
