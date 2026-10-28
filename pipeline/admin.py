@@ -13,7 +13,7 @@ from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.widgets import RelatedFieldWidgetWrapper
 from django.db import transaction
-from django.db.models import Count, F, Q, TextField
+from django.db.models import Count, Exists, F, OuterRef, Q, TextField
 from django.http import HttpResponseNotAllowed, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
@@ -703,8 +703,15 @@ class EmailsFilter(ChoiceFilter):
         ("review", "Email in review", Q(emails__status="in_review")),
         ("approved", "Email approved", Q(emails__status="approved")),
         ("sent", "Email sent", Q(emails__status__in=["sent", "opened"])),
-        ("none", "No email yet", Q(emails__isnull=True)),
+        ("unsent", "Not sent yet", None),
+        ("none", "No email created", Q(emails__isnull=True)),
     ]
+
+    def queryset(self, request, queryset):
+        if self.value() == "unsent":
+            sent_emails = Email.objects.filter(business_id=OuterRef("pk"), status__in=["sent", "opened"])
+            return queryset.filter(~Exists(sent_emails))
+        return super().queryset(request, queryset)
 
 
 class RatingFilter(ChoiceFilter):
