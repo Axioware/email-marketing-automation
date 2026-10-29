@@ -176,6 +176,7 @@ Both are edited in the admin; nothing is built into the code. Campaigns choose t
 
 | Write | You get |
 |---|---|
+| `{{greeting}}` | `Hi Ayesha,` when the name is known, or just `Hi` when it is not |
 | `{{first_name}}` | the contact's first name, e.g. Ayesha |
 | `{{first_name|there}}` | the first name, or "there" when we have none |
 | `{{business_short_name}}` | the business without its branch, e.g. Alvi Dental Hospital |

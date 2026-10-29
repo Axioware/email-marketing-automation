@@ -26,10 +26,17 @@ class TemplateIncomplete(ValueError):
 
 def _first_name(row: dict) -> str | None:
     if row.get("first_name"):
-        return row["first_name"]
+        first_name = str(row["first_name"]).strip()
+        return first_name if "@" not in first_name else None
     words = [word for word in (row.get("contact_name") or "").replace(".", ". ").split()
              if word.rstrip(".").casefold() not in {"dr", "mr", "mrs", "ms", "prof", "engr"}]
-    return words[0] if words else None
+    first_name = words[0] if words else None
+    return first_name if first_name and "@" not in first_name else None
+
+
+def _greeting(row: dict) -> str:
+    first_name = _first_name(row)
+    return f"Hi {first_name}," if first_name else "Hi"
 
 
 def _job_title(row: dict) -> str | None:
@@ -50,6 +57,7 @@ def _rating(row: dict) -> str | None:
 
 # name -> (what it is, how to get it from a prospect row)
 VARIABLES = {
+    "greeting": ("A greeting using the contact's first name when known, or just Hi", _greeting),
     "first_name": ("The contact's first name (without Dr./Mr.)", _first_name),
     "last_name": ("The contact's last name", lambda row: row.get("last_name")),
     "full_name": ("The contact's full name as found", lambda row: row.get("contact_name")),
